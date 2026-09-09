@@ -11,13 +11,18 @@ import (
 type Platform string
 
 const (
-	PlatformWeCom      Platform = "wecom"
-	PlatformFeishu     Platform = "feishu"
+	PlatformWeCom  Platform = "wecom"
+	PlatformFeishu Platform = "feishu"
+	// PlatformLark is Feishu's international edition (open.larksuite.com).
+	// It shares the Feishu adapter; only the API host and tenant differ.
+	PlatformLark       Platform = "lark"
 	PlatformSlack      Platform = "slack"
 	PlatformTelegram   Platform = "telegram"
 	PlatformDingtalk   Platform = "dingtalk"
 	PlatformMattermost Platform = "mattermost"
 	PlatformWeChat     Platform = "wechat"
+	PlatformQQBot      Platform = "qqbot"
+	PlatformYunzhijia  Platform = "yunzhijia"
 )
 
 // SessionMode determines how IM sessions are resolved.
@@ -66,7 +71,7 @@ type IncomingMessage struct {
 	// ThreadID is the platform-specific thread identifier.
 	// - Slack: thread_ts (top-level message uses its own timestamp)
 	// - Mattermost: root_id, or post_id if top-level
-	// - Feishu: root_id, or message_id if top-level
+	// - Feishu/Lark: root_id, or message_id if top-level
 	// - Telegram: message_thread_id (Forum Topics only)
 	// Empty for platforms without thread support (WeCom, DingTalk).
 	// In thread mode, top-level messages use their own ID as ThreadID,
@@ -139,24 +144,37 @@ type Adapter interface {
 }
 
 // StreamSender is an optional interface that adapters can implement to support streaming replies.
-// When an adapter implements StreamSender, the IM service will push answer chunks in real-time
-// instead of waiting for the full answer.
+// In stream output mode the IM service pushes answer chunks in real time. In
+// full output mode it may use the same replaceable message only as a progress
+// placeholder, then replace it once with the completed answer.
 type StreamSender interface {
 	// StartStream initializes a streaming reply session (e.g., creates a streaming card).
 	// Returns a platform-specific stream ID for subsequent chunk/end calls.
 	StartStream(ctx context.Context, incoming *IncomingMessage) (string, error)
 
-	// SendStreamChunk appends a content chunk to an ongoing stream.
-	SendStreamChunk(ctx context.Context, incoming *IncomingMessage, streamID string, content string) error
+	// UpdateStreamContent replaces the user-visible stream text with fullContent so far.
+	// Platforms with replace semantics (WeCom, Telegram edit, etc.) show this as the entire message.
+	UpdateStreamContent(ctx context.Context, incoming *IncomingMessage, streamID string, fullContent string) error
+
+	// FinalizeStream performs the final replace with answer-only content (thinking/tools stripped).
+	FinalizeStream(ctx context.Context, incoming *IncomingMessage, streamID string, finalContent string) error
 
 	// EndStream finalizes a streaming reply.
 	EndStream(ctx context.Context, incoming *IncomingMessage, streamID string) error
 }
 
+// FullOutputProgressSender is an optional capability for adapters whose stream
+// starts with a visible placeholder that can safely be replaced once with the
+// completed answer. Full output never calls UpdateStreamContent.
+type FullOutputProgressSender interface {
+	StreamSender
+	SupportsFullOutputProgress() bool
+}
+
 // FileDownloader is an optional interface that adapters can implement to support
-// downloading file attachments from the IM platform. When the adapter implements
-// this interface and the IM channel has a knowledge_base_id configured, file
-// messages will be downloaded and saved to the specified knowledge base.
+// downloading file attachments from the IM platform. It allows file/image
+// messages to be supplied to QA as attachments; when a knowledge_base_id is
+// configured, the same capability also enables asynchronous knowledge-base save.
 type FileDownloader interface {
 	// DownloadFile downloads a file resource from the IM platform.
 	// Returns the file content reader, the resolved file name, and any error.

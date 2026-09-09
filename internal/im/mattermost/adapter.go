@@ -49,12 +49,12 @@ func NewAdapter(client *Client, outgoingToken, botUserID string, postReplyToMain
 
 // outgoingPayload matches Mattermost outgoing webhook parameters (JSON or form).
 type outgoingPayload struct {
-	Token      string   `json:"token"`
-	UserID     string   `json:"user_id"`
-	UserName   string   `json:"user_name"`
-	ChannelID  string   `json:"channel_id"`
-	PostID     string   `json:"post_id"`
-	Text       string   `json:"text"`
+	Token      string          `json:"token"`
+	UserID     string          `json:"user_id"`
+	UserName   string          `json:"user_name"`
+	ChannelID  string          `json:"channel_id"`
+	PostID     string          `json:"post_id"`
+	Text       string          `json:"text"`
 	RootID     string          `json:"root_id"`
 	FileIDsRaw json.RawMessage `json:"file_ids"`
 }
@@ -276,8 +276,8 @@ func (a *Adapter) StartStream(ctx context.Context, incoming *im.IncomingMessage)
 	return streamID, nil
 }
 
-func (a *Adapter) SendStreamChunk(ctx context.Context, incoming *im.IncomingMessage, streamID string, content string) error {
-	if content == "" {
+func (a *Adapter) UpdateStreamContent(ctx context.Context, incoming *im.IncomingMessage, streamID string, fullContent string) error {
+	if fullContent == "" {
 		return nil
 	}
 
@@ -289,15 +289,23 @@ func (a *Adapter) SendStreamChunk(ctx context.Context, incoming *im.IncomingMess
 	}
 
 	state.mu.Lock()
-	state.content.WriteString(content)
-	full := state.content.String()
+	state.content.Reset()
+	state.content.WriteString(fullContent)
 	postID := state.postID
 	state.mu.Unlock()
 
-	if err := a.client.PatchPostMessage(ctx, postID, full); err != nil {
+	if err := a.client.PatchPostMessage(ctx, postID, fullContent); err != nil {
 		logger.Warnf(ctx, "[Mattermost] Patch post failed: %v", err)
 	}
 	return nil
+}
+
+func (a *Adapter) FinalizeStream(ctx context.Context, incoming *im.IncomingMessage, streamID string, finalContent string) error {
+	return a.UpdateStreamContent(ctx, incoming, streamID, finalContent)
+}
+
+func (a *Adapter) SendStreamChunk(ctx context.Context, incoming *im.IncomingMessage, streamID string, content string) error {
+	return a.UpdateStreamContent(ctx, incoming, streamID, content)
 }
 
 func (a *Adapter) EndStream(ctx context.Context, incoming *im.IncomingMessage, streamID string) error {

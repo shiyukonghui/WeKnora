@@ -3,6 +3,7 @@ package service
 import (
 	"context"
 	"fmt"
+	"strings"
 
 	infra_web_search "github.com/Tencent/WeKnora/internal/infrastructure/web_search"
 	"github.com/Tencent/WeKnora/internal/logger"
@@ -71,6 +72,55 @@ func (s *webSearchProviderService) UpdateProvider(ctx context.Context, provider 
 	return s.repo.Update(ctx, provider)
 }
 
+// UpdateProviderCredentials writes the api_key credential field. Web search
+// providers are stateless from our side — every search call rebuilds a
+// transport from current Parameters — so no cache invalidation is required.
+func (s *webSearchProviderService) UpdateProviderCredentials(
+	ctx context.Context, tenantID uint64, id string, apiKey *string,
+) (*types.WebSearchProviderEntity, error) {
+	existing, err := s.repo.GetByID(ctx, tenantID, id)
+	if err != nil {
+		return nil, err
+	}
+	if existing == nil {
+		return nil, fmt.Errorf("web search provider not found")
+	}
+
+	if apiKey != nil && *apiKey != "" && *apiKey != existing.Parameters.APIKey {
+		existing.Parameters.APIKey = *apiKey
+		if err := s.repo.Update(ctx, existing); err != nil {
+			return nil, err
+		}
+		logger.Infof(ctx, "WebSearch provider credentials updated: tenant=%d id=%s", tenantID, id)
+	}
+	return existing, nil
+}
+
+// ClearProviderCredential clears the api_key credential. Idempotent.
+func (s *webSearchProviderService) ClearProviderCredential(
+	ctx context.Context, tenantID uint64, id, field string,
+) error {
+	if field != "api_key" {
+		return fmt.Errorf("unknown credential field: %s", field)
+	}
+	existing, err := s.repo.GetByID(ctx, tenantID, id)
+	if err != nil {
+		return err
+	}
+	if existing == nil {
+		return fmt.Errorf("web search provider not found")
+	}
+	if existing.Parameters.APIKey == "" {
+		return nil
+	}
+	existing.Parameters.APIKey = ""
+	if err := s.repo.Update(ctx, existing); err != nil {
+		return err
+	}
+	logger.Infof(ctx, "WebSearch provider credential cleared by user: tenant=%d id=%s field=%s", tenantID, id, field)
+	return nil
+}
+
 // DeleteProvider deletes a provider by tenant + id.
 func (s *webSearchProviderService) DeleteProvider(ctx context.Context, tenantID uint64, id string) error {
 	logger.Infof(ctx, "Deleting web search provider: tenant=%d, id=%s", tenantID, id)
@@ -80,12 +130,18 @@ func (s *webSearchProviderService) DeleteProvider(ctx context.Context, tenantID 
 // isValidProviderType checks if the given provider type is supported
 func isValidProviderType(provider types.WebSearchProviderType) bool {
 	switch provider {
-	case types.WebSearchProviderTypeBing,
+	case types.WebSearchProviderTypeBrave, types.WebSearchProviderTypeBing,
 		types.WebSearchProviderTypeGoogle,
 		types.WebSearchProviderTypeDuckDuckGo,
 		types.WebSearchProviderTypeTavily,
 		types.WebSearchProviderTypeOllama,
-		types.WebSearchProviderTypeBaidu:
+		types.WebSearchProviderTypeBaidu,
+		types.WebSearchProviderTypeSearxng,
+		types.WebSearchProviderTypeKeenable,
+		types.WebSearchProviderTypeMetaso,
+		types.WebSearchProviderTypeZhipu,
+		types.WebSearchProviderTypeExa,
+		types.WebSearchProviderTypeBocha:
 		return true
 	default:
 		return false
@@ -95,6 +151,10 @@ func isValidProviderType(provider types.WebSearchProviderType) bool {
 // validateProviderParameters validates required parameters for each provider type
 func validateProviderParameters(provider types.WebSearchProviderType, params types.WebSearchProviderParameters) error {
 	switch provider {
+	case types.WebSearchProviderTypeBrave:
+		if strings.TrimSpace(params.APIKey) == "" {
+			return fmt.Errorf("API key is required for Brave provider")
+		}
 	case types.WebSearchProviderTypeBing:
 		if params.APIKey == "" {
 			return fmt.Errorf("API key is required for Bing provider")
@@ -118,8 +178,30 @@ func validateProviderParameters(provider types.WebSearchProviderType, params typ
 		if params.APIKey == "" {
 			return fmt.Errorf("API key is required for Baidu provider")
 		}
+	case types.WebSearchProviderTypeExa:
+		if params.APIKey == "" {
+			return fmt.Errorf("API key is required for Exa provider")
+		}
+	case types.WebSearchProviderTypeZhipu:
+		if err := infra_web_search.ValidateZhipuParameters(params); err != nil {
+			return err
+		}
+	case types.WebSearchProviderTypeMetaso:
+		if err := infra_web_search.ValidateMetasoParameters(params); err != nil {
+			return err
+		}
+	case types.WebSearchProviderTypeBocha:
+		if err := infra_web_search.ValidateBochaParameters(params); err != nil {
+			return err
+		}
 	case types.WebSearchProviderTypeDuckDuckGo:
 		// No API key required
+	case types.WebSearchProviderTypeKeenable:
+		// No API key required (keyless by default; an optional key lifts the rate limit)
+	case types.WebSearchProviderTypeSearxng:
+		if err := infra_web_search.ValidateSearxngBaseURL(params.BaseURL); err != nil {
+			return err
+		}
 	}
 	if err := validateOptionalProxyURL(params.ProxyURL); err != nil {
 		return err

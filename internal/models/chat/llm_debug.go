@@ -57,11 +57,8 @@ func buildOptionsSection(opts *ChatOptions) string {
 	if opts.TopP > 0 {
 		parts = append(parts, fmt.Sprintf("TopP=%.2f", opts.TopP))
 	}
-	if opts.MaxTokens > 0 {
-		parts = append(parts, fmt.Sprintf("MaxTokens=%d", opts.MaxTokens))
-	}
-	if opts.MaxCompletionTokens > 0 {
-		parts = append(parts, fmt.Sprintf("MaxCompletionTokens=%d", opts.MaxCompletionTokens))
+	if budget := opts.CompletionBudget(); budget > 0 {
+		parts = append(parts, fmt.Sprintf("CompletionBudget=%d", budget))
 	}
 	if opts.FrequencyPenalty > 0 {
 		parts = append(parts, fmt.Sprintf("FrequencyPenalty=%.2f", opts.FrequencyPenalty))
@@ -108,8 +105,9 @@ func buildResponseToolCalls(tcs []types.LLMToolCall) []logger.LLMToolCallInfo {
 }
 
 func usageString(u types.TokenUsage) string {
-	return fmt.Sprintf("Prompt: %d, Completion: %d, Total: %d",
-		u.PromptTokens, u.CompletionTokens, u.TotalTokens)
+	return fmt.Sprintf("Prompt: %d, Completion: %d, Total: %d, CacheRead: %d, CacheWrite: %d, CacheMiss: %d, CacheStatus: %s",
+		u.PromptTokens, u.CompletionTokens, u.TotalTokens, u.CacheReadTokens,
+		u.CacheWriteTokens, u.CacheMissTokens, u.CacheStatus)
 }
 
 // logLLMDebugCall logs a complete non-stream LLM chat call.

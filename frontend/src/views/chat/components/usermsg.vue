@@ -2,47 +2,41 @@
     <div class="user_msg_container" ref="containerRef" :class="{ 'is-embedded': embeddedMode }">
         <!-- 显示@的知识库和文件 -->
         <div v-if="mentioned_items && mentioned_items.length > 0" class="mentioned_items">
-            <span 
-                v-for="item in mentioned_items" 
-                :key="item.id" 
-                class="mentioned_tag"
-                :class="[
-                  item.type === 'kb' ? (item.kb_type === 'faq' ? 'faq-tag' : 'kb-tag') : 'file-tag'
-                ]"
-            >
+            <span v-for="item in mentioned_items" :key="item.id" class="mentioned_tag" :class="[
+                mentionTagClass(item)
+            ]">
                 <span class="tag_icon">
                     <t-icon v-if="item.type === 'kb'" :name="item.kb_type === 'faq' ? 'chat-bubble-help' : 'folder'" />
-                    <t-icon v-else name="file" />
+                    <t-icon v-else :name="mentionTagIcon(item)" />
                 </span>
                 <span class="tag_name">{{ item.name }}</span>
             </span>
         </div>
         <!-- 显示上传的图片 -->
         <div v-if="hasImages" class="user_images">
-            <img 
-                v-for="(img, idx) in props.images" 
-                :key="idx" 
-                :src="img.url" 
-                class="user_image_thumb"
-                @click="previewImage($event)"
-            />
+            <img v-for="(img, idx) in props.images" :key="idx" :src="img.url" class="user_image_thumb"
+                @click="previewImage($event)" />
         </div>
         <!-- 显示上传的附件 -->
         <div v-if="hasAttachments" class="user_attachments">
-            <div v-for="(att, idx) in props.attachments" :key="idx" class="user_attachment_card">
+            <div v-for="(att, idx) in props.attachments" :key="idx"
+                class="user_attachment_card"
+                :class="{ 'is-previewable': canPreviewAttachment(att) }"
+                @click="openAttachmentPreview(att)">
                 <div class="attachment_card_icon">
                     <svg viewBox="0 0 40 48" fill="none" xmlns="http://www.w3.org/2000/svg" width="36" height="44">
-                        <rect width="40" height="48" rx="4" fill="#4A90D9"/>
-                        <path d="M8 6h16l8 8v28a2 2 0 01-2 2H8a2 2 0 01-2-2V8a2 2 0 012-2z" fill="#5BA3E8"/>
-                        <path d="M24 6l8 8h-6a2 2 0 01-2-2V6z" fill="#3A7BC8"/>
-                        <rect x="10" y="20" width="20" height="2" rx="1" fill="white" fill-opacity="0.9"/>
-                        <rect x="10" y="26" width="20" height="2" rx="1" fill="white" fill-opacity="0.9"/>
-                        <rect x="10" y="32" width="14" height="2" rx="1" fill="white" fill-opacity="0.9"/>
+                        <rect width="40" height="48" rx="4" fill="#4A90D9" />
+                        <path d="M8 6h16l8 8v28a2 2 0 01-2 2H8a2 2 0 01-2-2V8a2 2 0 012-2z" fill="#5BA3E8" />
+                        <path d="M24 6l8 8h-6a2 2 0 01-2-2V6z" fill="#3A7BC8" />
+                        <rect x="10" y="20" width="20" height="2" rx="1" fill="white" fill-opacity="0.9" />
+                        <rect x="10" y="26" width="20" height="2" rx="1" fill="white" fill-opacity="0.9" />
+                        <rect x="10" y="32" width="14" height="2" rx="1" fill="white" fill-opacity="0.9" />
                     </svg>
                 </div>
                 <div class="attachment_card_info">
                     <div class="attachment_card_name">{{ att.file_name }}</div>
-                    <div class="attachment_card_meta">{{ getFileExt(att.file_name) }}<span v-if="att.file_size">&nbsp;·&nbsp;{{ formatFileSize(att.file_size) }}</span></div>
+                    <div class="attachment_card_meta">{{ getFileExt(att.file_name) }}<span
+                            v-if="att.file_size">&nbsp;·&nbsp;{{ formatFileSize(att.file_size) }}</span></div>
                 </div>
             </div>
         </div>
@@ -53,12 +47,27 @@
     </div>
 </template>
 <script setup>
-import { defineProps, computed, ref, watch, onMounted, nextTick } from "vue";
+import { computed, ref, watch, onMounted, nextTick } from "vue";
 import { hydrateProtectedFileImages } from '@/utils/security';
 import picturePreview from '@/components/picture-preview.vue';
 import { useI18n } from 'vue-i18n';
+import { useChatAttachmentPreviewDrawer } from '@/composables/useChatAttachmentPreviewDrawer';
+import { isPreviewableAttachment, resolveAttachmentFileType } from '@/utils/attachmentPreview';
+import { SKILL_ICON } from '@/types/mention';
 
 const { t } = useI18n();
+
+const mentionTagClass = (item) => {
+    if (item.type === 'kb') return item.kb_type === 'faq' ? 'faq-tag' : 'kb-tag';
+    return `${item.type || 'file'}-tag`;
+};
+
+const mentionTagIcon = (item) => {
+    if (item.type === 'tag') return 'tag';
+    if (item.type === 'mcp') return 'tools';
+    if (item.type === 'skill') return SKILL_ICON;
+    return 'file';
+};
 
 const props = defineProps({
     content: {
@@ -88,8 +97,14 @@ const props = defineProps({
     embeddedMode: {
         type: Boolean,
         default: false
+    },
+    sessionId: {
+        type: String,
+        default: ''
     }
 });
+
+const attachmentPreviewDrawer = useChatAttachmentPreviewDrawer();
 
 const channelLabelMap = {
     web: () => t('chat.channelWeb'),
@@ -115,7 +130,7 @@ const getAttachmentIcon = (fileNameOrType) => {
     if (['doc', 'docx'].includes(ext)) return 'file-word';
     if (['xls', 'xlsx'].includes(ext)) return 'file-excel';
     if (['ppt', 'pptx'].includes(ext)) return 'file-powerpoint';
-    if (['txt', 'md'].includes(ext)) return 'file-text';
+    if (['txt', 'md'].includes(ext)) return 'file';
     if (['mp3', 'wav', 'm4a', 'flac', 'ogg', 'aac'].includes(ext)) return 'sound';
     return 'file';
 };
@@ -129,6 +144,20 @@ const formatFileSize = (bytes) => {
     if (bytes < 1024) return bytes + ' B';
     if (bytes < 1024 * 1024) return (bytes / 1024).toFixed(1) + ' KB';
     return (bytes / (1024 * 1024)).toFixed(1) + ' MB';
+};
+
+const canPreviewAttachment = (attachment) => {
+    return Boolean(props.sessionId) && isPreviewableAttachment(attachment);
+};
+
+const openAttachmentPreview = (attachment) => {
+    if (!canPreviewAttachment(attachment) || !attachmentPreviewDrawer) return;
+    attachmentPreviewDrawer.open({
+        sessionId: props.sessionId,
+        attachmentId: attachment.id,
+        fileName: attachment.file_name,
+        fileType: resolveAttachmentFileType(attachment.file_name, attachment.file_type),
+    });
 };
 
 const hydrateImages = async () => {
@@ -156,6 +185,8 @@ const closePreImg = () => {
 };
 </script>
 <style scoped lang="less">
+@import '../../../components/css/chat-resource-chips.less';
+
 .user_msg_container {
     display: flex;
     flex-direction: column;
@@ -165,59 +196,11 @@ const closePreImg = () => {
 }
 
 .mentioned_items {
-    display: flex;
-    flex-wrap: wrap;
-    gap: 6px;
-    justify-content: flex-end;
-    max-width: 100%;
-    margin-bottom: 2px;
+    .chat-mentioned-items(flex-end);
 }
 
 .mentioned_tag {
-    display: inline-flex;
-    align-items: center;
-    gap: 4px;
-    padding: 3px 8px;
-    border-radius: 5px;
-    font-size: 12px;
-    font-weight: 500;
-    max-width: 200px;
-    cursor: default;
-    transition: all 0.15s;
-    background: rgba(7, 192, 95, 0.06);
-    border: 1px solid rgba(7, 192, 95, 0.2);
-    color: var(--td-text-color-primary);
-
-    &.kb-tag {
-        .tag_icon {
-            color: var(--td-brand-color);
-        }
-    }
-
-    &.faq-tag {
-        .tag_icon {
-            color: var(--td-warning-color);
-        }
-    }
-
-    &.file-tag {
-        .tag_icon {
-            color: var(--td-text-color-secondary);
-        }
-    }
-
-    .tag_icon {
-        font-size: 13px;
-        display: flex;
-        align-items: center;
-    }
-
-    .tag_name {
-        overflow: hidden;
-        text-overflow: ellipsis;
-        white-space: nowrap;
-        color: currentColor;
-    }
+    .chat-mentioned-tag();
 }
 
 .user_msg_container {
@@ -230,22 +213,25 @@ const closePreImg = () => {
 
 .user_msg {
     width: max-content;
-    max-width: 776px;
+    max-width: min(76%, 820px);
     display: flex;
-    padding: 10px 12px;
+    padding: 8px 12px;
     flex-direction: column;
     justify-content: center;
-    align-items: center;
+    align-items: flex-start;
     gap: 4px;
     flex: 1 0 0;
-    border-radius: 4px;
-    background: #8CE97F;
+    border-radius: 8px;
+    background: var(--td-bg-color-secondarycontainer);
     margin-left: auto;
-    color: #000000e6;
-    font-size: 15px;
-    text-align: justify;
-    word-break: break-all;
+    color: var(--td-text-color-primary);
+    font-size: 16px;
+    line-height: 1.6;
+    text-align: left;
+    word-break: break-word;
+    overflow-wrap: anywhere;
     box-sizing: border-box;
+    white-space: pre-wrap;
 }
 
 .user_images {
@@ -276,6 +262,16 @@ const closePreImg = () => {
     max-width: 260px;
     min-width: 160px;
     cursor: default;
+
+    &.is-previewable {
+        cursor: pointer;
+        transition: border-color 0.2s, box-shadow 0.2s;
+
+        &:hover {
+            border-color: var(--td-brand-color-2, rgba(0, 82, 217, 0.25));
+            box-shadow: 0 2px 8px rgba(0, 0, 0, 0.06);
+        }
+    }
 
     .attachment_card_icon {
         flex-shrink: 0;
@@ -356,8 +352,8 @@ const closePreImg = () => {
 
 html[theme-mode="dark"] {
     .user_msg {
-        background: var(--td-brand-color-3);
-        color: rgba(255, 255, 255, 0.9);
+        background: var(--td-bg-color-secondarycontainer);
+        color: var(--td-text-color-primary);
     }
 }
 </style>

@@ -6,15 +6,40 @@ structured Document objects with text content and chunks. It supports multiple
 sheets and handles various Excel formats using pandas.
 """
 import logging
+import re
 from io import BytesIO
-from typing import List
+from typing import Any, List
 
 import pandas as pd
 
 from docreader.models.document import Chunk, Document
 from docreader.parser.base_parser import BaseParser
+from docreader.parser.excel_convert import (
+    convert_excel_to_xlsx_bytes,
+    detect_excel_format,
+    engine_for_format,
+    normalize_excel_bytes,
+)
+from docreader.parser.xlsx_merge import fill_merged_cells_xlsx
+from docreader.parser.xlsx_repair import repair_xlsx_bytes
 
 logger = logging.getLogger(__name__)
+
+# Pattern to detect Excel image function strings that should be excluded from
+# parsed text content.  WPS uses =DISPIMG("ID",mode) to embed images in cells;
+# when opened by other tools the formula may appear as plain text prefixed with
+# "_xlfn." or "=".  Office 365 uses =_xlfn.IMAGE(url, ...) similarly.
+# The _xlfn. prefix is optional — WPS may omit it (e.g. =DISPIMG("ID",1)).
+_IMAGE_FUNC_RE = re.compile(
+    r"^=?(_xlfn\.)?(DISPIMG|IMAGE)\(", re.IGNORECASE
+)
+
+
+def _is_image_function(value: object) -> bool:
+    """Return True if *value* looks like an embedded-image function string."""
+    if not isinstance(value, str):
+        return False
+    return _IMAGE_FUNC_RE.match(value) is not None
 
 
 class ExcelParser(BaseParser):
@@ -39,6 +64,16 @@ class ExcelParser(BaseParser):
         Name: John,Age: 30,City: NYC
         Name: Jane,Age: 25,City: LA
     """
+
+    def __init__(
+        self,
+        file_name: str = "",
+        file_type: str | None = None,
+        xlsx_first_row_as_header: Any = False,
+        **kwargs: Any,
+    ):
+        super().__init__(file_name=file_name, file_type=file_type, **kwargs)
+        self.xlsx_first_row_as_header = _parse_bool(xlsx_first_row_as_header)
     
     def parse_into_text(self, content: bytes) -> Document:
         """Parse Excel file bytes into a Document object.
@@ -60,13 +95,15 @@ class ExcelParser(BaseParser):
         text: List[str] = []
         start, end = 0, 0
 
-        # Load Excel file from bytes into pandas ExcelFile object
-        excel_file = pd.ExcelFile(BytesIO(content))
+        excel_file = _open_excel_file(content, file_type=self.file_type)
         
         # Process each sheet in the Excel file
         for excel_sheet_name in excel_file.sheet_names:
-            # Parse the sheet into a DataFrame
-            df = excel_file.parse(sheet_name=excel_sheet_name)
+            df = _read_sheet_dataframe(
+                excel_file,
+                excel_sheet_name,
+                xlsx_first_row_as_header=self.xlsx_first_row_as_header,
+            )
             # Remove rows where all values are NaN (completely empty rows)
             df.dropna(how="all", inplace=True)
 
@@ -75,7 +112,7 @@ class ExcelParser(BaseParser):
                 page_content = []
                 # Build key-value pairs for non-null values
                 for k, v in row.items():
-                    if pd.notna(v):  # Skip NaN/null values
+                    if pd.notna(v) and not _is_image_function(v):
                         page_content.append(f"{k}: {v}")
                 
                 # Skip rows with no valid content
@@ -95,6 +132,115 @@ class ExcelParser(BaseParser):
 
         # Combine all text and return as Document
         return Document(content="".join(text), chunks=chunks)
+
+
+def _read_sheet_dataframe(
+    excel_file: pd.ExcelFile,
+    sheet_name: str,
+    xlsx_first_row_as_header: bool = False,
+) -> pd.DataFrame:
+    """Read a worksheet into a DataFrame with stable column labels."""
+    from openpyxl.utils import get_column_letter
+
+    # Keep row 1 as data by default for both XLSX and legacy XLS. Users can
+    # explicitly restore the historical behavior where row 1 supplies semantic
+    # labels for every row.
+    df = excel_file.parse(sheet_name=sheet_name, header=None)
+    if xlsx_first_row_as_header and len(df.index) >= 2:
+        df.columns = _stable_header_labels(df.iloc[0].tolist())
+        return df.iloc[1:].copy()
+
+    df.columns = [get_column_letter(idx + 1) for idx in range(len(df.columns))]
+    return df
+
+
+def _stable_header_labels(values: List[object]) -> List[str]:
+    """Build non-empty, unique labels from an explicitly selected header row."""
+    from openpyxl.utils import get_column_letter
+
+    labels: List[str] = []
+    counts: dict[str, int] = {}
+    for index, value in enumerate(values, start=1):
+        label = ""
+        if pd.notna(value) and not _is_image_function(value):
+            label = str(value).strip()
+        if not label:
+            label = get_column_letter(index)
+
+        count = counts.get(label, 0) + 1
+        counts[label] = count
+        labels.append(label if count == 1 else f"{label}_{count}")
+    return labels
+
+
+def _parse_bool(value: Any) -> bool:
+    if isinstance(value, bool):
+        return value
+    return str(value).strip().lower() in {"1", "true", "yes", "on"}
+
+
+def _prepare_xlsx_bytes(data: bytes) -> bytes:
+    repaired = repair_xlsx_bytes(data)
+    if repaired is not None:
+        data = repaired
+    return fill_merged_cells_xlsx(data)
+
+
+def _open_excel_file(content: bytes, file_type: str | None = None) -> pd.ExcelFile:
+    """Open an Excel workbook with explicit engine selection and fallbacks."""
+    data = content
+    converted_via_soffice = False
+
+    while True:
+        ext = detect_excel_format(data)
+        if ext is None:
+            if converted_via_soffice:
+                raise ValueError(
+                    "Excel file format cannot be determined, you must specify an engine manually."
+                )
+            try:
+                data = normalize_excel_bytes(data, file_type=file_type)
+            except ValueError as exc:
+                raise ValueError(
+                    "Excel file format cannot be determined, you must specify an engine manually."
+                ) from exc
+            converted_via_soffice = True
+            continue
+
+        if ext == "ods":
+            converted = convert_excel_to_xlsx_bytes(data, suffix=".ods")
+            if converted:
+                data = converted
+                continue
+
+        engine = engine_for_format(ext)
+        if ext == "xlsx":
+            data = _prepare_xlsx_bytes(data)
+            engine = "openpyxl"
+        try:
+            return pd.ExcelFile(BytesIO(data), engine=engine)
+        except ImportError as exc:
+            raise ValueError(
+                f"Excel engine {engine!r} is not available for .{ext} files"
+            ) from exc
+        except KeyError as exc:
+            if "sharedStrings.xml" not in str(exc) or engine != "openpyxl":
+                raise
+            repaired = repair_xlsx_bytes(data)
+            if repaired is None:
+                raise
+            logger.info("Repaired XLSX sharedStrings packaging before parse")
+            data = _prepare_xlsx_bytes(repaired)
+            continue
+        except ValueError as exc:
+            if converted_via_soffice or "cannot be determined" not in str(exc):
+                raise
+            try:
+                data = normalize_excel_bytes(content, file_type=file_type)
+            except ValueError:
+                raise
+            converted_via_soffice = True
+            continue
 
 
 if __name__ == "__main__":

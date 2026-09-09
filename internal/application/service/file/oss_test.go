@@ -117,7 +117,7 @@ func TestNewOSSClient(t *testing.T) {
 		},
 		{
 			name:      "custom endpoint",
-			endpoint:  "https://custom-oss-endpoint.com",
+			endpoint:  "https://example.com",
 			region:    "cn-shanghai",
 			accessKey: "ak",
 			secretKey: "sk",
@@ -142,6 +142,12 @@ func TestNewOSSClient(t *testing.T) {
 				t.Error("expected non-nil client")
 			}
 		})
+	}
+}
+
+func TestNewOSSClientRejectsUnsafeEndpoint(t *testing.T) {
+	if _, err := newOSSClient("http://127.0.0.1:9000", "cn-hangzhou", "ak", "sk"); err == nil {
+		t.Fatal("expected loopback OSS endpoint to be rejected")
 	}
 }
 
@@ -192,8 +198,11 @@ func TestOssEnsureBucket_CreateFails(t *testing.T) {
 		t.Fatalf("newOSSClient() error: %v", err)
 	}
 
-	// Should fail with invalid credentials
-	err = ossEnsureBucket(client, "test-bucket")
+	// Use a bucket that does not exist so IsBucketExist returns false and the
+	// create path is exercised; with invalid credentials PutBucket then fails.
+	// A common name like "test-bucket" already exists globally on OSS, which
+	// would short-circuit at IsBucketExist and make this assertion flaky.
+	err = ossEnsureBucket(client, "weknora-nonexistent-bucket-create-fails-12345")
 	if err == nil {
 		t.Error("ossEnsureBucket with invalid credentials should return an error")
 	}

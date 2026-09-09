@@ -65,7 +65,7 @@ Components deployed:
   - Redis ({{ include "weknora.redis.image" . }})
 {{- end }}
 
-{{- if or .Values.minio.enabled .Values.neo4j.enabled .Values.qdrant.enabled .Values.jaeger.enabled }}
+{{- if or .Values.minio.enabled .Values.neo4j.enabled .Values.qdrant.enabled }}
 
 Optional components enabled:
 {{- if .Values.minio.enabled }}
@@ -76,9 +76,6 @@ Optional components enabled:
 {{- end }}
 {{- if .Values.qdrant.enabled }}
   - Qdrant (Vector Database)
-{{- end }}
-{{- if .Values.jaeger.enabled }}
-  - Jaeger (Distributed Tracing)
 {{- end }}
 {{- end }}
 
@@ -107,10 +104,11 @@ Supported LLM backends:
 
 Neo4j is enabled for GraphRAG feature.
 
-To use GraphRAG, set ENABLE_GRAPH_RAG=true in the app:
+To use GraphRAG, enable Neo4j. NEO4J_ENABLE is the sole graph switch and is
+injected automatically when neo4j.enabled=true (no need to set ENABLE_GRAPH_RAG,
+which is deprecated and no longer read by the app):
 
   helm upgrade {{ .Release.Name }} ./helm \
-    --set app.env.ENABLE_GRAPH_RAG=true \
     --set neo4j.enabled=true \
     --set neo4j.password=<your-secure-password>
 

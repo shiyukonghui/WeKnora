@@ -8,6 +8,28 @@ import { get, post, put, del } from "../../utils/request";
 // 'custom'       : 完全自定义（不应用预设）
 export type AgentType = 'rag-qa' | 'wiki-qa' | 'hybrid-rag-wiki' | 'data-analysis' | 'custom';
 
+export interface QuestionSuggestionConfig {
+  starters: {
+    enabled: boolean;
+    mode: 'curated' | 'knowledge' | 'hybrid';
+    items: string[];
+    count: number;
+  };
+  follow_ups: {
+    enabled: boolean;
+    mode: 'generated' | 'knowledge' | 'hybrid';
+    count: number;
+    model_id?: string;
+    additional_instruction?: string;
+    categories: Array<'clarify' | 'deepen' | 'action'>;
+    max_context_turns: number;
+    suppress_on_fallback: boolean;
+    suppress_when_answer_asks_question: boolean;
+    knowledge_fallback: boolean;
+    allow_regenerate: boolean;
+  };
+}
+
 export interface CustomAgentConfig {
   // ===== 基础设置 =====
   agent_mode?: 'quick-answer' | 'smart-reasoning';  // 运行模式：quick-answer=RAG模式, smart-reasoning=ReAct Agent模式
@@ -22,20 +44,31 @@ export interface CustomAgentConfig {
   model_id?: string;
   rerank_model_id?: string;         // ReRank 模型 ID
   temperature?: number;
-  max_completion_tokens?: number;   // 最大生成token数（普通模式）
+  max_completion_tokens?: number;   // 0 = 跟随系统默认（快速问答 2048；智能推理 4096，绑沙箱可写文件时 24576）。大于 0 为自定义上限
+  thinking?: boolean;                      // 是否启用思考模式（支持扩展思考的模型）
+  citation_enabled?: boolean;        // 是否在最终回答中输出知识库/网页来源引用（默认开启）
 
   // ===== Agent模式设置 =====
-  max_iterations?: number;          // 最大迭代次数
+  max_iterations?: number;          // 最大迭代次数；-1 表示不限制
+  llm_call_timeout?: number;        // LLM调用超时时间（秒）
   allowed_tools?: string[];         // 允许的工具
   reflection_enabled?: boolean;     // 是否启用反思
   // MCP服务选择模式：all=全部启用的MCP服务, selected=指定服务, none=不使用MCP
   mcp_selection_mode?: 'all' | 'selected' | 'none';
   mcp_services?: string[];          // 选择的MCP服务ID列表
+  // 对话中触发 OAuth 授权时的等待超时（秒）：到点后自动跳过授权提示。
+  // <=0 时使用服务端默认超时。仅对使用 OAuth 的 MCP 服务生效。
+  mcp_auth_wait_timeout?: number;
 
   // ===== Skills设置（仅Agent模式）=====
   // Skills选择模式：all=全部预装, selected=指定, none=不使用
   skills_selection_mode?: 'all' | 'selected' | 'none';
   selected_skills?: string[];       // 选择的Skill名称列表
+
+  // ===== 沙箱设置 =====
+  // 该智能体的技能脚本运行在哪个沙箱配置上；为空表示不启用沙箱执行。
+  // 指向逻辑配置而非某个具体版本，凭据轮换时无需重新指派每个智能体。
+  sandbox_config_id?: string;
 
   // ===== 知识库设置 =====
   // 知识库选择模式：all=全部知识库, selected=指定知识库, none=不使用知识库
@@ -52,6 +85,16 @@ export interface CustomAgentConfig {
   image_storage_provider?: string;   // 图片存储提供商
   audio_upload_enabled?: boolean;    // 是否启用音频上传/ASR转录（默认: false）
   asr_model_id?: string;            // ASR模型ID（音频转录用）
+  // 附件图片理解 / 扫描件 OCR 开关（默认: false，开启会增加解析耗时）
+  attachment_image_understanding?: boolean;
+  // 扫描件 OCR 最大页数（0 = 使用全局默认 WEKNORA_CHAT_ATTACHMENT_OCR_MAX_PAGES）
+  attachment_ocr_max_pages?: number;
+  // 单轮问答等待附件解析完成的最长时间（秒，0 = 使用全局默认 WEKNORA_CHAT_ATTACHMENT_WAIT_TIMEOUT_SEC）
+  attachment_parse_wait_timeout_sec?: number;
+
+  // ===== 聊天附件解析引擎策略 =====
+  // 按文件类型选择解析引擎；优先级：请求 parser_engine > 智能体规则 > 租户规则 > auto
+  chat_parser_engine_rules?: { file_types: string[]; engine: string }[];
 
   // ===== 文件类型限制 =====
   // 支持的文件类型（如 ["csv", "xlsx", "xls"]）
@@ -66,6 +109,12 @@ export interface CustomAgentConfig {
   // ===== 多轮对话设置 =====
   multi_turn_enabled?: boolean;     // 是否启用多轮对话
   history_turns?: number;           // 保留历史轮数
+
+  // ===== 长期记忆 =====
+  // 该智能体是否可以读取用户的长期记忆。
+  // 缺省（旧数据）等同于 true：这是一个只能"关"的开关，空间设置关闭时
+  // 这里打开也不会生效。
+  memory_enabled?: boolean;
 
   // ===== 检索策略设置 =====
   embedding_top_k?: number;         // 向量召回TopK
@@ -82,10 +131,12 @@ export interface CustomAgentConfig {
   fallback_strategy?: 'fixed' | 'model'; // 兜底策略
   fallback_response?: string;       // 固定兜底回复
   fallback_prompt?: string;         // 兜底提示词（模型生成时）
+  // 意图提示词：非检索意图（问候、闲聊等）时覆盖主系统提示词
+  intent_prompts?: Record<string, string>;
 
   // ===== 已废弃字段（保留兼容）=====
   welcome_message?: string;
-  suggested_prompts?: string[];
+  question_suggestions?: QuestionSuggestionConfig;
 }
 
 // 智能体
@@ -97,6 +148,8 @@ export interface CustomAgent {
   is_builtin: boolean;
   tenant_id?: number;
   created_by?: string;
+  // creator_name 由后端 list 接口批量回填，仅用于列表卡片来源徽章。
+  creator_name?: string;
   config: CustomAgentConfig;
   created_at?: string;
   updated_at?: string;
@@ -132,9 +185,18 @@ export const BUILTIN_AGENT_NORMAL_ID = BUILTIN_QUICK_ANSWER_ID;
 export const BUILTIN_AGENT_AGENT_ID = BUILTIN_SMART_REASONING_ID;
 
 // 获取智能体列表（包括内置智能体）
-// disabled_own_agent_ids: 当前租户在对话下拉中停用的「我的」智能体 ID，仅影响本租户
-export function listAgents() {
-  return get<{ data: CustomAgent[]; disabled_own_agent_ids?: string[] }>('/api/v1/agents');
+// disabled_own_agent_ids: 当前空间在对话下拉中停用的「我的」智能体 ID，仅影响本空间
+export function listAgents(params?: {
+  /**
+   * Optional creator filter; mirrors listKnowledgeBases. Built-in agents
+   * (is_builtin=true) are always returned regardless of this filter so
+   * the conversation dropdown never silently loses quick-answer /
+   * smart-reasoning when a user picks "Created by me".
+   */
+  creator?: 'all' | 'mine' | 'others';
+}) {
+  const qs = params?.creator && params.creator !== 'all' ? `?creator=${params.creator}` : '';
+  return get<{ data: CustomAgent[]; disabled_own_agent_ids?: string[] }>(`/api/v1/agents${qs}`);
 }
 
 // 获取智能体详情
@@ -244,7 +306,8 @@ export interface IMChannel {
   id: string;
   tenant_id?: number;
   agent_id: string;
-  platform: 'wecom' | 'feishu' | 'slack' | 'telegram' | 'dingtalk' | 'mattermost' | 'wechat';
+  // 'lark' is Feishu's international edition; it shares Feishu's credentials and modes.
+  platform: 'wecom' | 'feishu' | 'lark' | 'slack' | 'telegram' | 'dingtalk' | 'mattermost' | 'wechat' | 'qqbot' | 'yunzhijia';
   name: string;
   enabled: boolean;
   mode: 'webhook' | 'websocket' | 'longpoll';
@@ -258,6 +321,28 @@ export interface IMChannel {
 
 export function listIMChannels(agentId: string) {
   return get<{ data: IMChannel[] }>(`/api/v1/agents/${agentId}/im-channels`);
+}
+
+// Tenant-wide overview row. Credentials are intentionally omitted — use
+// listIMChannels(agentId) when you need to edit a specific channel.
+export interface IMChannelOverview {
+  id: string;
+  tenant_id: number;
+  agent_id: string;
+  agent_name: string; // localized built-in name when the agent is built-in
+  platform: IMChannel['platform'];
+  name: string;
+  enabled: boolean;
+  mode: IMChannel['mode'];
+  output_mode: IMChannel['output_mode'];
+  session_mode?: IMChannel['session_mode'];
+  bot_identity: string;
+  created_at: string;
+  updated_at: string;
+}
+
+export function listAllIMChannels() {
+  return get<{ data: IMChannelOverview[] }>('/api/v1/im-channels');
 }
 
 export function createIMChannel(agentId: string, data: Partial<IMChannel>) {
@@ -289,11 +374,17 @@ export interface SuggestedQuestion {
 // 根据智能体关联的知识库范围返回推荐问题，用于前端对话面板快捷提问
 export function getSuggestedQuestions(
   agentId: string,
-  params?: { knowledge_base_ids?: string[]; knowledge_ids?: string[]; limit?: number }
+  params?: {
+    knowledge_base_ids?: string[];
+    knowledge_ids?: string[];
+    tag_scopes?: Array<{ knowledge_base_id: string; tag_ids: string[] }>;
+    limit?: number;
+  }
 ) {
   const query = new URLSearchParams();
   if (params?.knowledge_base_ids?.length) query.set('knowledge_base_ids', params.knowledge_base_ids.join(','));
   if (params?.knowledge_ids?.length) query.set('knowledge_ids', params.knowledge_ids.join(','));
+  if (params?.tag_scopes?.length) query.set('tag_scopes', JSON.stringify(params.tag_scopes));
   if (params?.limit) query.set('limit', String(params.limit));
   const qs = query.toString();
   return get<{ data: { questions: SuggestedQuestion[] } }>(`/api/v1/agents/${agentId}/suggested-questions${qs ? '?' + qs : ''}`);

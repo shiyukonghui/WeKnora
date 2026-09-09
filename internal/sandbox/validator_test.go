@@ -359,3 +359,12 @@ func containsHelper(s, substr string) bool {
 	}
 	return false
 }
+
+func BenchmarkValidateArgs(b *testing.B) {
+	v := NewScriptValidator()
+	args := []string{"--input", "file.txt", "--name", "report 2024", "--out", "/tmp/x", "--verbose", "--limit=50"}
+	b.ReportAllocs()
+	for b.Loop() {
+		_ = v.ValidateArgs(args)
+	}
+}

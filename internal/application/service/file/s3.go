@@ -11,6 +11,7 @@ import (
 	"strings"
 	"time"
 
+	"github.com/Tencent/WeKnora/internal/logger"
 	"github.com/Tencent/WeKnora/internal/types/interfaces"
 	"github.com/Tencent/WeKnora/internal/utils"
 	"github.com/aws/aws-sdk-go-v2/aws"
@@ -29,15 +30,26 @@ type s3FileService struct {
 }
 
 // newS3Client creates a bare s3FileService with just the SDK client initialised.
-func newS3Client(endpoint, accessKey, secretKey, bucketName, region, pathPrefix string) (*s3FileService, error) {
+func newS3Client(endpoint, accessKey, secretKey, bucketName, region, pathPrefix string, forcePathStyle bool) (*s3FileService, error) {
+	if err := utils.ValidateURLForSSRF(endpoint); err != nil {
+		return nil, fmt.Errorf("unsafe S3 endpoint: %w", err)
+	}
 	var cfg aws.Config
 	var err error
 
-	// Configure AWS SDK
-	cfg, err = config.LoadDefaultConfig(context.Background(),
-		config.WithRegion(region),
-		config.WithCredentialsProvider(credentials.NewStaticCredentialsProvider(accessKey, secretKey, "")),
-	)
+	// With no explicit AK/SK, keep the AWS default credential chain intact. This
+	// supports IAM roles for EC2/ECS/EKS (IRSA), web identity, shared config, and
+	// environment credentials without persisting long-lived keys in WeKnora.
+	loadOptions := []func(*config.LoadOptions) error{config.WithRegion(region)}
+	if accessKey != "" || secretKey != "" {
+		if accessKey == "" || secretKey == "" {
+			return nil, fmt.Errorf("S3 access key and secret key must be provided together")
+		}
+		loadOptions = append(loadOptions, config.WithCredentialsProvider(
+			credentials.NewStaticCredentialsProvider(accessKey, secretKey, ""),
+		))
+	}
+	cfg, err = config.LoadDefaultConfig(context.Background(), loadOptions...)
 
 	if err != nil {
 		return nil, fmt.Errorf("failed to load AWS config: %w", err)
@@ -46,16 +58,26 @@ func newS3Client(endpoint, accessKey, secretKey, bucketName, region, pathPrefix 
 	// Create S3 client with custom endpoint if provided.
 	// For S3-compatible services (non-AWS), use path-style addressing
 	// (endpoint/bucket/key) instead of virtual-hosted style (bucket.endpoint/key).
+	httpClient := utils.NewSSRFSafeHTTPClient(utils.DefaultSSRFSafeHTTPClientConfig())
 	var client *s3.Client
 	if endpoint != "" {
-		usePathStyle := !strings.Contains(endpoint, "amazonaws.com")
+		usePathStyle := forcePathStyle || !strings.Contains(endpoint, "amazonaws.com")
 		client = s3.NewFromConfig(cfg, func(o *s3.Options) {
 			o.BaseEndpoint = aws.String(endpoint)
 			o.UsePathStyle = usePathStyle
+			if !strings.Contains(endpoint, "amazonaws.com") {
+				// S3-compatible services commonly reject the SDK's default
+				// trailing checksum negotiation. Only relax this for explicit
+				// non-AWS endpoints; standard AWS S3 keeps its default behavior.
+				o.RequestChecksumCalculation = aws.RequestChecksumCalculationWhenRequired
+			}
+			o.HTTPClient = httpClient
 		})
 	} else {
 		// Standard AWS S3
-		client = s3.NewFromConfig(cfg)
+		client = s3.NewFromConfig(cfg, func(o *s3.Options) {
+			o.HTTPClient = httpClient
+		})
 	}
 
 	// Normalize pathPrefix: ensure it ends with '/' if not empty
@@ -75,7 +97,7 @@ func newS3Client(endpoint, accessKey, secretKey, bucketName, region, pathPrefix 
 func NewS3FileService(endpoint,
 	accessKey, secretKey, bucketName, region, pathPrefix string,
 ) (interfaces.FileService, error) {
-	svc, err := newS3Client(endpoint, accessKey, secretKey, bucketName, region, pathPrefix)
+	svc, err := newS3Client(endpoint, accessKey, secretKey, bucketName, region, pathPrefix, false)
 	if err != nil {
 		return nil, err
 	}
@@ -92,6 +114,25 @@ func NewS3FileService(endpoint,
 		}
 	}
 
+	return svc, nil
+}
+
+// NewS3FileServiceWithOptions is the instance-aware S3 constructor. Existing
+// callers keep the historical endpoint-based path-style inference.
+func NewS3FileServiceWithOptions(endpoint, accessKey, secretKey, bucketName, region, pathPrefix string, forcePathStyle bool) (interfaces.FileService, error) {
+	svc, err := newS3Client(endpoint, accessKey, secretKey, bucketName, region, pathPrefix, forcePathStyle)
+	if err != nil {
+		return nil, err
+	}
+	exists, err := svc.bucketExists(context.Background())
+	if err != nil {
+		return nil, fmt.Errorf("failed to check bucket: %w", err)
+	}
+	if !exists {
+		if err = svc.createBucket(context.Background()); err != nil {
+			return nil, fmt.Errorf("failed to create bucket: %w", err)
+		}
+	}
 	return svc, nil
 }
 
@@ -144,7 +185,11 @@ func (s *s3FileService) CheckConnectivity(ctx context.Context) error {
 // CheckS3Connectivity tests S3 connectivity using the provided credentials.
 // It creates a temporary service instance internally and delegates to CheckConnectivity.
 func CheckS3Connectivity(ctx context.Context, endpoint, accessKey, secretKey, bucketName, region string) error {
-	svc, err := newS3Client(endpoint, accessKey, secretKey, bucketName, region, "")
+	return CheckS3ConnectivityWithOptions(ctx, endpoint, accessKey, secretKey, bucketName, region, false)
+}
+
+func CheckS3ConnectivityWithOptions(ctx context.Context, endpoint, accessKey, secretKey, bucketName, region string, forcePathStyle bool) error {
+	svc, err := newS3Client(endpoint, accessKey, secretKey, bucketName, region, "", forcePathStyle)
 	if err != nil {
 		return err
 	}
@@ -242,6 +287,37 @@ func (s *s3FileService) DeleteFile(ctx context.Context, filePath string) error {
 	}
 
 	return nil
+}
+
+// CopyFile copies an existing S3 object to a new knowledge-owned object using a
+// server-side CopyObject (no data leaves S3). The destination uses the same
+// layout as SaveFile. Returns ErrCrossBackendCopy when srcPath is not an s3:// path.
+func (s *s3FileService) CopyFile(ctx context.Context,
+	srcPath string, tenantID uint64, knowledgeID string,
+) (string, error) {
+	srcKey, err := s.parseS3FilePath(srcPath)
+	if err != nil {
+		return "", fmt.Errorf("s3 copy rejected source %q: %w", srcPath, ErrCrossBackendCopy)
+	}
+
+	ext := filepath.Ext(srcPath)
+	destKey := fmt.Sprintf("%s%d/%s/%s%s", s.pathPrefix, tenantID, knowledgeID, uuid.New().String(), ext)
+
+	// CopySource is "bucket/key"; the '/' separators must NOT be percent-encoded
+	// (url.PathEscape would turn them into %2F and break the bucket/key split).
+	// srcKey is already validated by parseS3FilePath -> SafeObjectKey.
+	_, err = s.client.CopyObject(ctx, &s3.CopyObjectInput{
+		Bucket:     aws.String(s.bucketName),
+		CopySource: aws.String(s.bucketName + "/" + srcKey),
+		Key:        aws.String(destKey),
+	})
+	if err != nil {
+		return "", fmt.Errorf("failed to copy file in S3: %w", err)
+	}
+
+	newPath := fmt.Sprintf("s3://%s/%s", s.bucketName, destKey)
+	logger.Infof(ctx, "Copied S3 object %s to %s", srcPath, newPath)
+	return newPath, nil
 }
 
 // SaveBytes saves bytes data to S3 and returns the file path

@@ -139,6 +139,7 @@ type AgentCompleteData struct {
 	FinalAnswer     string                 `json:"final_answer"`
 	KnowledgeRefs   []interface{}          `json:"knowledge_refs,omitempty"` // []*types.SearchResult
 	AgentSteps      interface{}            `json:"agent_steps,omitempty"`    // []types.AgentStep - detailed execution steps
+	Usage           interface{}            `json:"usage,omitempty"`          // *types.TokenUsage - LLM token usage aggregated over the turn
 	TotalDurationMs int64                  `json:"total_duration_ms"`
 	MessageID       string                 `json:"message_id,omitempty"` // Assistant message ID
 	RequestID       string                 `json:"request_id,omitempty"`
@@ -182,11 +183,37 @@ type AgentReferencesData struct {
 	Iteration  int         `json:"iteration"`
 }
 
+// MemoryRecalledData carries the long-term memories injected into this turn.
+// Memories is []types.UsedMemory, kept as interface{} for the same reason
+// AgentReferencesData does: the event package stays free of a types import.
+type MemoryRecalledData struct {
+	Memories interface{} `json:"memories"`
+}
+
 // AgentFinalAnswerData represents final answer streaming data
 type AgentFinalAnswerData struct {
 	Content    string `json:"content"`
 	Done       bool   `json:"done"`
 	IsFallback bool   `json:"is_fallback,omitempty"` // True when response is a fallback (no knowledge base match)
+}
+
+// ContextCompactedData reports that older conversation was replaced by a
+// summary. Compaction changes what the agent remembers, so it is shown rather
+// than hidden: an answer that forgets an earlier instruction is otherwise
+// indistinguishable from the model ignoring it.
+type ContextCompactedData struct {
+	Reason         string `json:"reason"` // threshold | overflow
+	Round          int    `json:"round"`
+	TokensBefore   int    `json:"tokens_before"`
+	TokensAfter    int    `json:"tokens_after"`
+	MessagesBefore int    `json:"messages_before"`
+	MessagesAfter  int    `json:"messages_after"`
+	Summary        string `json:"summary"`
+	// Degraded marks a summary that came from the mechanical archive because
+	// the summarizer failed.
+	Degraded bool `json:"degraded,omitempty"`
+	// SplitTurn marks a cut that landed inside a single turn.
+	SplitTurn bool `json:"split_turn,omitempty"`
 }
 
 // AgentReflectionData represents agent reflection data
@@ -208,4 +235,60 @@ type StopData struct {
 	SessionID string `json:"session_id"`
 	MessageID string `json:"message_id"`
 	Reason    string `json:"reason,omitempty"` // Optional reason for stopping
+}
+
+// ToolApprovalRequiredData is emitted when an MCP tool marked dangerous is about to run.
+type ToolApprovalRequiredData struct {
+	PendingID          string      `json:"pending_id"`
+	TenantID           uint64      `json:"tenant_id"`
+	SessionID          string      `json:"session_id"`
+	AssistantMessageID string      `json:"assistant_message_id"`
+	ServiceID          string      `json:"service_id"`
+	ServiceName        string      `json:"service_name"`
+	MCPToolName        string      `json:"mcp_tool_name"`
+	RegisteredToolName string      `json:"registered_tool_name"`
+	Description        string      `json:"description"`
+	Args               interface{} `json:"args,omitempty"`
+	ArgsJSON           string      `json:"args_json,omitempty"`
+	TimeoutSeconds     int         `json:"timeout_seconds"`
+	RequestedAtUnix    int64       `json:"requested_at"`
+	ToolCallID         string      `json:"tool_call_id"`
+	RequestID          string      `json:"request_id,omitempty"`
+}
+
+// ToolApprovalResolvedData confirms the user decision (or timeout/cancel).
+type ToolApprovalResolvedData struct {
+	PendingID string `json:"pending_id"`
+	Approved  bool   `json:"approved"`
+	Reason    string `json:"reason,omitempty"`
+	TimedOut  bool   `json:"timed_out,omitempty"`
+	Canceled  bool   `json:"canceled,omitempty"`
+}
+
+// MCPOAuthRequiredData is emitted when an OAuth-enabled MCP service is invoked
+// during a conversation but the current user has not authorized it yet. The
+// UI surfaces an "Authorize" card; the agent pauses until the user authorizes.
+type MCPOAuthRequiredData struct {
+	PendingID          string `json:"pending_id"`
+	TenantID           uint64 `json:"tenant_id"`
+	SessionID          string `json:"session_id"`
+	AssistantMessageID string `json:"assistant_message_id"`
+	ServiceID          string `json:"service_id"`
+	ServiceName        string `json:"service_name"`
+	MCPToolName        string `json:"mcp_tool_name"`
+	TimeoutSeconds     int    `json:"timeout_seconds"`
+	RequestedAtUnix    int64  `json:"requested_at"`
+	ToolCallID         string `json:"tool_call_id"`
+	RequestID          string `json:"request_id,omitempty"`
+}
+
+// MCPOAuthResolvedData confirms the outcome of an in-conversation OAuth prompt
+// (authorized / timeout / cancel).
+type MCPOAuthResolvedData struct {
+	PendingID  string `json:"pending_id"`
+	ServiceID  string `json:"service_id"`
+	Authorized bool   `json:"authorized"`
+	Reason     string `json:"reason,omitempty"`
+	TimedOut   bool   `json:"timed_out,omitempty"`
+	Canceled   bool   `json:"canceled,omitempty"`
 }

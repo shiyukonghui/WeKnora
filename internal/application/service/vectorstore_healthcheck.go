@@ -6,18 +6,23 @@ import (
 	"encoding/json"
 	"fmt"
 	"io"
-	"net"
 	"net/http"
+	"strings"
 	"time"
 
+	openSearchRepo "github.com/Tencent/WeKnora/internal/application/repository/retriever/opensearch"
 	"github.com/Tencent/WeKnora/internal/errors"
 	"github.com/Tencent/WeKnora/internal/logger"
 	"github.com/Tencent/WeKnora/internal/types"
+	secutils "github.com/Tencent/WeKnora/internal/utils"
+	"github.com/go-sql-driver/mysql"   // MySQL driver for database/sql, used by Doris connection test
 	_ "github.com/jackc/pgx/v5/stdlib" // pgx driver for database/sql
 	"github.com/qdrant/go-client/qdrant"
+	"github.com/tencent/vectordatabase-sdk-go/tcvectordb"
 	"github.com/weaviate/weaviate-go-client/v5/weaviate"
 	"github.com/weaviate/weaviate-go-client/v5/weaviate/auth"
 	wgrpc "github.com/weaviate/weaviate-go-client/v5/weaviate/grpc"
+	"google.golang.org/grpc"
 )
 
 const connectionTestTimeout = 10 * time.Second
@@ -38,8 +43,14 @@ func (s *vectorStoreService) TestConnection(
 		return testQdrantConnection(ctx, config)
 	case types.MilvusRetrieverEngineType:
 		return testMilvusConnection(ctx, config)
+	case types.TencentVectorDBRetrieverEngineType:
+		return testTencentVectorDBConnection(ctx, config)
 	case types.WeaviateRetrieverEngineType:
 		return testWeaviateConnection(ctx, config)
+	case types.DorisRetrieverEngineType:
+		return testDorisConnection(ctx, config)
+	case types.OpenSearchRetrieverEngineType:
+		return testOpenSearchConnection(ctx, config)
 	case types.SQLiteRetrieverEngineType:
 		// SQLite is file-based, no remote connection to test
 		return "", nil
@@ -61,7 +72,15 @@ func testElasticsearchConnection(ctx context.Context, config types.ConnectionCon
 		req.SetBasicAuth(config.Username, config.Password)
 	}
 
-	client := &http.Client{Timeout: connectionTestTimeout}
+	clientCfg := secutils.DefaultSSRFSafeHTTPClientConfig()
+	clientCfg.Timeout = connectionTestTimeout
+	client := secutils.NewSSRFSafeHTTPClient(clientCfg)
+	client.CheckRedirect = func(*http.Request, []*http.Request) error {
+		// A health probe must not follow redirects: a malicious or compromised
+		// endpoint could return a 302 to an internal address, defeating the
+		// SSRF check that only validated the original (user-supplied) Addr.
+		return http.ErrUseLastResponse
+	}
 	resp, err := client.Do(req)
 	if err != nil {
 		logger.Warnf(ctx, "Elasticsearch connection test failed: %v", err)
@@ -137,6 +156,9 @@ func testQdrantConnection(ctx context.Context, config types.ConnectionConfig) (s
 		Port:   port,
 		APIKey: config.APIKey,
 		UseTLS: config.UseTLS,
+		GrpcOptions: []grpc.DialOption{
+			grpc.WithContextDialer(secutils.SSRFSafeGRPCDialer),
+		},
 	})
 	if err != nil {
 		return "", errors.NewBadRequestError("failed to create qdrant client: invalid configuration")
@@ -166,13 +188,37 @@ func testMilvusConnection(ctx context.Context, config types.ConnectionConfig) (s
 		addr = "localhost:19530"
 	}
 
-	conn, err := (&net.Dialer{}).DialContext(testCtx, "tcp", addr)
+	conn, err := secutils.SSRFSafeDialContext(testCtx, "tcp", addr)
 	if err != nil {
 		logger.Warnf(ctx, "Milvus connection test failed: %v", err)
 		return "", errors.NewBadRequestError("failed to connect to milvus: connection refused or server unreachable")
 	}
 	defer conn.Close()
 
+	return "", nil
+}
+
+func testTencentVectorDBConnection(ctx context.Context, config types.ConnectionConfig) (string, error) {
+	testCtx, cancel := context.WithTimeout(ctx, connectionTestTimeout)
+	defer cancel()
+
+	client, err := tcvectordb.NewRpcClient(config.Addr, config.Username, config.APIKey, &tcvectordb.ClientOption{
+		ReadConsistency: tcvectordb.EventualConsistency,
+		Timeout:         connectionTestTimeout,
+		Transport: &secutils.SSRFValidatingRoundTripper{
+			Base: secutils.NewSSRFSafeTransport(secutils.DefaultSSRFSafeHTTPClientConfig()),
+		},
+	})
+	if err != nil {
+		logger.Warnf(ctx, "Tencent VectorDB connection test failed: %v", err)
+		return "", errors.NewBadRequestError("failed to connect to tencent vectordb: connection refused or authentication failed")
+	}
+	defer client.Close()
+
+	if _, err := client.ListDatabase(testCtx); err != nil {
+		logger.Warnf(ctx, "Tencent VectorDB list database failed: %v", err)
+		return "", errors.NewBadRequestError("failed to connect to tencent vectordb: authentication failed or server error")
+	}
 	return "", nil
 }
 
@@ -194,7 +240,8 @@ func testWeaviateConnection(ctx context.Context, config types.ConnectionConfig) 
 	}
 
 	weaviateCfg := weaviate.Config{
-		Host: host,
+		Host:             host,
+		ConnectionClient: secutils.NewSSRFSafeHTTPClient(secutils.DefaultSSRFSafeHTTPClientConfig()),
 		GrpcConfig: &wgrpc.Config{
 			Host: grpcAddress,
 		},
@@ -225,4 +272,76 @@ func testWeaviateConnection(ctx context.Context, config types.ConnectionConfig) 
 	}
 
 	return meta.Version, nil
+}
+
+// testDorisConnection 通过 MySQL 协议（database/sql + go-sql-driver）
+// Ping Doris FE 并查询 @@version。
+//
+// Doris 的 @@version 形如 "5.7.99 Doris-4.1.0"——前半段是 MySQL 协议
+// 兼容性表达式，"Doris-" 之后才是真实版本号。统一只返回 "4.1.0" 这类
+// 裸版本号，与 Postgres/ES 路径的格式保持一致。
+func testDorisConnection(ctx context.Context, config types.ConnectionConfig) (string, error) {
+	testCtx, cancel := context.WithTimeout(ctx, connectionTestTimeout)
+	defer cancel()
+
+	if config.Addr == "" {
+		return "", errors.NewBadRequestError("failed to create doris connection: addr is required")
+	}
+
+	// Database 不强制要求；Ping 时无明确库则用 information_schema（任何 MySQL 兼容服务都有）。
+	database := config.Database
+	if database == "" {
+		database = "information_schema"
+	}
+
+	// 用 mysql.Config.FormatDSN() 构造 DSN，避免用户名/密码中 `@` `:` `/`
+	// 等特殊字符破坏字面量拼接（fmt.Sprintf 会跑偏，参考 issue #1234 类问题）。
+	cfg := mysql.NewConfig()
+	cfg.User = config.Username
+	cfg.Passwd = config.Password
+	secutils.RegisterMySQLSSRFDialer()
+	cfg.Net = secutils.MySQLSSRFNetwork
+	cfg.Addr = config.Addr
+	cfg.DBName = database
+	cfg.Timeout = 5 * time.Second
+	db, err := sql.Open("mysql", cfg.FormatDSN())
+	if err != nil {
+		return "", errors.NewBadRequestError("failed to create doris connection: invalid configuration")
+	}
+	defer db.Close()
+
+	if err := db.PingContext(testCtx); err != nil {
+		logger.Warnf(ctx, "Doris connection test failed: %v", err)
+		return "", errors.NewBadRequestError("failed to connect to doris: connection refused or authentication failed")
+	}
+
+	var version string
+	if err := db.QueryRowContext(testCtx, "SELECT @@version").Scan(&version); err != nil {
+		logger.Warnf(ctx, "Doris version detection failed: %v", err)
+		return "", nil
+	}
+	if i := strings.Index(version, "Doris-"); i >= 0 {
+		return strings.TrimSpace(version[i+len("Doris-"):]), nil
+	}
+	return version, nil
+}
+
+// testOpenSearchConnection verifies the cluster is reachable, runs a
+// supported OpenSearch version, and has the k-NN plugin installed. The driver
+// owns the probe logic; a generic message is returned on failure so cluster
+// internals are not surfaced to the API caller.
+func testOpenSearchConnection(ctx context.Context, config types.ConnectionConfig) (string, error) {
+	if config.Addr == "" {
+		return "", errors.NewBadRequestError("failed to create opensearch connection: addr is required")
+	}
+	testCtx, cancel := context.WithTimeout(ctx, connectionTestTimeout)
+	defer cancel()
+	if err := openSearchRepo.TestConnection(testCtx, &config); err != nil {
+		logger.Warnf(ctx, "OpenSearch connection test failed: %v", err)
+		return "", errors.NewBadRequestError(
+			"failed to connect to opensearch: check address, credentials, version (>= 2.4), and that the k-NN plugin is installed")
+	}
+	// Version is detected during the probe but not surfaced here; lazy index
+	// creation re-validates on first use.
+	return "", nil
 }

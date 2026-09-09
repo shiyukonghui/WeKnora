@@ -3,6 +3,8 @@ package types
 import (
 	"database/sql/driver"
 	"encoding/json"
+	"fmt"
+	"strings"
 	"time"
 
 	"gorm.io/gorm"
@@ -26,6 +28,8 @@ const (
 	BuiltinWikiResearcherID = "builtin-wiki-researcher"
 	// BuiltinWikiFixerID is the ID for the built-in wiki fixer agent
 	BuiltinWikiFixerID = "builtin-wiki-fixer"
+	// BuiltinSkillInstallerID is the ID for the built-in skill installer agent
+	BuiltinSkillInstallerID = "builtin-skill-installer"
 )
 
 // AgentMode constants for agent running mode
@@ -83,6 +87,11 @@ type CustomAgent struct {
 	CreatedAt time.Time      `yaml:"created_at" json:"created_at"`
 	UpdatedAt time.Time      `yaml:"updated_at" json:"updated_at"`
 	DeletedAt gorm.DeletedAt `yaml:"deleted_at" json:"deleted_at" gorm:"index"`
+
+	// CreatorName 由 list handler 在返回前批量回填，作用同 KnowledgeBase.CreatorName：
+	// 让前端列表卡片区分「我创建」与「同空间其他成员创建」。不落库，内建 agent / 老数据
+	// 仍可能为空。
+	CreatorName string `yaml:"-" json:"creator_name,omitempty" gorm:"-"`
 }
 
 // CustomAgentConfig represents the configuration of a custom agent
@@ -114,13 +123,20 @@ type CustomAgentConfig struct {
 	RerankModelID string `yaml:"rerank_model_id" json:"rerank_model_id"`
 	// Temperature for LLM (0-1)
 	Temperature float64 `yaml:"temperature" json:"temperature"`
-	// Maximum completion tokens (only for normal mode)
+	// Maximum completion tokens. Quick-answer uses this for the RAG answer.
+	// Smart-reasoning ReAct rounds send this value as-is (zero becomes
+	// DefaultMaxCompletionTokens at call time: 4096, or 24576 with a sandbox).
 	MaxCompletionTokens int `yaml:"max_completion_tokens" json:"max_completion_tokens"`
 	// Whether to enable thinking mode (for models that support extended thinking)
 	Thinking *bool `yaml:"thinking" json:"thinking"`
+	// Whether final answers include knowledge/web source citations. Nil defaults to true
+	// so agents saved before this option was introduced keep their existing behavior.
+	CitationEnabled *bool `yaml:"citation_enabled" json:"citation_enabled"`
 
 	// ===== Agent Mode Settings =====
-	// Maximum iterations for ReAct loop (only for agent type)
+	// Maximum iterations for the ReAct loop. Zero is unset (filled with a
+	// default). A negative value is unlimited: the loop runs until the model
+	// stops, the user cancels, or another guard fires.
 	MaxIterations int `yaml:"max_iterations" json:"max_iterations"`
 	// Timeout for a single LLM call in seconds (0 = use global default)
 	LLMCallTimeout int `yaml:"llm_call_timeout" json:"llm_call_timeout,omitempty"`
@@ -130,12 +146,25 @@ type CustomAgentConfig struct {
 	MCPSelectionMode string `yaml:"mcp_selection_mode" json:"mcp_selection_mode"`
 	// Selected MCP service IDs (only used when MCPSelectionMode is "selected")
 	MCPServices []string `yaml:"mcp_services" json:"mcp_services"`
+	// MCPAuthWaitTimeout is how many seconds to wait for in-conversation OAuth
+	// authorization before skipping. <=0 uses the gate's configured timeout.
+	MCPAuthWaitTimeout int `yaml:"mcp_auth_wait_timeout,omitempty" json:"mcp_auth_wait_timeout,omitempty"`
 
 	// ===== Skills Settings (only for smart-reasoning mode) =====
-	// Skills selection mode: "all" = all preloaded skills, "selected" = specific skills, "none" = no skills
+	// Skills selection mode: "all" = all installed skills, "selected" = specific skills, "none" = no skills
 	SkillsSelectionMode string `yaml:"skills_selection_mode" json:"skills_selection_mode"`
 	// Selected skill names (only used when SkillsSelectionMode is "selected")
 	SelectedSkills []string `yaml:"selected_skills" json:"selected_skills"`
+
+	// ===== Sandbox Settings =====
+	// SandboxConfigID selects which workspace sandbox config this agent's
+	// skill scripts run on. Empty means sandbox execution is disabled.
+	//
+	// This references the LOGICAL config, never a specific revision: keeping
+	// the indirection here is what would let credential rotation happen
+	// without re-pointing every agent (see the spec's §4.8).
+	SandboxConfigID string `yaml:"sandbox_config_id" json:"sandbox_config_id,omitempty"`
+
 	// ===== Knowledge Base Settings =====
 	// Knowledge base selection mode: "all" = all KBs, "selected" = specific KBs, "none" = no KB
 	KBSelectionMode string `yaml:"kb_selection_mode" json:"kb_selection_mode"`
@@ -152,14 +181,14 @@ type CustomAgentConfig struct {
 	// ===== Image Upload / Multimodal Settings =====
 	// Whether image upload is enabled for this agent (default: false)
 	ImageUploadEnabled bool `yaml:"image_upload_enabled" json:"image_upload_enabled"`
-	// VLM model ID for image analysis (optional, falls back to tenant-level VLM)
+	// VLM model ID for image analysis (optional, falls back to workspace-level VLM)
 	VLMModelID string `yaml:"vlm_model_id" json:"vlm_model_id"`
 	// Whether audio upload (ASR transcription) is enabled for this agent (default: false)
 	AudioUploadEnabled bool `yaml:"audio_upload_enabled" json:"audio_upload_enabled"`
 	// ASR model ID for audio transcription (optional)
 	ASRModelID string `yaml:"asr_model_id" json:"asr_model_id"`
-	// Storage provider for image uploads: "local", "minio", "cos", "tos"
-	// Empty means use the global/tenant default provider.
+	// Storage provider for image uploads: "local", "minio", "cos", "tos", "s3", "oss", "ks3".
+	// Empty means use the global/workspace default provider.
 	ImageStorageProvider string `yaml:"image_storage_provider" json:"image_storage_provider"`
 
 	// ===== File Type Restriction Settings =====
@@ -167,6 +196,35 @@ type CustomAgentConfig struct {
 	// Empty means all file types are supported
 	// When set, only files with matching extensions can be used with this agent
 	SupportedFileTypes []string `yaml:"supported_file_types" json:"supported_file_types"`
+
+	// ===== Chat Attachment Parsing Settings =====
+	// ChatParserEngineRules selects parser engines for session-scoped chat
+	// attachments by file type. Takes precedence over the tenant-level
+	// ParserEngineConfig.ChatParserEngineRules; an explicit per-request
+	// parser_engine still overrides both.
+	ChatParserEngineRules []ParserEngineRule `yaml:"chat_parser_engine_rules" json:"chat_parser_engine_rules,omitempty"`
+	// AttachmentImageUnderstanding enables VLM OCR fallback for image-only /
+	// scanned documents (PDF/PPT whose pages are images). Disabled by default
+	// because it materially increases parse latency; only triggers when the
+	// extracted text is below a threshold and a VLM model is configured.
+	AttachmentImageUnderstanding bool `yaml:"attachment_image_understanding" json:"attachment_image_understanding"`
+	// AttachmentOCRMaxPages caps how many pages of a scanned / image-only
+	// document this agent sends to the VLM for OCR. 0 falls back to the global
+	// default (WEKNORA_CHAT_ATTACHMENT_OCR_MAX_PAGES). More pages means higher
+	// coverage but slower parsing and more VLM cost.
+	AttachmentOCRMaxPages int `yaml:"attachment_ocr_max_pages" json:"attachment_ocr_max_pages,omitempty"`
+	// AttachmentParseWaitTimeoutSec bounds, in seconds, how long a chat turn
+	// waits for this agent's still-parsing attachments before proceeding with
+	// only the finished ones. 0 falls back to the global default
+	// (WEKNORA_CHAT_ATTACHMENT_WAIT_TIMEOUT_SEC).
+	AttachmentParseWaitTimeoutSec int `yaml:"attachment_parse_wait_timeout_sec" json:"attachment_parse_wait_timeout_sec,omitempty"`
+
+	// ===== Data Analysis Settings =====
+	// Whether to run the legacy in-pipeline DuckDB SQL data-analysis stage when
+	// the retrieved chunks include CSV/Excel files. This issues an extra LLM
+	// call to generate a SQL query and is disabled by default because most
+	// quick-answer / RAG-style agents do not want the added latency.
+	DataAnalysisEnabled bool `yaml:"data_analysis_enabled" json:"data_analysis_enabled"`
 
 	// ===== FAQ Strategy Settings =====
 	// Whether FAQ priority strategy is enabled (FAQ answers prioritized over document chunks)
@@ -182,7 +240,7 @@ type CustomAgentConfig struct {
 	// Maximum web search results
 	WebSearchMaxResults int `yaml:"web_search_max_results" json:"web_search_max_results"`
 	// WebSearchProviderID references a specific WebSearchProviderEntity.
-	// If empty, the tenant's default provider (is_default=true) is used.
+	// If empty, the workspace's default provider (is_default=true) is used.
 	WebSearchProviderID string `yaml:"web_search_provider_id" json:"web_search_provider_id,omitempty"`
 	// Whether to auto-fetch full page content for reranked web search results
 	WebFetchEnabled bool `yaml:"web_fetch_enabled" json:"web_fetch_enabled"`
@@ -194,6 +252,10 @@ type CustomAgentConfig struct {
 	MultiTurnEnabled bool `yaml:"multi_turn_enabled" json:"multi_turn_enabled"`
 	// Number of history turns to keep in context
 	HistoryTurns int `yaml:"history_turns" json:"history_turns"`
+	// Whether this agent may read the user's long-term memory. Nil inherits
+	// the workspace setting; false opts a single agent out of memory even when
+	// the workspace has it on. There is no "on" that overrides the workspace.
+	MemoryEnabled *bool `yaml:"memory_enabled" json:"memory_enabled,omitempty"`
 
 	// ===== Retrieval Strategy Settings (for both modes) =====
 	// Embedding/Vector retrieval top K
@@ -216,16 +278,165 @@ type CustomAgentConfig struct {
 	RewritePromptSystem string `yaml:"rewrite_prompt_system" json:"rewrite_prompt_system"`
 	// Rewrite prompt user message template
 	RewritePromptUser string `yaml:"rewrite_prompt_user" json:"rewrite_prompt_user"`
+	// Dedicated chat model ID for the query-understanding (rewrite + intent) step.
+	// When empty, the main conversation ModelID is used as a fallback.
+	QueryUnderstandModelID string `yaml:"query_understand_model_id" json:"query_understand_model_id,omitempty"`
 	// Fallback strategy: "fixed" for fixed response, "model" for model generation
 	FallbackStrategy string `yaml:"fallback_strategy" json:"fallback_strategy"`
 	// Fixed fallback response (when FallbackStrategy is "fixed")
 	FallbackResponse string `yaml:"fallback_response" json:"fallback_response"`
 	// Fallback prompt (when FallbackStrategy is "model")
 	FallbackPrompt string `yaml:"fallback_prompt" json:"fallback_prompt"`
+	// IntentPrompts holds per-intent system prompt overrides for non-retrieval
+	// intents (greeting, chitchat, etc.). Empty values fall back to templates
+	// under config/prompt_templates/intent_prompts.yaml.
+	IntentPrompts map[string]string `yaml:"intent_prompts" json:"intent_prompts,omitempty"`
 
-	// ===== Suggested Prompts =====
-	// 推荐问题列表，用于在前端对话面板展示快捷提问
-	SuggestedPrompts []string `yaml:"suggested_prompts" json:"suggested_prompts,omitempty"`
+	// ===== Conversation Question Suggestions =====
+	// QuestionSuggestions owns both the static/knowledge-backed prompts shown
+	// before the first user turn and the contextual follow-up questions shown
+	// after a completed assistant answer.
+	QuestionSuggestions *QuestionSuggestionConfig `yaml:"question_suggestions,omitempty" json:"question_suggestions,omitempty"`
+}
+
+const (
+	SuggestionModeCurated   = "curated"
+	SuggestionModeKnowledge = "knowledge"
+	SuggestionModeGenerated = "generated"
+	SuggestionModeHybrid    = "hybrid"
+
+	SuggestionCategoryClarify = "clarify"
+	SuggestionCategoryDeepen  = "deepen"
+	SuggestionCategoryAction  = "action"
+)
+
+// QuestionSuggestionConfig is the agent-owned configuration for question
+// suggestions. Channel settings may suppress rendering, but never override
+// this content/generation policy.
+type QuestionSuggestionConfig struct {
+	Starters  StarterSuggestionConfig  `yaml:"starters" json:"starters"`
+	FollowUps FollowUpSuggestionConfig `yaml:"follow_ups" json:"follow_ups"`
+}
+
+// StarterSuggestionConfig controls prompts shown before the first user turn.
+type StarterSuggestionConfig struct {
+	Enabled bool     `yaml:"enabled" json:"enabled"`
+	Mode    string   `yaml:"mode" json:"mode"`
+	Items   []string `yaml:"items" json:"items"`
+	Count   int      `yaml:"count" json:"count"`
+}
+
+// FollowUpSuggestionConfig controls contextual questions generated after a
+// completed assistant answer.
+type FollowUpSuggestionConfig struct {
+	Enabled                        bool     `yaml:"enabled" json:"enabled"`
+	Mode                           string   `yaml:"mode" json:"mode"`
+	Count                          int      `yaml:"count" json:"count"`
+	ModelID                        string   `yaml:"model_id,omitempty" json:"model_id,omitempty"`
+	AdditionalInstruction          string   `yaml:"additional_instruction,omitempty" json:"additional_instruction,omitempty"`
+	Categories                     []string `yaml:"categories,omitempty" json:"categories,omitempty"`
+	MaxContextTurns                int      `yaml:"max_context_turns" json:"max_context_turns"`
+	SuppressOnFallback             bool     `yaml:"suppress_on_fallback" json:"suppress_on_fallback"`
+	SuppressWhenAnswerAsksQuestion bool     `yaml:"suppress_when_answer_asks_question" json:"suppress_when_answer_asks_question"`
+	KnowledgeFallback              bool     `yaml:"knowledge_fallback" json:"knowledge_fallback"`
+	AllowRegenerate                bool     `yaml:"allow_regenerate" json:"allow_regenerate"`
+}
+
+// EnsureDefaults normalizes suggestion configuration without overriding
+// explicit enable/disable choices.
+func (c *QuestionSuggestionConfig) EnsureDefaults() {
+	if c.Starters.Mode == "" {
+		c.Starters.Mode = SuggestionModeHybrid
+	}
+	if c.Starters.Count <= 0 {
+		c.Starters.Count = 6
+	}
+	if c.Starters.Items == nil {
+		c.Starters.Items = []string{}
+	}
+	if c.FollowUps.Mode == "" {
+		c.FollowUps.Mode = SuggestionModeHybrid
+	}
+	if c.FollowUps.Count <= 0 {
+		c.FollowUps.Count = 3
+	}
+	if c.FollowUps.MaxContextTurns <= 0 {
+		c.FollowUps.MaxContextTurns = 2
+	}
+	if len(c.FollowUps.Categories) == 0 {
+		c.FollowUps.Categories = []string{
+			SuggestionCategoryClarify,
+			SuggestionCategoryDeepen,
+			SuggestionCategoryAction,
+		}
+	}
+}
+
+// Validate rejects invalid agent-authored suggestion settings before they are
+// persisted or used to incur a model call.
+func (c *QuestionSuggestionConfig) Validate() error {
+	if c == nil {
+		return nil
+	}
+	if c.Starters.Count < 1 || c.Starters.Count > 8 {
+		return fmt.Errorf("starter suggestion count must be between 1 and 8")
+	}
+	if c.FollowUps.Count < 1 || c.FollowUps.Count > 5 {
+		return fmt.Errorf("follow-up suggestion count must be between 1 and 5")
+	}
+	if c.FollowUps.MaxContextTurns < 1 || c.FollowUps.MaxContextTurns > 5 {
+		return fmt.Errorf("follow-up max_context_turns must be between 1 and 5")
+	}
+	if !oneOf(c.Starters.Mode, SuggestionModeCurated, SuggestionModeKnowledge, SuggestionModeHybrid) {
+		return fmt.Errorf("invalid starter suggestion mode %q", c.Starters.Mode)
+	}
+	if !oneOf(c.FollowUps.Mode, SuggestionModeGenerated, SuggestionModeKnowledge, SuggestionModeHybrid) {
+		return fmt.Errorf("invalid follow-up suggestion mode %q", c.FollowUps.Mode)
+	}
+	for i, item := range c.Starters.Items {
+		trimmed := strings.TrimSpace(item)
+		if trimmed == "" {
+			return fmt.Errorf("starter suggestion %d cannot be empty", i+1)
+		}
+		if len([]rune(trimmed)) > 200 {
+			return fmt.Errorf("starter suggestion %d exceeds 200 characters", i+1)
+		}
+	}
+	if len([]rune(strings.TrimSpace(c.FollowUps.AdditionalInstruction))) > 2000 {
+		return fmt.Errorf("follow-up additional_instruction exceeds 2000 characters")
+	}
+	for _, category := range c.FollowUps.Categories {
+		if !oneOf(category, SuggestionCategoryClarify, SuggestionCategoryDeepen, SuggestionCategoryAction) {
+			return fmt.Errorf("invalid follow-up suggestion category %q", category)
+		}
+	}
+	return nil
+}
+
+func oneOf(value string, allowed ...string) bool {
+	for _, candidate := range allowed {
+		if value == candidate {
+			return true
+		}
+	}
+	return false
+}
+
+// ResolveChatParserEngine returns the agent-configured parser engine for a
+// chat attachment file type, or the type-level default when no rule matches.
+// Mirrors ParserEngineConfig.ResolveChatParserEngine.
+func (c *CustomAgentConfig) ResolveChatParserEngine(fileType string) string {
+	if c != nil {
+		normalized := normalizeParserFileType(fileType)
+		for _, rule := range c.ChatParserEngineRules {
+			for _, candidate := range rule.FileTypes {
+				if normalizeParserFileType(candidate) == normalized {
+					return strings.TrimSpace(rule.Engine)
+				}
+			}
+		}
+	}
+	return DefaultParserEngine(fileType)
 }
 
 // Value implements driver.Valuer interface for CustomAgentConfig
@@ -260,11 +471,40 @@ func (a *CustomAgent) EnsureDefaults() {
 	if a == nil {
 		return
 	}
+	if a.Config.QuestionSuggestions == nil {
+		a.Config.QuestionSuggestions = &QuestionSuggestionConfig{
+			Starters: StarterSuggestionConfig{
+				Enabled: true,
+				Mode:    SuggestionModeHybrid,
+				Items:   []string{},
+				Count:   6,
+			},
+			FollowUps: FollowUpSuggestionConfig{
+				Enabled:                        false,
+				Mode:                           SuggestionModeHybrid,
+				Count:                          3,
+				MaxContextTurns:                2,
+				SuppressOnFallback:             true,
+				SuppressWhenAnswerAsksQuestion: true,
+				KnowledgeFallback:              true,
+				Categories: []string{
+					SuggestionCategoryClarify,
+					SuggestionCategoryDeepen,
+					SuggestionCategoryAction,
+				},
+			},
+		}
+	} else {
+		a.Config.QuestionSuggestions.EnsureDefaults()
+	}
 	if a.Config.Temperature < 0 {
 		a.Config.Temperature = 0.7
 	}
 	if a.Config.MaxIterations == 0 {
 		a.Config.MaxIterations = 10
+	}
+	if a.Config.MaxIterations < 0 {
+		a.Config.MaxIterations = UnlimitedMaxIterations
 	}
 	if a.Config.WebSearchMaxResults == 0 {
 		a.Config.WebSearchMaxResults = 5
@@ -289,12 +529,24 @@ func (a *CustomAgent) EnsureDefaults() {
 	if a.Config.FallbackStrategy == "" {
 		a.Config.FallbackStrategy = "model"
 	}
-	if a.Config.MaxCompletionTokens == 0 {
-		a.Config.MaxCompletionTokens = 2048
-	}
+	// MaxCompletionTokens 0 means "use DefaultMaxCompletionTokens at call
+	// time". Do not materialize a number here — that would make the editor
+	// treat a chosen default as a custom cap.
 	// Agent mode should always enable multi-turn conversation
 	if a.Config.AgentMode == AgentModeSmartReasoning {
 		a.Config.MultiTurnEnabled = true
+	}
+	// Pin thinking to an explicit false when unset so provider-specific wire
+	// formats (e.g. thinking_control=thinking_type) always receive a value.
+	if a.Config.Thinking == nil {
+		disabled := false
+		a.Config.Thinking = &disabled
+	}
+	// Keep citations enabled for existing agents whose persisted config predates
+	// this field. An explicit false is always preserved.
+	if a.Config.CitationEnabled == nil {
+		enabled := true
+		a.Config.CitationEnabled = &enabled
 	}
 }
 
@@ -321,11 +573,12 @@ var BuiltinAgentRegistry = map[string]func(uint64) *CustomAgent{}
 // builtinAgentIDsOrdered defines the fixed display order of built-in agents
 // that are exposed in the user-facing agent list (ListAgents).
 //
-// NOTE: BuiltinWikiFixerID is intentionally excluded here. The wiki fixer is
-// an internal agent invoked programmatically from the Wiki editor
-// (see frontend WikiBrowser.vue) and should not clutter the tenant's agent
-// picker. It remains fully usable via GetAgentByID because the YAML entry
-// still registers it in BuiltinAgentRegistry.
+// NOTE: BuiltinWikiFixerID and BuiltinSkillInstallerID are intentionally
+// excluded here. Both are internal agents invoked programmatically — the wiki
+// fixer from the Wiki editor, the skill installer from the sandbox-config skill
+// upload flow — and should not clutter the tenant's agent picker. They remain
+// fully usable via GetAgentByID because the YAML entries still register them in
+// BuiltinAgentRegistry.
 var builtinAgentIDsOrdered = []string{
 	BuiltinQuickAnswerID,
 	BuiltinSmartReasoningID,

@@ -96,8 +96,11 @@ app:
     AUTO_RECOVER_DIRTY: "true"
     STREAM_MANAGER_TYPE: redis
     CONCURRENCY_POOL_SIZE: "5"
-    ENABLE_GRAPH_RAG: "false"
     TZ: UTC
+    # Docker sandbox talks to a local Engine API (often docker.sock = host root).
+    # Leave false unless this is a private single-node install that also mounts
+    # the daemon socket or points at a remote tcp:// daemon with TLS.
+    WEKNORA_SANDBOX_DOCKER_ENABLED: "false"
 
   # -- Additional environment variables
   extraEnv: []
@@ -392,13 +395,23 @@ secrets:
   redisPassword: ""
   # -- JWT signing secret (REQUIRED: change in production)
   jwtSecret: ""
-  # -- Tenant AES encryption key
-  tenantAesKey: ""
-  # -- System AES-256 key for database API key encryption (32 bytes)
+  # -- System AES-256 key for database field encryption (must be exactly 32 bytes).
+  # Encrypts: tenants.api_key, model API keys, vector store credentials,
+  # web search provider keys, WeKnoraCloud.AppSecret.
+  # STRONGLY RECOMMENDED to set this explicitly in production. If left empty, a
+  # random 32-char value is generated on first install and reused on subsequent
+  # `helm upgrade` via Secret lookup. However, if the Secret is ever
+  # deleted/recreated (e.g. namespace recreated, GitOps prune, cluster rebuilt)
+  # a new random value will be generated and any data encrypted with the old
+  # key becomes UNRECOVERABLE (the UI will display ciphertext like "enc:v1:..."
+  # instead of plaintext).
+  # NOTE: TENANT_AES_KEY is deprecated since v0.4.0 — encryption now uses
+  # SYSTEM_AES_KEY exclusively. The Go app no longer reads TENANT_AES_KEY and
+  # it has been removed from the Secret.
   systemAesKey: ""
 
   # -- Use existing secret instead of creating one
-  # The secret must contain keys: DB_USER, DB_PASSWORD, DB_NAME, REDIS_USERNAME, REDIS_PASSWORD, JWT_SECRET, TENANT_AES_KEY, SYSTEM_AES_KEY
+  # The secret must contain keys: DB_USER, DB_PASSWORD, DB_NAME, REDIS_USERNAME, REDIS_PASSWORD, JWT_SECRET, SYSTEM_AES_KEY
   existingSecret: ""
 
 # -----------------------------------------------------------------------------
@@ -423,7 +436,7 @@ minio:
 
 # -- Neo4j configuration (Knowledge Graph)
 # Equivalent to: docker compose --profile neo4j
-# Required for GraphRAG feature (ENABLE_GRAPH_RAG=true)
+# Required for GraphRAG feature (sets NEO4J_ENABLE=true automatically when enabled)
 neo4j:
   # -- Enable Neo4j for GraphRAG
   enabled: false
@@ -481,12 +494,3 @@ qdrant:
   persistence:
     enabled: true
     size: 10Gi
-
-# -- Jaeger configuration (Distributed Tracing)
-# Equivalent to: docker compose --profile jaeger
-jaeger:
-  # -- Enable Jaeger tracing
-  enabled: false
-  image:
-    repository: jaegertracing/all-in-one
-    tag: latest

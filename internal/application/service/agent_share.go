@@ -23,9 +23,13 @@ var (
 	ErrAgentNotConfigured      = errors.New("agent is not fully configured (missing required chat model, or rerank model when the knowledge_search tool is enabled)")
 )
 
-// agentRequiresRerankModel returns true when the agent's configured tools
-// will actually invoke the reranker at runtime. This mirrors the runtime
-// check in session_agent_qa.go: only `knowledge_search` uses the reranker.
+// agentRequiresRerankModel returns true when the agent's configured scope and
+// tools will actually invoke the reranker at runtime. An agent whose knowledge
+// base scope is explicitly disabled cannot run knowledge_search, so it does not
+// need a rerank model even if that tool remains in AllowedTools.
+//
+// This mirrors the runtime check in session_agent_qa.go: only
+// `knowledge_search` with an enabled knowledge-base scope uses the reranker.
 // Wiki-first agents (wiki_search / wiki_read_page / …) never call it and
 // therefore don't need a rerank model configured, even when knowledge bases
 // are attached.
@@ -35,6 +39,9 @@ var (
 // that case as requiring the reranker.
 func agentRequiresRerankModel(agent *types.CustomAgent) bool {
 	if agent == nil {
+		return false
+	}
+	if agent.Config.KBSelectionMode == "none" {
 		return false
 	}
 	allowed := agent.Config.AllowedTools
@@ -49,13 +56,18 @@ func agentRequiresRerankModel(agent *types.CustomAgent) bool {
 	return false
 }
 
-// agentShareService implements AgentShareService interface
+// agentShareService implements AgentShareService.
+//
+// Plan 3 of #1303: visibility and access checks key on the caller's
+// tenant. callerTenantRole flows through every read path so the 3-D
+// cap (tenant Viewer → at most OrgRoleViewer) lands consistently.
 type agentShareService struct {
-	shareRepo    interfaces.AgentShareRepository
-	disabledRepo interfaces.TenantDisabledSharedAgentRepository
-	orgRepo      interfaces.OrganizationRepository
-	agentRepo    interfaces.CustomAgentRepository
-	userRepo     interfaces.UserRepository
+	shareRepo             interfaces.AgentShareRepository
+	disabledRepo          interfaces.TenantDisabledSharedAgentRepository
+	orgRepo               interfaces.OrganizationRepository
+	agentRepo             interfaces.CustomAgentRepository
+	userRepo              interfaces.UserRepository
+	webSearchProviderRepo interfaces.WebSearchProviderRepository
 }
 
 // NewAgentShareService creates a new agent share service
@@ -65,17 +77,77 @@ func NewAgentShareService(
 	orgRepo interfaces.OrganizationRepository,
 	agentRepo interfaces.CustomAgentRepository,
 	userRepo interfaces.UserRepository,
+	webSearchProviderRepo interfaces.WebSearchProviderRepository,
 ) interfaces.AgentShareService {
 	return &agentShareService{
-		shareRepo:    shareRepo,
-		disabledRepo: disabledRepo,
-		orgRepo:      orgRepo,
-		agentRepo:    agentRepo,
-		userRepo:     userRepo,
+		shareRepo:             shareRepo,
+		disabledRepo:          disabledRepo,
+		orgRepo:               orgRepo,
+		agentRepo:             agentRepo,
+		userRepo:              userRepo,
+		webSearchProviderRepo: webSearchProviderRepo,
 	}
 }
 
-// ShareAgent shares an agent to an organization
+func (s *agentShareService) sharedAgentInfo(
+	ctx context.Context,
+	share *types.AgentShare,
+	effective types.OrgMemberRole,
+	webSearchReadyCache map[string]bool,
+) *types.SharedAgentInfo {
+	info := &types.SharedAgentInfo{
+		Agent:          share.Agent,
+		ShareID:        share.ID,
+		OrganizationID: share.OrganizationID,
+		Permission:     effective,
+		SourceTenantID: share.SourceTenantID,
+		SharedAt:       share.CreatedAt,
+		SharedByUserID: share.SharedByUserID,
+	}
+	if share.Agent != nil {
+		types.ApplyBuiltinAgentLocalization(ctx, share.Agent)
+	}
+	if share.Organization != nil {
+		info.OrgName = share.Organization.Name
+	}
+	if share.SharedByUserID != "" && s.userRepo != nil {
+		if u, err := s.userRepo.GetUserByID(ctx, share.SharedByUserID); err == nil && u != nil {
+			info.SharedByUsername = u.Username
+		}
+	}
+	cacheKey := fmt.Sprintf("%d:%t:%s", share.SourceTenantID, share.Agent.Config.WebSearchEnabled, share.Agent.Config.WebSearchProviderID)
+	if ready, ok := webSearchReadyCache[cacheKey]; ok {
+		info.WebSearchReady = ready
+	} else {
+		info.WebSearchReady = s.isAgentWebSearchReady(ctx, share.Agent, share.SourceTenantID)
+		webSearchReadyCache[cacheKey] = info.WebSearchReady
+	}
+	return info
+}
+
+// isAgentWebSearchReady resolves only an availability bit in the source
+// workspace. Returning source provider rows would leak configuration, while
+// comparing provider IDs with the receiver workspace produces false negatives.
+func (s *agentShareService) isAgentWebSearchReady(
+	ctx context.Context,
+	agent *types.CustomAgent,
+	sourceTenantID uint64,
+) bool {
+	if agent == nil || !agent.Config.WebSearchEnabled || s.webSearchProviderRepo == nil {
+		return false
+	}
+	var provider *types.WebSearchProviderEntity
+	var err error
+	if agent.Config.WebSearchProviderID != "" {
+		provider, err = s.webSearchProviderRepo.GetByID(ctx, sourceTenantID, agent.Config.WebSearchProviderID)
+	} else {
+		provider, err = s.webSearchProviderRepo.GetDefault(ctx, sourceTenantID)
+	}
+	return err == nil && provider != nil
+}
+
+// ShareAgent shares an agent to an organization. Permission is forced to
+// OrgRoleViewer (cross-tenant agent edit is not part of v1).
 func (s *agentShareService) ShareAgent(ctx context.Context, agentID string, orgID string, userID string, tenantID uint64, permission types.OrgMemberRole) (*types.AgentShare, error) {
 	logger.Infof(ctx, "Sharing agent %s to organization %s", agentID, orgID)
 
@@ -87,10 +159,6 @@ func (s *agentShareService) ShareAgent(ctx context.Context, agentID string, orgI
 		return nil, ErrNotAgentOwner
 	}
 
-	// Require agent to be fully configured before sharing (same rules as for
-	// conversation — see session_agent_qa.go). Rerank model is only required
-	// when the `knowledge_search` tool is enabled; Wiki-only agents
-	// (wiki_search / wiki_read_page) don't call the reranker at runtime.
 	if agent.Config.ModelID == "" {
 		return nil, ErrAgentNotConfigured
 	}
@@ -106,18 +174,19 @@ func (s *agentShareService) ShareAgent(ctx context.Context, agentID string, orgI
 		return nil, err
 	}
 
-	member, err := s.orgRepo.GetMember(ctx, orgID, userID)
+	// Caller's tenant must be an org member with editor+ role to share.
+	tm, err := s.orgRepo.GetTenantMember(ctx, orgID, tenantID)
 	if err != nil {
 		if errors.Is(err, repository.ErrOrgMemberNotFound) {
-			return nil, ErrUserNotInOrg
+			return nil, ErrTenantNotInOrg
 		}
 		return nil, err
 	}
-	if !member.Role.HasPermission(types.OrgRoleEditor) {
+	if !tm.Role.HasPermission(types.OrgRoleEditor) {
 		return nil, ErrOrgRoleCannotShareAgent
 	}
 
-	// 智能体共享仅支持只读，不支持可编辑
+	// 智能体共享仅支持只读
 	permission = types.OrgRoleViewer
 
 	share := &types.AgentShare{
@@ -151,8 +220,10 @@ func (s *agentShareService) ShareAgent(ctx context.Context, agentID string, orgI
 	return share, nil
 }
 
-// RemoveShare removes an agent share
-func (s *agentShareService) RemoveShare(ctx context.Context, shareID string, userID string) error {
+// RemoveShare removes an agent share.
+// Same authz envelope as KB-share remove (see kbshare.callerCanManageShare):
+// original sharer, OR source-tenant Admin+, OR target-org admin.
+func (s *agentShareService) RemoveShare(ctx context.Context, shareID string, userID string, tenantID uint64) error {
 	share, err := s.shareRepo.GetByID(ctx, shareID)
 	if err != nil {
 		if errors.Is(err, repository.ErrAgentShareNotFound) {
@@ -160,18 +231,40 @@ func (s *agentShareService) RemoveShare(ctx context.Context, shareID string, use
 		}
 		return err
 	}
+	// (1) Original sharer.
 	if share.SharedByUserID == userID {
 		return s.shareRepo.Delete(ctx, shareID)
 	}
-	member, err := s.orgRepo.GetMember(ctx, share.OrganizationID, userID)
-	if err == nil && member.Role == types.OrgRoleAdmin {
+	// (2) Source-tenant Admin+ — Plan 3 ownership is tenant-level.
+	if tenantID != 0 && tenantID == share.SourceTenantID {
+		if types.TenantRoleFromContext(ctx).HasPermission(types.TenantRoleAdmin) {
+			return s.shareRepo.Delete(ctx, shareID)
+		}
+	}
+	// (3) Org admin in the target org (governance / sharer-left repair).
+	if tm, err := s.orgRepo.GetTenantMember(ctx, share.OrganizationID, tenantID); err == nil && tm.Role == types.OrgRoleAdmin {
 		return s.shareRepo.Delete(ctx, shareID)
 	}
 	return ErrAgentSharePermission
 }
 
-// ListSharesByAgent lists all shares for an agent
-func (s *agentShareService) ListSharesByAgent(ctx context.Context, agentID string) ([]*types.AgentShare, error) {
+// ListSharesByAgent lists all shares for an agent owned by tenantID.
+//
+// Ownership is enforced here (not only at the route layer): the caller must
+// own the agent, mirroring ListSharesByKnowledgeBase. This is the sole guard
+// for API-key principals, whose route-level OwnedAgentOrAdmin check
+// short-circuits — without this, a full-access key could enumerate any
+// tenant's agent shares by ID (cross-tenant IDOR).
+func (s *agentShareService) ListSharesByAgent(
+	ctx context.Context, agentID string, tenantID uint64,
+) ([]*types.AgentShare, error) {
+	agent, err := s.agentRepo.GetAgentByID(ctx, agentID, tenantID)
+	if err != nil || agent == nil {
+		return nil, ErrAgentNotFoundForShare
+	}
+	if agent.TenantID != tenantID {
+		return nil, ErrNotAgentOwner
+	}
 	return s.shareRepo.ListByAgent(ctx, agentID)
 }
 
@@ -180,52 +273,34 @@ func (s *agentShareService) ListSharesByOrganization(ctx context.Context, orgID 
 	return s.shareRepo.ListByOrganization(ctx, orgID)
 }
 
-// ListSharedAgents lists agents shared to the user through organizations, deduplicated by agent ID (keep highest permission)
-func (s *agentShareService) ListSharedAgents(ctx context.Context, userID string, currentTenantID uint64) ([]*types.SharedAgentInfo, error) {
-	shares, err := s.shareRepo.ListSharedAgentsForUser(ctx, userID)
+// ListSharedAgents lists agents reachable from the caller's tenant.
+func (s *agentShareService) ListSharedAgents(ctx context.Context, tenantID uint64, callerTenantRole types.TenantRole) ([]*types.SharedAgentInfo, error) {
+	shares, err := s.shareRepo.ListSharedAgentsForTenant(ctx, tenantID)
 	if err != nil {
 		return nil, err
 	}
 
 	agentInfoMap := make(map[string]*types.SharedAgentInfo)
+	webSearchReadyCache := make(map[string]bool)
 	for _, share := range shares {
-		if share.SourceTenantID == currentTenantID {
+		if share.SourceTenantID == tenantID {
 			continue
 		}
 		if share.Agent == nil {
 			continue
 		}
-		member, err := s.orgRepo.GetMember(ctx, share.OrganizationID, userID)
+		tm, err := s.orgRepo.GetTenantMember(ctx, share.OrganizationID, tenantID)
 		if err != nil {
 			continue
 		}
-		effectivePermission := share.Permission
-		if !member.Role.HasPermission(share.Permission) {
-			effectivePermission = member.Role
-		}
-		info := &types.SharedAgentInfo{
-			Agent:          share.Agent,
-			ShareID:        share.ID,
-			OrganizationID: share.OrganizationID,
-			OrgName:        "",
-			Permission:     effectivePermission,
-			SourceTenantID: share.SourceTenantID,
-			SharedAt:       share.CreatedAt,
-			SharedByUserID: share.SharedByUserID,
-		}
-		if share.Organization != nil {
-			info.OrgName = share.Organization.Name
-		}
-		if share.SharedByUserID != "" {
-			if u, err := s.userRepo.GetUserByID(ctx, share.SharedByUserID); err == nil && u != nil {
-				info.SharedByUsername = u.Username
-			}
-		}
+		effective := types.MinOrgRole(share.Permission, tm.Role)
+		effective = applyTenantRoleCap(effective, callerTenantRole)
+		info := s.sharedAgentInfo(ctx, share, effective, webSearchReadyCache)
 		key := fmt.Sprintf("%s_%d", share.AgentID, share.SourceTenantID)
 		existing, exists := agentInfoMap[key]
 		if !exists {
 			agentInfoMap[key] = info
-		} else if effectivePermission.HasPermission(existing.Permission) && effectivePermission != existing.Permission {
+		} else if effective.HasPermission(existing.Permission) && effective != existing.Permission {
 			agentInfoMap[key] = info
 		}
 	}
@@ -236,9 +311,9 @@ func (s *agentShareService) ListSharedAgents(ctx context.Context, userID string,
 	}
 
 	// Set DisabledByMe from tenant_disabled_shared_agents for current tenant
-	disabledList, err := s.disabledRepo.ListByTenantID(ctx, currentTenantID)
+	disabledList, err := s.disabledRepo.ListByTenantID(ctx, tenantID)
 	if err != nil {
-		return result, nil // non-fatal: return list without DisabledByMe
+		return result, nil
 	}
 	disabledSet := make(map[string]bool)
 	for _, d := range disabledList {
@@ -253,12 +328,14 @@ func (s *agentShareService) ListSharedAgents(ctx context.Context, userID string,
 	return result, nil
 }
 
-// ListSharedAgentsInOrganization returns all agents shared to the given organization (including those shared by the current tenant), for list-page display when a space is selected.
-func (s *agentShareService) ListSharedAgentsInOrganization(ctx context.Context, orgID string, userID string, currentTenantID uint64) ([]*types.OrganizationSharedAgentItem, error) {
-	member, err := s.orgRepo.GetMember(ctx, orgID, userID)
+// ListSharedAgentsInOrganization returns all agents shared to the given
+// organization (including those shared by the caller's tenant), for list-page
+// display when a space is selected.
+func (s *agentShareService) ListSharedAgentsInOrganization(ctx context.Context, orgID string, tenantID uint64, callerTenantRole types.TenantRole) ([]*types.OrganizationSharedAgentItem, error) {
+	tm, err := s.orgRepo.GetTenantMember(ctx, orgID, tenantID)
 	if err != nil {
 		if errors.Is(err, repository.ErrOrgMemberNotFound) {
-			return nil, ErrUserNotInOrg
+			return nil, ErrTenantNotInOrg
 		}
 		return nil, err
 	}
@@ -269,45 +346,25 @@ func (s *agentShareService) ListSharedAgentsInOrganization(ctx context.Context, 
 	}
 
 	result := make([]*types.OrganizationSharedAgentItem, 0, len(shares))
+	webSearchReadyCache := make(map[string]bool)
 	for _, share := range shares {
 		if share.Agent == nil {
 			continue
 		}
 
-		effectivePermission := share.Permission
-		if !member.Role.HasPermission(share.Permission) {
-			effectivePermission = member.Role
-		}
+		effective := types.MinOrgRole(share.Permission, tm.Role)
+		effective = applyTenantRoleCap(effective, callerTenantRole)
 
-		orgName := ""
-		if share.Organization != nil {
-			orgName = share.Organization.Name
-		}
-		info := &types.SharedAgentInfo{
-			Agent:          share.Agent,
-			ShareID:        share.ID,
-			OrganizationID: share.OrganizationID,
-			OrgName:        orgName,
-			Permission:     effectivePermission,
-			SourceTenantID: share.SourceTenantID,
-			SharedAt:       share.CreatedAt,
-			SharedByUserID: share.SharedByUserID,
-		}
-		if share.SharedByUserID != "" {
-			if u, err := s.userRepo.GetUserByID(ctx, share.SharedByUserID); err == nil && u != nil {
-				info.SharedByUsername = u.Username
-			}
-		}
+		info := s.sharedAgentInfo(ctx, share, effective, webSearchReadyCache)
 
 		item := &types.OrganizationSharedAgentItem{
 			SharedAgentInfo: *info,
-			IsMine:          share.SourceTenantID == currentTenantID,
+			IsMine:          share.SourceTenantID == tenantID,
 		}
 		result = append(result, item)
 	}
 
-	// Set DisabledByMe for entries shared by others (mine entries stay false)
-	disabledList, err := s.disabledRepo.ListByTenantID(ctx, currentTenantID)
+	disabledList, err := s.disabledRepo.ListByTenantID(ctx, tenantID)
 	if err == nil {
 		disabledSet := make(map[string]bool)
 		for _, d := range disabledList {
@@ -323,13 +380,14 @@ func (s *agentShareService) ListSharedAgentsInOrganization(ctx context.Context, 
 	return result, nil
 }
 
-// ListSharedAgentsInOrganizations returns per-org agent lists (batch); only orgs where user is member.
-func (s *agentShareService) ListSharedAgentsInOrganizations(ctx context.Context, orgIDs []string, userID string, currentTenantID uint64) (map[string][]*types.OrganizationSharedAgentItem, error) {
+// ListSharedAgentsInOrganizations returns per-org agent lists (batch); only
+// orgs where the caller's tenant is a member.
+func (s *agentShareService) ListSharedAgentsInOrganizations(ctx context.Context, orgIDs []string, tenantID uint64, callerTenantRole types.TenantRole) (map[string][]*types.OrganizationSharedAgentItem, error) {
 	out := make(map[string][]*types.OrganizationSharedAgentItem)
 	if len(orgIDs) == 0 {
 		return out, nil
 	}
-	members, err := s.orgRepo.ListMembersByUserForOrgs(ctx, userID, orgIDs)
+	members, err := s.orgRepo.ListTenantMembersByTenantForOrgs(ctx, tenantID, orgIDs)
 	if err != nil {
 		return nil, err
 	}
@@ -344,44 +402,25 @@ func (s *agentShareService) ListSharedAgentsInOrganizations(ctx context.Context,
 		}
 	}
 	disabledSet := make(map[string]bool)
-	if disabledList, err := s.disabledRepo.ListByTenantID(ctx, currentTenantID); err == nil {
+	if disabledList, err := s.disabledRepo.ListByTenantID(ctx, tenantID); err == nil {
 		for _, d := range disabledList {
 			disabledSet[fmt.Sprintf("%s_%d", d.AgentID, d.SourceTenantID)] = true
 		}
 	}
+	webSearchReadyCache := make(map[string]bool)
 	for orgID, list := range byOrg {
-		member := members[orgID]
+		tm := members[orgID]
 		result := make([]*types.OrganizationSharedAgentItem, 0, len(list))
 		for _, share := range list {
 			if share.Agent == nil {
 				continue
 			}
-			effectivePermission := share.Permission
-			if !member.Role.HasPermission(share.Permission) {
-				effectivePermission = member.Role
-			}
-			orgName := ""
-			if share.Organization != nil {
-				orgName = share.Organization.Name
-			}
-			info := &types.SharedAgentInfo{
-				Agent:          share.Agent,
-				ShareID:        share.ID,
-				OrganizationID: share.OrganizationID,
-				OrgName:        orgName,
-				Permission:     effectivePermission,
-				SourceTenantID: share.SourceTenantID,
-				SharedAt:       share.CreatedAt,
-				SharedByUserID: share.SharedByUserID,
-			}
-			if share.SharedByUserID != "" {
-				if u, err := s.userRepo.GetUserByID(ctx, share.SharedByUserID); err == nil && u != nil {
-					info.SharedByUsername = u.Username
-				}
-			}
+			effective := types.MinOrgRole(share.Permission, tm.Role)
+			effective = applyTenantRoleCap(effective, callerTenantRole)
+			info := s.sharedAgentInfo(ctx, share, effective, webSearchReadyCache)
 			item := &types.OrganizationSharedAgentItem{
 				SharedAgentInfo: *info,
-				IsMine:          share.SourceTenantID == currentTenantID,
+				IsMine:          share.SourceTenantID == tenantID,
 			}
 			if item.Agent != nil && !item.IsMine {
 				item.DisabledByMe = disabledSet[fmt.Sprintf("%s_%d", item.Agent.ID, item.SourceTenantID)]
@@ -406,12 +445,43 @@ func (s *agentShareService) SetSharedAgentDisabledByMe(ctx context.Context, tena
 	return s.disabledRepo.Remove(ctx, tenantID, agentID, sourceTenantID)
 }
 
-// GetSharedAgentForUser returns the shared agent by agentID if the user has access; source tenant is resolved from the user's share. One share lookup + one agent lookup.
-func (s *agentShareService) GetSharedAgentForUser(ctx context.Context, userID string, currentTenantID uint64, agentID string) (*types.CustomAgent, error) {
+// GetSharedAgentForTenant returns the shared agent by agentID if the caller's
+// tenant has access; source tenant is resolved from the share. One share
+// lookup + one agent lookup.
+//
+// callerTenantRole is currently only used for symmetry / future caps on
+// agent execution (e.g. tenant Viewers might be banned from
+// state-changing tool calls in a follow-up).
+func (s *agentShareService) GetSharedAgentForTenant(
+	ctx context.Context,
+	tenantID uint64,
+	callerTenantRole types.TenantRole,
+	agentID string,
+	sourceTenantID ...uint64,
+) (*types.CustomAgent, error) {
 	if agentID == "" {
 		return nil, ErrAgentShareNotFound
 	}
-	share, err := s.shareRepo.GetShareByAgentIDForUser(ctx, userID, agentID, currentTenantID)
+	if len(sourceTenantID) > 0 && sourceTenantID[0] != 0 {
+		if sourceTenantID[0] == tenantID {
+			return nil, ErrAgentShareNotFound
+		}
+		share, err := s.shareRepo.GetShareByAgentIDAndSourceForTenant(ctx, tenantID, agentID, sourceTenantID[0])
+		if err != nil {
+			if errors.Is(err, repository.ErrAgentShareNotFound) {
+				return nil, ErrAgentSharePermission
+			}
+			return nil, err
+		}
+		agent, err := s.agentRepo.GetAgentByID(ctx, agentID, share.SourceTenantID)
+		if err != nil || agent == nil {
+			return nil, ErrAgentNotFoundForShare
+		}
+		types.ApplyBuiltinAgentLocalization(ctx, agent)
+		_ = callerTenantRole
+		return agent, nil
+	}
+	share, err := s.shareRepo.GetShareByAgentIDForTenant(ctx, tenantID, agentID, tenantID)
 	if err != nil {
 		if errors.Is(err, repository.ErrAgentShareNotFound) {
 			return nil, ErrAgentSharePermission
@@ -425,39 +495,25 @@ func (s *agentShareService) GetSharedAgentForUser(ctx context.Context, userID st
 		}
 		return nil, err
 	}
+	types.ApplyBuiltinAgentLocalization(ctx, agent)
+	_ = callerTenantRole
 	return agent, nil
 }
 
-// UserCanAccessKBViaSomeSharedAgent returns true if the user has at least one shared agent that can access the given KB (used when opening KB detail from space list without agent_id).
-func (s *agentShareService) UserCanAccessKBViaSomeSharedAgent(ctx context.Context, userID string, currentTenantID uint64, kb *types.KnowledgeBase) (bool, error) {
+// TenantCanAccessKBViaSomeSharedAgent returns true if the caller's tenant has
+// at least one shared agent that can access the given KB (used when opening KB
+// detail from "通过智能体可见" list without agent_id).
+func (s *agentShareService) TenantCanAccessKBViaSomeSharedAgent(ctx context.Context, tenantID uint64, callerTenantRole types.TenantRole, kb *types.KnowledgeBase) (bool, error) {
 	if kb == nil || kb.ID == "" {
 		return false, nil
 	}
-	list, err := s.ListSharedAgents(ctx, userID, currentTenantID)
+	list, err := s.ListSharedAgents(ctx, tenantID, callerTenantRole)
 	if err != nil || len(list) == 0 {
 		return false, err
 	}
 	for _, info := range list {
-		if info.Agent == nil {
-			continue
-		}
-		agent := info.Agent
-		if agent.TenantID != kb.TenantID {
-			continue
-		}
-		mode := agent.Config.KBSelectionMode
-		if mode == "none" {
-			continue
-		}
-		if mode == "all" {
+		if types.SharedAgentIncludesKB(info.Agent, kb) {
 			return true, nil
-		}
-		if mode == "selected" {
-			for _, id := range agent.Config.KnowledgeBases {
-				if id == kb.ID {
-					return true, nil
-				}
-			}
 		}
 	}
 	return false, nil
@@ -487,7 +543,8 @@ func (s *agentShareService) GetShareByAgentAndOrg(ctx context.Context, agentID s
 	return share, nil
 }
 
-// GetShareByAgentIDForUser returns one share for the given agentID that the user can access (user in org), excluding source_tenant_id == excludeTenantID.
-func (s *agentShareService) GetShareByAgentIDForUser(ctx context.Context, userID, agentID string, excludeTenantID uint64) (*types.AgentShare, error) {
-	return s.shareRepo.GetShareByAgentIDForUser(ctx, userID, agentID, excludeTenantID)
+// GetShareByAgentIDForTenant returns one share for the given agentID that the
+// tenant can reach, excluding source_tenant_id == excludeTenantID.
+func (s *agentShareService) GetShareByAgentIDForTenant(ctx context.Context, tenantID uint64, agentID string, excludeTenantID uint64) (*types.AgentShare, error) {
+	return s.shareRepo.GetShareByAgentIDForTenant(ctx, tenantID, agentID, excludeTenantID)
 }

@@ -19,6 +19,7 @@ export interface LoginResponse {
     avatar?: string
     tenant_id: number
     can_access_all_tenants?: boolean
+    is_system_admin?: boolean
     is_active: boolean
     created_at: string
     updated_at: string
@@ -27,14 +28,28 @@ export interface LoginResponse {
     id: number
     name: string
     description: string
-    api_key: string
     status: string
     business: string
     storage_quota: number
     storage_used: number
     created_at: string
     updated_at: string
-  }
+  } | null
+  // active_tenant mirrors `tenant` for endpoints that distinguish home
+  // tenant from current tenant (e.g. /auth/register-by-invite). Only
+  // one of `tenant` / `active_tenant` is populated by any given endpoint.
+  active_tenant?: {
+    id: number
+    name: string
+    description?: string
+    status?: string
+    business?: string
+    storage_quota?: number
+    storage_used?: number
+    created_at?: string
+    updated_at?: string
+  } | null
+  memberships?: MembershipInfo[]
   token?: string
   refresh_token?: string
 }
@@ -72,9 +87,20 @@ export interface RegisterResponse {
     tenant: {
       id: string
       name: string
-      api_key: string
     }
   }
+}
+
+// 用户偏好（与后端 types.UserPreferences 对齐，字段可选 = 没显式设置过）。
+// 新加 key 时记得：后端 service.UpdateUserPreferences 也要在 merge 分支里
+// 处理；前端调用方按需读 / 默认值降级。
+export interface UserPreferences {
+  // last_active_tenant_id 持久化「刷新 / 换设备 / 重新登录后回到上次的空间」
+  // 偏好；后端在 Login / RefreshToken 时校验 membership 有效后才会沿用，
+  // 否则回退到 home 并清掉这个字段。传 0 给 PATCH 表示「清除偏好」。
+  last_active_tenant_id?: number | null
+  // oidc_only_login 为 true 表示账号由 OIDC 自动开通且用户尚未设置已知密码。
+  oidc_only_login?: boolean
 }
 
 // 用户信息接口
@@ -85,16 +111,58 @@ export interface UserInfo {
   avatar?: string
   tenant_id: string
   can_access_all_tenants?: boolean
+  preferences?: UserPreferences
+  is_system_admin?: boolean
   created_at: string
   updated_at: string
 }
 
-// 租户信息接口
+/**
+ * 把后端返回的 user JSON 规范化成前端 UserInfo。
+ *
+ * 历史上有 4 处独立的 setUser 调用（Login、autoSetup、token rehydrate、
+ * /auth/me 主动 refresh）各自手写字段白名单，每加一个 user 字段都要在
+ * 4 处同步——否则该字段就被悄悄过滤掉。is_system_admin 上线时就因为
+ * 漏拷一处而看不到「系统管理」入口；这个工厂存在的目的就是杜绝同类
+ * 漏拷再发生。**新增 user 字段请只改这里**。
+ *
+ * fallbackTenantId 是 tenant_id 缺失时的兜底来源——
+ *   - autoSetup 响应顶层有 tenant.id，但 user 对象上没有 tenant_id
+ *   - /auth/me 偶发只返回 user 不带 tenant 时也走兜底
+ * 调用方按需传入；不传则保持空字符串（与历史行为一致）。
+ *
+ * 字段读取统一走 `=== true` 而不是 `|| false`，对偶发非 boolean
+ * 类型（后端某天传 1/0 或字符串）做严格收敛，避免把 truthy 字符串
+ * 误判为权限通过。
+ */
+export function userInfoFromApi(
+  u: any,
+  fallbackTenantId?: string | number | null,
+): UserInfo {
+  const rawTenantId =
+    u?.tenant_id !== undefined && u?.tenant_id !== null && u.tenant_id !== ''
+      ? u.tenant_id
+      : fallbackTenantId ?? ''
+  const tid = Number(rawTenantId) > 0 ? rawTenantId : ''
+  return {
+    id: u?.id || '',
+    username: u?.username || '',
+    email: u?.email || '',
+    avatar: u?.avatar,
+    tenant_id: String(tid) || '',
+    can_access_all_tenants: u?.can_access_all_tenants === true,
+    is_system_admin: u?.is_system_admin === true,
+    preferences: u?.preferences,
+    created_at: u?.created_at || new Date().toISOString(),
+    updated_at: u?.updated_at || new Date().toISOString(),
+  }
+}
+
+// 空间信息接口
 export interface TenantInfo {
   id: string
   name: string
   description?: string
-  api_key: string
   status?: string
   business?: string
   owner_id: string
@@ -111,6 +179,13 @@ export interface KnowledgeBaseInfo {
   name: string
   description: string
   tenant_id: string
+  // creator_id is the user id of whoever originally created the KB.
+  // Set by PR 5 of the multi-tenant RBAC series; nullable for legacy
+  // KBs created before that migration backfilled the column.
+  creator_id?: string
+  // creator_name 由后端 list 接口批量回填（username 优先，退化到 email），
+  // 仅用于列表卡片来源徽章；缺失代表无法解析（已删除 / 老数据）。
+  creator_name?: string
   created_at: string
   updated_at: string
   document_count?: number
@@ -176,6 +251,30 @@ export async function getOIDCConfig(): Promise<OIDCConfigResponse> {
 }
 
 /**
+ * 获取认证配置（仅返回前端渲染需要的公开字段，例如注册模式）。
+ *
+ * 后端通过 `auth.registration_mode` 控制是否允许自助注册：
+ *   - "self_serve"  保留现有自助注册入口（默认）
+ *   - "invite_only" 关闭注册，要求管理员邀请
+ *
+ * 失败时回落到 self_serve，避免接口异常导致注册入口直接消失。
+ */
+export interface AuthConfigResponse {
+  success: boolean
+  registration_mode: 'self_serve' | 'invite_only' | string
+  complex_password_enabled: boolean
+}
+
+export async function getAuthConfig(): Promise<AuthConfigResponse> {
+  try {
+    const response = await get('/api/v1/auth/config')
+    return response as unknown as AuthConfigResponse
+  } catch {
+    return { success: false, registration_mode: 'self_serve', complex_password_enabled: false }
+  }
+}
+
+/**
  * 用户注册
  */
 export async function register(data: RegisterRequest): Promise<RegisterResponse> {
@@ -191,7 +290,7 @@ export async function register(data: RegisterRequest): Promise<RegisterResponse>
 }
 
 /**
- * Lite 版自动初始化（创建默认用户/租户 + 签发令牌）
+ * Lite 版自动初始化（创建默认用户/空间 + 签发令牌）
  */
 export async function autoSetup(): Promise<LoginResponse> {
   try {
@@ -206,12 +305,30 @@ export async function autoSetup(): Promise<LoginResponse> {
 }
 
 /**
+ * Membership row returned alongside /auth/me. Mirrors the LoginResponse
+ * shape so the frontend can refresh `currentTenantRole` on every page
+ * load — without it, role changes after login (e.g. an Owner demoting
+ * us in a peer tenant) stay invisible until the user logs out and back
+ * in.
+ */
+export interface MembershipInfo {
+  tenant_id: number
+  tenant_name?: string
+  role: string
+}
+
+/**
  * 获取当前用户信息
  */
-export async function getCurrentUser(): Promise<{ success: boolean; data?: { user: UserInfo; tenant: TenantInfo }; message?: string }> {
+export interface AuthCapabilities {
+  can_create_tenant: boolean
+  auto_accept_invitation: boolean
+}
+
+export async function getCurrentUser(): Promise<{ success: boolean; data?: { user: UserInfo; tenant?: TenantInfo | null; memberships?: MembershipInfo[]; tenant_required?: boolean; capabilities?: AuthCapabilities }; message?: string }> {
   try {
     const response = await get('/api/v1/auth/me')
-    return response as unknown as { success: boolean; data?: { user: UserInfo; tenant: TenantInfo }; message?: string }
+    return response as unknown as { success: boolean; data?: { user: UserInfo; tenant?: TenantInfo | null; memberships?: MembershipInfo[]; tenant_required?: boolean; capabilities?: AuthCapabilities }; message?: string }
   } catch (error: any) {
     return {
       success: false,
@@ -221,7 +338,25 @@ export async function getCurrentUser(): Promise<{ success: boolean; data?: { use
 }
 
 /**
- * 获取当前租户信息
+ * 更新当前用户的偏好设置（PATCH 语义：只发要改的字段，后端只覆盖发了的 key，
+ * 其它 key 保持不变）。后端会返回更新后的完整 preferences 对象。
+ */
+export async function updateMyPreferences(
+  patch: Partial<UserPreferences>,
+): Promise<{ success: boolean; data?: UserPreferences; message?: string }> {
+  try {
+    const response = await put('/api/v1/auth/me/preferences', patch)
+    return response as unknown as { success: boolean; data?: UserPreferences; message?: string }
+  } catch (error: any) {
+    return {
+      success: false,
+      message: error.message || t('error.auth.updatePreferencesFailed'),
+    }
+  }
+}
+
+/**
+ * 获取当前空间信息
  */
 export async function getCurrentTenant(): Promise<{ success: boolean; data?: TenantInfo; message?: string }> {
   try {
@@ -283,6 +418,50 @@ export async function logout(): Promise<{ success: boolean; message?: string }> 
   }
 }
 
+export interface ChangePasswordRequest {
+  old_password: string
+  new_password: string
+}
+
+/** Map change-password API failures to localized UI strings. */
+export function resolveChangePasswordError(error: any): string {
+  const details =
+    typeof error?.error?.details === 'string'
+      ? error.error.details
+      : typeof error?.details === 'string'
+        ? error.details
+        : ''
+  switch (details) {
+    case 'invalid_old_password':
+      return t('userProfile.changePassword.failed')
+    case 'password_policy':
+      return t('userProfile.changePassword.policyFailed')
+    case 'same_password':
+      return t('userProfile.changePassword.sameAsCurrent')
+    default:
+      return error?.message || t('userProfile.changePassword.failed')
+  }
+}
+
+/**
+ * Self-service password rotation. On success the backend revokes every
+ * outstanding session for the caller, so the client should clear local
+ * auth state and send the user back to /login.
+ */
+export async function changePassword(
+  data: ChangePasswordRequest,
+): Promise<{ success: boolean; message?: string }> {
+  try {
+    const response = await post('/api/v1/auth/change-password', data)
+    return response as unknown as { success: boolean; message?: string }
+  } catch (error: any) {
+    return {
+      success: false,
+      message: resolveChangePasswordError(error),
+    }
+  }
+}
+
 /**
  * 验证Token有效性
  */
@@ -302,3 +481,59 @@ export async function validateToken(): Promise<{ success: boolean; valid?: boole
 
 
 
+
+// ---- share-link registration --------------------------------------------
+
+// InviteLookup is the public projection of a share-link row used by
+// /register?token=xxx — enough to render the registration page header
+// ("X invited you to Y") without leaking sensitive inviter fields.
+export interface InviteLookup {
+  tenant_id: number
+  tenant_name?: string
+  role: string
+  expires_at: string
+}
+
+export interface InviteLookupResponse {
+  success: boolean
+  data?: InviteLookup
+  message?: string
+}
+
+export interface RegisterByInviteRequest {
+  token: string
+  email: string
+  username: string
+  password: string
+}
+
+/**
+ * Resolve a share-link token (no auth) into the context the
+ * registration page needs (tenant name, role, expiry). Returns 410
+ * when the link is invalid / revoked / expired.
+ *
+ * Uses POST + body (rather than GET + path) so the plaintext token
+ * never appears in access logs, browser history, or tracing spans.
+ */
+export async function getInvitationByToken(token: string): Promise<InviteLookupResponse> {
+  try {
+    const response = await post(`/api/v1/auth/invitations/lookup`, { token })
+    return response as unknown as InviteLookupResponse
+  } catch (error: any) {
+    return { success: false, message: error.message || '' }
+  }
+}
+
+/**
+ * Complete registration via a share-link token. The invitee supplies
+ * their own email — the token is the authorisation, not an identity
+ * lock.
+ */
+export async function registerByInvite(data: RegisterByInviteRequest): Promise<LoginResponse> {
+  try {
+    const response = await post('/api/v1/auth/register-by-invite', data)
+    return response as unknown as LoginResponse
+  } catch (error: any) {
+    return { success: false, message: error.message || t('error.auth.registerFailed') }
+  }
+}

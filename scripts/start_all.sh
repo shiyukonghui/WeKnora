@@ -58,6 +58,20 @@ log_success() {
     printf "%b\n" "${GREEN}[SUCCESS]${NC} $1"
 }
 
+# Inject git short hash into the frontend image when composing from source.
+# docker-compose.yml interpolates VITE_FRONTEND_COMMIT; the build context is
+# frontend/ (no .git), so Vite cannot discover the commit on its own.
+export_frontend_build_args() {
+    if [ -n "${VITE_FRONTEND_COMMIT:-}" ]; then
+        export VITE_FRONTEND_COMMIT
+        return 0
+    fi
+    # shellcheck source=/dev/null
+    eval "$("$PROJECT_ROOT/scripts/get_version.sh" env)"
+    export VITE_FRONTEND_COMMIT="${COMMIT_ID:-unknown}"
+    log_info "VITE_FRONTEND_COMMIT=${VITE_FRONTEND_COMMIT}"
+}
+
 # 选择可用的 Docker Compose 命令（优先 docker compose，其次 docker-compose）
 DOCKER_COMPOSE_BIN=""
 DOCKER_COMPOSE_SUBCMD=""
@@ -355,8 +369,10 @@ start_docker() {
     
     check_platform
     
-    # 进入项目根目录再执行docker-compose命令
+	# 进入项目根目录再执行docker-compose命令
     cd "$PROJECT_ROOT"
+
+    export_frontend_build_args
     
     # 启动基本服务
     log_info "启动核心服务容器..."
@@ -499,6 +515,8 @@ restart_container() {
     
     # 进入项目根目录再执行docker-compose命令
     cd "$PROJECT_ROOT"
+
+    export_frontend_build_args
     
     # 检查容器是否存在
 	if ! "$DOCKER_COMPOSE_BIN" $DOCKER_COMPOSE_SUBCMD ps --services | grep -q "^$container_name$"; then
@@ -749,7 +767,6 @@ else
             log_success "所有服务启动完成，可通过以下地址访问:"
             printf "%b\n" "${GREEN}  - 前端界面: http://localhost:${FRONTEND_PORT:-80}${NC}"
             printf "%b\n" "${GREEN}  - API接口: http://localhost:${APP_PORT:-8080}${NC}"
-            printf "%b\n" "${GREEN}  - Jaeger链路追踪: http://localhost:16686${NC}"
             echo ""
             log_info "正在持续输出容器日志（按 Ctrl+C 退出日志，容器不会停止）..."
             "$DOCKER_COMPOSE_BIN" $DOCKER_COMPOSE_SUBCMD logs app docreader postgres --since=10s -f
@@ -763,7 +780,6 @@ else
         log_success "Docker容器启动完成，可通过以下地址访问:"
         printf "%b\n" "${GREEN}  - 前端界面: http://localhost:${FRONTEND_PORT:-80}${NC}"
         printf "%b\n" "${GREEN}  - API接口: http://localhost:${APP_PORT:-8080}${NC}"
-        printf "%b\n" "${GREEN}  - Jaeger链路追踪: http://localhost:16686${NC}"
         echo ""
         log_info "正在持续输出容器日志（按 Ctrl+C 退出日志，容器不会停止）..."
         "$DOCKER_COMPOSE_BIN" $DOCKER_COMPOSE_SUBCMD logs app docreader postgres --since=10s -f

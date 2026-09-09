@@ -25,9 +25,12 @@ type knowledgeTagService struct {
 	knowledgeRepo  interfaces.KnowledgeRepository
 	chunkRepo      interfaces.ChunkRepository
 	retrieveEngine interfaces.RetrieveEngineRegistry
+	ownership      retriever.TenantStoreOwnership
 	modelService   interfaces.ModelService
 	task           interfaces.TaskEnqueuer
 	kbShareService interfaces.KBShareService
+	tenantRepo     interfaces.TenantRepository
+	audit          interfaces.AuditLogService
 }
 
 // NewKnowledgeTagService creates a new tag service.
@@ -37,9 +40,12 @@ func NewKnowledgeTagService(
 	knowledgeRepo interfaces.KnowledgeRepository,
 	chunkRepo interfaces.ChunkRepository,
 	retrieveEngine interfaces.RetrieveEngineRegistry,
+	ownership retriever.TenantStoreOwnership,
 	modelService interfaces.ModelService,
 	task interfaces.TaskEnqueuer,
 	kbShareService interfaces.KBShareService,
+	tenantRepo interfaces.TenantRepository,
+	audit interfaces.AuditLogService,
 ) (interfaces.KnowledgeTagService, error) {
 	return &knowledgeTagService{
 		kbService:      kbService,
@@ -47,9 +53,12 @@ func NewKnowledgeTagService(
 		knowledgeRepo:  knowledgeRepo,
 		chunkRepo:      chunkRepo,
 		retrieveEngine: retrieveEngine,
+		ownership:      ownership,
 		modelService:   modelService,
 		task:           task,
 		kbShareService: kbShareService,
+		tenantRepo:     tenantRepo,
+		audit:          audit,
 	}, nil
 }
 
@@ -73,25 +82,10 @@ func (s *knowledgeTagService) ListTags(
 		return nil, err
 	}
 
-	// Check access permission
-	tenantID := types.MustTenantIDFromContext(ctx)
-	if kb.TenantID != tenantID {
-		// Get user ID from context
-		userIDVal := ctx.Value(types.UserIDContextKey)
-		if userIDVal == nil {
-			return nil, werrors.NewForbiddenError("无权访问该知识库")
-		}
-		userID := userIDVal.(string)
-
-		// Check if user has at least viewer permission through organization sharing
-		hasPermission, err := s.kbShareService.HasKBPermission(ctx, kbID, userID, types.OrgRoleViewer)
-		if err != nil || !hasPermission {
-			return nil, werrors.NewForbiddenError("无权访问该知识库")
-		}
+	effectiveTenantID, err := resolveKBReadTenant(ctx, kb, s.kbShareService)
+	if err != nil {
+		return nil, err
 	}
-
-	// Use kb's tenant ID for data access
-	effectiveTenantID := kb.TenantID
 
 	tags, total, err := s.repo.ListByKB(ctx, effectiveTenantID, kbID, page, keyword)
 	if err != nil {
@@ -151,6 +145,10 @@ func (s *knowledgeTagService) CreateTag(
 	if err != nil {
 		return nil, err
 	}
+	ctx, err = requireKBWrite(ctx, kb)
+	if err != nil {
+		return nil, err
+	}
 
 	// Check if tag with same name already exists
 	existingTag, err := s.repo.GetByName(ctx, kb.TenantID, kbID, name)
@@ -179,6 +177,8 @@ func (s *knowledgeTagService) CreateTag(
 	if err := s.repo.Create(ctx, tag); err != nil {
 		return nil, err
 	}
+	recordKBActivity(ctx, s.audit, tag.TenantID, tag.KnowledgeBaseID, types.AuditActionTagCreated,
+		"knowledge_tag", tag.ID, types.AuditOutcomeSuccess, map[string]any{"name": tag.Name})
 	return tag, nil
 }
 
@@ -193,8 +193,15 @@ func (s *knowledgeTagService) UpdateTag(
 	if id == "" {
 		return nil, werrors.NewBadRequestError("标签ID不能为空")
 	}
-	tenantID := types.MustTenantIDFromContext(ctx)
+	tenantID, ok := types.TenantIDFromContext(ctx)
+	if !ok || tenantID == 0 {
+		return nil, werrors.NewForbiddenError("无权修改标签")
+	}
 	tag, err := s.repo.GetByID(ctx, tenantID, id)
+	if err != nil {
+		return nil, err
+	}
+	_, ctx, err = s.requireTagWrite(ctx, tag)
 	if err != nil {
 		return nil, err
 	}
@@ -216,6 +223,8 @@ func (s *knowledgeTagService) UpdateTag(
 	if err := s.repo.Update(ctx, tag); err != nil {
 		return nil, err
 	}
+	recordKBActivity(ctx, s.audit, tag.TenantID, tag.KnowledgeBaseID, types.AuditActionTagUpdated,
+		"knowledge_tag", tag.ID, types.AuditOutcomeSuccess, map[string]any{"name": tag.Name})
 	return tag, nil
 }
 
@@ -226,14 +235,22 @@ func (s *knowledgeTagService) DeleteTag(ctx context.Context, id string, force bo
 	if id == "" {
 		return werrors.NewBadRequestError("标签ID不能为空")
 	}
-	tenantID := types.MustTenantIDFromContext(ctx)
+	tenantID, ok := types.TenantIDFromContext(ctx)
+	if !ok || tenantID == 0 {
+		return werrors.NewForbiddenError("无权修改标签")
+	}
 	tag, err := s.repo.GetByID(ctx, tenantID, id)
 	if err != nil {
 		return err
 	}
-
-	// Get KB info for embedding model
-	kb, err := s.kbService.GetKnowledgeBaseByID(ctx, tag.KnowledgeBaseID)
+	kb, ctx, err := s.requireTagWrite(ctx, tag)
+	if err != nil {
+		return err
+	}
+	if err := s.validateTagDeleteExclusions(ctx, kb, excludeIDs); err != nil {
+		return err
+	}
+	ctx, err = withKBWriteTenantInfo(ctx, kb, s.tenantRepo)
 	if err != nil {
 		return err
 	}
@@ -257,7 +274,7 @@ func (s *knowledgeTagService) DeleteTag(ctx context.Context, id string, force bo
 
 		// Enqueue async index deletion task for the deleted chunks
 		if len(deletedIDs) > 0 {
-			s.enqueueIndexDeleteTask(ctx, tenantID, kb.ID, kb.EmbeddingModelID, string(kb.Type), deletedIDs, tenantInfo.GetEffectiveEngines())
+			s.enqueueIndexDeleteTask(ctx, tenantID, kb.ID, kb.EmbeddingModelID, string(kb.Type), deletedIDs, tenantInfo.GetEffectiveEngines(), kb.VectorStoreID)
 		}
 
 		logger.Infof(ctx, "Deleted %d chunks under tag %s", len(deletedIDs), tag.ID)
@@ -270,7 +287,7 @@ func (s *knowledgeTagService) DeleteTag(ctx context.Context, id string, force bo
 			return nil
 		}
 		// Get all knowledge IDs under this tag
-		knowledgeIDs, err := s.knowledgeRepo.ListIDsByTagID(ctx, tenantID, kb.ID, tag.ID)
+		knowledgeIDs, err := s.knowledgeRepo.ListIDsByTagIDs(ctx, tenantID, kb.ID, []string{tag.ID})
 		if err != nil {
 			logger.Errorf(ctx, "Failed to list knowledge IDs by tag ID %s: %v", tag.ID, err)
 			return werrors.NewInternalServerError("获取标签下的文档失败")
@@ -280,8 +297,10 @@ func (s *knowledgeTagService) DeleteTag(ctx context.Context, id string, force bo
 		}
 		// Enqueue async task to delete knowledge files
 		payload := types.KnowledgeListDeletePayload{
-			TenantID:     tenantID,
-			KnowledgeIDs: knowledgeIDs,
+			KnowledgeBaseID: kb.ID,
+			TenantID:        tenantID,
+			KnowledgeIDs:    knowledgeIDs,
+			Initiator:       types.TaskInitiatorFromContext(ctx),
 		}
 		langfuse.InjectTracing(ctx, &payload)
 		payloadBytes, err := json.Marshal(payload)
@@ -289,7 +308,8 @@ func (s *knowledgeTagService) DeleteTag(ctx context.Context, id string, force bo
 			logger.Errorf(ctx, "Failed to marshal knowledge list delete payload: %v", err)
 			return werrors.NewInternalServerError("删除标签下的文档失败")
 		}
-		task := asynq.NewTask(types.TypeKnowledgeListDelete, payloadBytes, asynq.Queue("low"), asynq.MaxRetry(3))
+		task := asynq.NewTask(types.TypeKnowledgeListDelete, payloadBytes,
+			asynq.Queue(types.QueueMaintenance), asynq.MaxRetry(3), asynq.Timeout(2*time.Hour))
 		info, err := s.task.Enqueue(task)
 		if err != nil {
 			logger.Errorf(ctx, "Failed to enqueue knowledge list delete task: %v", err)
@@ -312,6 +332,9 @@ func (s *knowledgeTagService) DeleteTag(ctx context.Context, id string, force bo
 				return err
 			}
 		}
+		recordKBActivity(ctx, s.audit, tenantID, tag.KnowledgeBaseID, types.AuditActionTagUpdated,
+			"knowledge_tag", tag.ID, types.AuditOutcomeSuccess,
+			map[string]any{"name": tag.Name, "content_cleared": true, "excluded_count": len(excludeIDs)})
 		return nil
 	}
 
@@ -336,14 +359,28 @@ func (s *knowledgeTagService) DeleteTag(ctx context.Context, id string, force bo
 
 	// If there are excludeIDs, we cannot delete the tag itself as it still has content
 	if len(excludeIDs) > 0 {
+		recordKBActivity(ctx, s.audit, tenantID, tag.KnowledgeBaseID, types.AuditActionTagUpdated,
+			"knowledge_tag", tag.ID, types.AuditOutcomeSuccess,
+			map[string]any{"name": tag.Name, "content_cleared": true, "excluded_count": len(excludeIDs)})
 		return nil
 	}
-	return s.repo.Delete(ctx, tenantID, id)
+	if err := s.repo.Delete(ctx, tenantID, id); err != nil {
+		return err
+	}
+	recordKBActivity(ctx, s.audit, tenantID, tag.KnowledgeBaseID, types.AuditActionTagDeleted,
+		"knowledge_tag", tag.ID, types.AuditOutcomeSuccess,
+		map[string]any{"name": tag.Name, "force": force})
+	return nil
 }
 
-// enqueueIndexDeleteTask enqueues an async task for index deletion (low priority)
+// enqueueIndexDeleteTask enqueues an async task for index deletion (low priority).
+//
+// vectorStoreID is captured from the owning KB at enqueue time and snapshotted
+// into the payload so the worker can route to the correct store even if the
+// KB is deleted or rebound before the task runs.
 func (s *knowledgeTagService) enqueueIndexDeleteTask(ctx context.Context,
-	tenantID uint64, kbID, embeddingModelID, kbType string, chunkIDs []string, effectiveEngines []types.RetrieverEngineParams,
+	tenantID uint64, kbID, embeddingModelID, kbType string, chunkIDs []string,
+	effectiveEngines []types.RetrieverEngineParams, vectorStoreID *string,
 ) {
 	payload := types.IndexDeletePayload{
 		TenantID:         tenantID,
@@ -352,6 +389,7 @@ func (s *knowledgeTagService) enqueueIndexDeleteTask(ctx context.Context,
 		KBType:           kbType,
 		ChunkIDs:         chunkIDs,
 		EffectiveEngines: effectiveEngines,
+		VectorStoreID:    vectorStoreID,
 	}
 	langfuse.InjectTracing(ctx, &payload)
 	payloadBytes, err := json.Marshal(payload)
@@ -360,7 +398,8 @@ func (s *knowledgeTagService) enqueueIndexDeleteTask(ctx context.Context,
 		return
 	}
 
-	task := asynq.NewTask(types.TypeIndexDelete, payloadBytes, asynq.Queue("low"), asynq.MaxRetry(10))
+	task := asynq.NewTask(types.TypeIndexDelete, payloadBytes,
+		asynq.Queue(types.QueueMaintenance), asynq.MaxRetry(10), asynq.Timeout(time.Hour))
 	info, err := s.task.Enqueue(task)
 	if err != nil {
 		logger.Errorf(ctx, "Failed to enqueue index delete task: %v", err)
@@ -382,8 +421,22 @@ func (s *knowledgeTagService) ProcessIndexDelete(ctx context.Context, t *asynq.T
 
 	logger.Infof(ctx, "Processing index delete task for %d chunks in KB %s", len(payload.ChunkIDs), payload.KnowledgeBaseID)
 
-	// Create retrieve engine
-	retrieveEngine, err := retriever.NewCompositeRetrieveEngine(s.retrieveEngine, payload.EffectiveEngines)
+	// Create retrieve engine.
+	// The factory verifies the payload's tenant owns the bound store, so a
+	// tampered queue entry cannot reach a cross-tenant store.
+	// Forbidden/NotFound are non-retryable — SkipRetry prevents burning the
+	// full retry budget on an unrecoverable task.
+	retrieveEngine, err := retriever.CreateRetrieveEngineFromPayload(
+		ctx, s.retrieveEngine, s.ownership,
+		payload.TenantID, payload.EffectiveEngines, payload.VectorStoreID,
+	)
+	if errors.Is(err, retriever.ErrVectorStoreForbidden) ||
+		errors.Is(err, retriever.ErrVectorStoreNotFound) {
+		logger.Errorf(ctx, "Index delete task aborted: %v (tenant=%d, kb=%s)", err, payload.TenantID, payload.KnowledgeBaseID)
+		return asynq.SkipRetry
+	}
+	// ErrVectorStoreUnavailable deliberately falls through to the retry path
+	// below: the store exists and its engine may build on a later attempt.
 	if err != nil {
 		logger.Warnf(ctx, "Failed to create retrieve engine for index cleanup: %v", err)
 		return err
@@ -427,6 +480,10 @@ func (s *knowledgeTagService) FindOrCreateTagByName(ctx context.Context, kbID st
 	}
 
 	kb, err := s.kbService.GetKnowledgeBaseByID(ctx, kbID)
+	if err != nil {
+		return nil, err
+	}
+	ctx, err = requireKBWrite(ctx, kb)
 	if err != nil {
 		return nil, err
 	}

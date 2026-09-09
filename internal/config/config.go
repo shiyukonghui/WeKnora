@@ -5,6 +5,7 @@ import (
 	"os"
 	"path/filepath"
 	"regexp"
+	"strconv"
 	"strings"
 	"time"
 
@@ -20,6 +21,8 @@ type Config struct {
 	Server          *ServerConfig          `yaml:"server"           json:"server"`
 	KnowledgeBase   *KnowledgeBaseConfig   `yaml:"knowledge_base"   json:"knowledge_base"`
 	Tenant          *TenantConfig          `yaml:"tenant"           json:"tenant"`
+	Auth            *AuthConfig            `yaml:"auth"             json:"auth"`
+	Audit           *AuditConfig           `yaml:"audit"            json:"audit"`
 	OIDCAuth        *OIDCAuthConfig        `yaml:"oidc_auth"        json:"oidc_auth"`
 	Models          []ModelConfig          `yaml:"models"           json:"models"`
 	VectorDatabase  *VectorDatabaseConfig  `yaml:"vector_database"  json:"vector_database"`
@@ -30,6 +33,12 @@ type Config struct {
 	PromptTemplates *PromptTemplatesConfig `yaml:"prompt_templates" json:"prompt_templates"`
 	IM              *IMConfig              `yaml:"im"               json:"im"`
 	Agent           *AgentConfig           `yaml:"agent"            json:"agent"`
+	// FrontendBaseURL is the externally-visible origin of the SPA, used
+	// to compose absolute share-link URLs. Empty falls back to a host-
+	// relative URL ("/register?token=…") which the SPA then resolves
+	// against window.location.origin — fine for typical single-origin
+	// deployments. Sourced from FRONTEND_BASE_URL env at startup.
+	FrontendBaseURL string `yaml:"frontend_base_url" json:"frontend_base_url"`
 }
 
 // AgentConfig represents the global agent settings.
@@ -37,6 +46,9 @@ type AgentConfig struct {
 	// LLMCallTimeout is the default timeout for a single LLM call in seconds.
 	// Default: 120 (standard agents) or 300 (can be overridden by Env).
 	LLMCallTimeout int `yaml:"llm_call_timeout" json:"llm_call_timeout"`
+	// ToolApprovalTimeoutSeconds is how long the agent waits for human approval on a flagged MCP tool.
+	// 0 means default 600 (10 minutes).
+	ToolApprovalTimeoutSeconds int `yaml:"tool_approval_timeout_seconds" json:"tool_approval_timeout_seconds"`
 }
 
 // IMConfig configures the IM integration service.
@@ -151,11 +163,31 @@ type ServerConfig struct {
 
 // KnowledgeBaseConfig 知识库配置
 type KnowledgeBaseConfig struct {
-	ChunkSize       int                    `yaml:"chunk_size"       json:"chunk_size"`
-	ChunkOverlap    int                    `yaml:"chunk_overlap"    json:"chunk_overlap"`
-	SplitMarkers    []string               `yaml:"split_markers"    json:"split_markers"`
-	KeepSeparator   bool                   `yaml:"keep_separator"   json:"keep_separator"`
-	ImageProcessing *ImageProcessingConfig `yaml:"image_processing" json:"image_processing"`
+	ChunkSize              int                    `yaml:"chunk_size"       json:"chunk_size"`
+	ChunkOverlap           int                    `yaml:"chunk_overlap"    json:"chunk_overlap"`
+	SplitMarkers           []string               `yaml:"split_markers"    json:"split_markers"`
+	KeepSeparator          bool                   `yaml:"keep_separator"   json:"keep_separator"`
+	ImageProcessing        *ImageProcessingConfig `yaml:"image_processing" json:"image_processing"`
+	DocumentProcessTimeout time.Duration          `yaml:"document_process_timeout"  json:"document_process_timeout"`
+	// DocReaderCallTimeout caps a single DocReader RPC. Without this the
+	// gRPC call inherits the asynq task context (whole DocumentProcessTimeout,
+	// default 2h+), so a hung docreader would block a worker for hours and
+	// leave knowledge in "processing". Default 30 minutes is generous enough
+	// for OCR-heavy large PDFs while ensuring forward progress.
+	DocReaderCallTimeout time.Duration `yaml:"docreader_call_timeout"   json:"docreader_call_timeout"`
+}
+
+// DefaultDocumentProcessTimeout is the ceiling for a single document:process
+// Asynq task when document_process_timeout is unset or non-positive.
+const DefaultDocumentProcessTimeout = 2 * time.Hour
+
+// DocumentProcessTimeout returns the effective document-process task timeout.
+// Partial configs (e.g. unit tests) receive the default when unset.
+func DocumentProcessTimeout(cfg *Config) time.Duration {
+	if cfg != nil && cfg.KnowledgeBase != nil && cfg.KnowledgeBase.DocumentProcessTimeout > 0 {
+		return cfg.KnowledgeBase.DocumentProcessTimeout
+	}
+	return DefaultDocumentProcessTimeout
 }
 
 // ImageProcessingConfig 图像处理配置
@@ -163,13 +195,111 @@ type ImageProcessingConfig struct {
 	EnableMultimodal bool `yaml:"enable_multimodal" json:"enable_multimodal"`
 }
 
-// TenantConfig 租户配置
+// TenantConfig 空间配置
 type TenantConfig struct {
 	DefaultSessionName        string `yaml:"default_session_name"        json:"default_session_name"`
 	DefaultSessionTitle       string `yaml:"default_session_title"       json:"default_session_title"`
 	DefaultSessionDescription string `yaml:"default_session_description" json:"default_session_description"`
 	// EnableCrossTenantAccess enables cross-tenant access for users with permission
 	EnableCrossTenantAccess bool `yaml:"enable_cross_tenant_access" json:"enable_cross_tenant_access"`
+	// EnableRBAC turns on tenant-level role enforcement (issue #1303).
+	// Pointer so we can distinguish "unset" from "explicit false":
+	//   nil           — fall back to the built-in default (true) applied
+	//                   by applyAuthAndTenantDefaults.
+	//   pointer false — operators opted into the logging-only rollout
+	//                   window (set via config.yaml `enable_rbac: false`
+	//                   or env `WEKNORA_TENANT_ENABLE_RBAC=false`).
+	//   pointer true  — enforcement on (the new default).
+	// Read through IsRBACEnforced so callers stay nil-safe.
+	EnableRBAC *bool `yaml:"enable_rbac" json:"enable_rbac"`
+	// MaxOwnedPerUser caps how many tenants a single non-superuser can
+	// create (and Own) via self-service POST /tenants. Counts only Owner
+	// memberships so being invited as Admin/Editor/Viewer in another
+	// tenant doesn't burn quota. Cross-tenant superusers
+	// (CanAccessAllTenants) are exempt.
+	//   > 0 — enforce the cap (handler returns 429 when reached).
+	//   = 0 — fall back to defaultMaxOwnedTenantsPerUser in the handler.
+	//   < 0 — disable the cap entirely (not recommended in shared deployments).
+	//
+	// Env override: WEKNORA_TENANT_MAX_OWNED_PER_USER (integer). When set
+	// and parseable it always wins over config.yaml so operators can
+	// loosen / tighten the quota without a redeploy. See
+	// applyAuthAndTenantDefaults for the semantics of <0 / 0 / >0.
+	MaxOwnedPerUser int `yaml:"max_owned_per_user" json:"max_owned_per_user" mapstructure:"max_owned_per_user"`
+	// SelfServiceCreationEnabled controls whether ordinary authenticated
+	// users may create a workspace for themselves. Nil preserves the
+	// historical default (enabled); cross-tenant superusers are exempt.
+	SelfServiceCreationEnabled *bool `yaml:"self_service_creation_enabled" json:"self_service_creation_enabled" mapstructure:"self_service_creation_enabled"`
+}
+
+// IsRBACEnforced reports whether tenant-level role enforcement is
+// active. Nil receiver or nil EnableRBAC pointer means "operator did
+// not opt out", which after applyAuthAndTenantDefaults is the new
+// default (true). Callers that need to treat a nil *Config as
+// fail-open (legacy behaviour) should keep their own `cfg != nil`
+// short-circuit before invoking this helper.
+func (t *TenantConfig) IsRBACEnforced() bool {
+	if t == nil || t.EnableRBAC == nil {
+		return true
+	}
+	return *t.EnableRBAC
+}
+
+// IsSelfServiceCreationEnabled reports whether ordinary users may create
+// tenants. Nil keeps the historical behaviour enabled.
+func (t *TenantConfig) IsSelfServiceCreationEnabled() bool {
+	return t == nil || t.SelfServiceCreationEnabled == nil || *t.SelfServiceCreationEnabled
+}
+
+// AuditConfig governs durable audit log behaviour. Writes happen on
+// every member-management mutation and on RBAC denials (when
+// EnableRBAC is true); the table grows monotonically unless this
+// section turns on retention.
+type AuditConfig struct {
+	// RetentionDays is how many days of audit history to keep. Older
+	// rows are deleted by a daily background sweep.
+	//   > 0 — purge rows whose created_at < NOW() - retention_days.
+	//   = 0 — disable purge entirely (the pre-rollout default).
+	//   < 0 — invalid; ValidateConfig rejects it.
+	// Default: 90 (set by applyAuditDefaults when the section is omitted).
+	RetentionDays int `yaml:"retention_days" json:"retention_days"`
+}
+
+// AuthConfig governs the user authentication entry points.
+type AuthConfig struct {
+	// RegistrationMode controls who may call POST /auth/register.
+	//   "self_serve" (default) — anyone may register; a new tenant is
+	//                            auto-created and the registrant becomes
+	//                            its Owner. Preserves existing behaviour.
+	//   "invite_only"          — public registration is rejected; new
+	//                            users only enter through the invitation
+	//                            flow added in PR 3.
+	RegistrationMode string `yaml:"registration_mode" json:"registration_mode"`
+	// DefaultTenantMode controls public password-registration provisioning.
+	// create_personal preserves the historical one-user-one-workspace default;
+	// tenantless creates only the identity and waits for an invitation or an
+	// explicit self-service tenant creation.
+	DefaultTenantMode      string `yaml:"default_tenant_mode" json:"default_tenant_mode"`
+	ComplexPasswordEnabled bool   `yaml:"complex_password_enabled" json:"complex_password_enabled"`
+}
+
+// AuthRegistrationMode constants used by handlers and middleware.
+const (
+	AuthRegistrationModeSelfServe       = "self_serve"
+	AuthRegistrationModeInviteOnly      = "invite_only"
+	AuthDefaultTenantModeCreatePersonal = "create_personal"
+	AuthDefaultTenantModeTenantless     = "tenantless"
+)
+
+// IsInviteOnly returns true when registration is gated behind invitations.
+// Treats nil receiver and empty/unknown values as "not invite-only" so the
+// default keeps current behaviour even if the section is missing from the
+// config file.
+func (c *AuthConfig) IsInviteOnly() bool {
+	if c == nil {
+		return false
+	}
+	return c.RegistrationMode == AuthRegistrationModeInviteOnly
 }
 
 type OIDCUserInfoMapping struct {
@@ -187,6 +317,7 @@ type OIDCAuthConfig struct {
 	AuthorizationEndpoint string               `yaml:"authorization_endpoint" json:"authorization_endpoint"`
 	TokenEndpoint         string               `yaml:"token_endpoint"         json:"token_endpoint"`
 	UserInfoEndpoint      string               `yaml:"user_info_endpoint"     json:"user_info_endpoint"`
+	JwksURI               string               `yaml:"jwks_uri"               json:"jwks_uri"`
 	Scopes                []string             `yaml:"scopes"                 json:"scopes"`
 	UserInfoMapping       *OIDCUserInfoMapping `yaml:"user_info_mapping"      json:"user_info_mapping"`
 }
@@ -269,7 +400,9 @@ func DefaultTemplateByMode(templates []PromptTemplate, mode string) *PromptTempl
 
 // LocalizeTemplates returns a deep copy of the template list with Name and
 // Description replaced according to the given locale.  Fallback chain:
-//   locale → primary language (e.g. "zh" from "zh-CN") → original Name/Description.
+//
+//	locale → primary language (e.g. "zh" from "zh-CN") → original Name/Description.
+//
 // The returned slice is safe to serialise directly; it never mutates the original.
 func LocalizeTemplates(templates []PromptTemplate, locale string) []PromptTemplate {
 	if len(templates) == 0 {
@@ -338,6 +471,24 @@ type FebriText struct {
 	WithNoTag string `yaml:"with_no_tag" json:"with_no_tag"`
 }
 
+// resolvedConfigDir holds the directory of the loaded config file. Populated by
+// LoadConfig and read by ConfigDir(); empty until LoadConfig has run.
+var resolvedConfigDir string
+
+// ConfigDir returns the directory containing the loaded config.yaml. Other
+// startup code (e.g. builtin model loader) uses this to locate sibling config
+// files like builtin_models.yaml without re-implementing viper search rules.
+// Falls back to "./config" when LoadConfig has not been called yet.
+func ConfigDir() string {
+	if resolvedConfigDir != "" {
+		return resolvedConfigDir
+	}
+	if f := viper.ConfigFileUsed(); f != "" {
+		return filepath.Dir(f)
+	}
+	return "./config"
+}
+
 // LoadConfig 从配置文件加载配置
 func LoadConfig() (*Config, error) {
 	// 设置配置文件名和路径
@@ -389,6 +540,7 @@ func LoadConfig() (*Config, error) {
 
 	// 加载提示词模板（从目录或配置文件）
 	configDir := filepath.Dir(viper.ConfigFileUsed())
+	resolvedConfigDir = configDir
 	promptTemplates, err := loadPromptTemplates(configDir)
 	if err != nil {
 		fmt.Printf("Warning: failed to load prompt templates from directory: %v\n", err)
@@ -429,10 +581,31 @@ func LoadConfig() (*Config, error) {
 	// Validate configuration values
 	applyOIDCEnvOverrides(&cfg)
 	applyAgentEnvOverrides(&cfg)
+	applyKnowledgeBaseEnvOverrides(&cfg)
+	applyAuthAndTenantDefaults(&cfg)
+	applyAuditDefaults(&cfg)
 
 	if err := ValidateConfig(&cfg); err != nil {
 		return nil, err
 	}
+
+	// Surface RBAC enforcement state at startup. air's hot-reload only
+	// rebuilds the binary on Go-source changes; it does NOT re-source
+	// .env, so a `WEKNORA_TENANT_ENABLE_RBAC=true` flip while the dev
+	// loop is already running silently has no effect until the dev
+	// script restarts. Logging this once at startup makes the
+	// "I edited .env but the gates still aren't firing" trap obvious
+	// from the first console line. Printf rather than logger because
+	// LoadConfig runs before the logger sink is wired in the dig graph.
+	rbacOn := cfg.Tenant.IsRBACEnforced()
+	xtAccess := cfg.Tenant != nil && cfg.Tenant.EnableCrossTenantAccess
+	fmt.Printf(
+		"[config] tenant RBAC enforcement: enable_rbac=%v cross_tenant_access=%v "+
+			"(env: WEKNORA_TENANT_ENABLE_RBAC=%q WEKNORA_TENANT_ENABLE_CROSS_TENANT_ACCESS=%q)\n",
+		rbacOn, xtAccess,
+		os.Getenv("WEKNORA_TENANT_ENABLE_RBAC"),
+		os.Getenv("WEKNORA_TENANT_ENABLE_CROSS_TENANT_ACCESS"),
+	)
 
 	return &cfg, nil
 }
@@ -453,6 +626,25 @@ func ValidateConfig(cfg *Config) error {
 			(strings.TrimSpace(cfg.OIDCAuth.AuthorizationEndpoint) == "" || strings.TrimSpace(cfg.OIDCAuth.TokenEndpoint) == "") {
 			errs = append(errs, "oidc_auth.discovery_url or both oidc_auth.authorization_endpoint and oidc_auth.token_endpoint are required when OIDC is enabled")
 		}
+	}
+
+	if cfg.Auth != nil {
+		mode := strings.TrimSpace(cfg.Auth.RegistrationMode)
+		if mode != "" && mode != AuthRegistrationModeSelfServe && mode != AuthRegistrationModeInviteOnly {
+			errs = append(errs, fmt.Sprintf("auth.registration_mode must be %q or %q, got %q",
+				AuthRegistrationModeSelfServe, AuthRegistrationModeInviteOnly, mode))
+		}
+
+		tenantMode := strings.TrimSpace(cfg.Auth.DefaultTenantMode)
+		if tenantMode != "" && tenantMode != AuthDefaultTenantModeCreatePersonal && tenantMode != AuthDefaultTenantModeTenantless {
+			errs = append(errs, fmt.Sprintf("auth.default_tenant_mode must be %q or %q, got %q",
+				AuthDefaultTenantModeCreatePersonal, AuthDefaultTenantModeTenantless, tenantMode))
+		}
+	}
+
+	if cfg.Audit != nil && cfg.Audit.RetentionDays < 0 {
+		errs = append(errs, fmt.Sprintf("audit.retention_days must be >= 0 (got %d); use 0 to disable purge",
+			cfg.Audit.RetentionDays))
 	}
 
 	if cfg.Conversation != nil {
@@ -529,6 +721,9 @@ func applyOIDCEnvOverrides(cfg *Config) {
 	if value := strings.TrimSpace(os.Getenv("OIDC_AUTH_USER_INFO_ENDPOINT")); value != "" {
 		cfg.OIDCAuth.UserInfoEndpoint = value
 	}
+	if value := strings.TrimSpace(os.Getenv("OIDC_AUTH_JWKS_URI")); value != "" {
+		cfg.OIDCAuth.JwksURI = value
+	}
 	if value := strings.TrimSpace(os.Getenv("OIDC_AUTH_SCOPES")); value != "" {
 		cfg.OIDCAuth.Scopes = strings.Fields(strings.ReplaceAll(value, ",", " "))
 	}
@@ -556,6 +751,28 @@ func applyOIDCEnvOverrides(cfg *Config) {
 	}
 }
 
+func applyKnowledgeBaseEnvOverrides(cfg *Config) {
+	if cfg.KnowledgeBase == nil {
+		cfg.KnowledgeBase = &KnowledgeBaseConfig{}
+	}
+	if cfg.KnowledgeBase.DocumentProcessTimeout <= 0 {
+		cfg.KnowledgeBase.DocumentProcessTimeout = DefaultDocumentProcessTimeout
+	}
+	if value := strings.TrimSpace(os.Getenv("WEKNORA_DOCUMENT_PROCESS_TIMEOUT")); value != "" {
+		if d, err := time.ParseDuration(value); err == nil {
+			cfg.KnowledgeBase.DocumentProcessTimeout = d
+		}
+	}
+	if cfg.KnowledgeBase.DocReaderCallTimeout <= 0 {
+		cfg.KnowledgeBase.DocReaderCallTimeout = 30 * time.Minute
+	}
+	if value := strings.TrimSpace(os.Getenv("WEKNORA_DOCREADER_CALL_TIMEOUT")); value != "" {
+		if d, err := time.ParseDuration(value); err == nil && d > 0 {
+			cfg.KnowledgeBase.DocReaderCallTimeout = d
+		}
+	}
+}
+
 func applyAgentEnvOverrides(cfg *Config) {
 	if cfg.Agent == nil {
 		cfg.Agent = &AgentConfig{}
@@ -568,9 +785,166 @@ func applyAgentEnvOverrides(cfg *Config) {
 			cfg.Agent.LLMCallTimeout = int(sec.Seconds())
 		}
 	}
+	// MCP tool human-approval wait timeout (issue #1173). Accepts Go duration
+	// (e.g. "10m", "30s") or a bare number interpreted as seconds.
+	if value := strings.TrimSpace(os.Getenv("WEKNORA_AGENT_TOOL_APPROVAL_TIMEOUT")); value != "" {
+		if d, err := time.ParseDuration(value); err == nil {
+			cfg.Agent.ToolApprovalTimeoutSeconds = int(d.Seconds())
+		} else if d, err := time.ParseDuration(value + "s"); err == nil {
+			cfg.Agent.ToolApprovalTimeoutSeconds = int(d.Seconds())
+		}
+	}
 }
 
-// backfillConversationDefaults resolves prompt template ID references
+// applyAuthAndTenantDefaults fills in defaults for the Auth and Tenant
+// config sections and applies env-var overrides that operators commonly use
+// to enable RBAC or switch registration mode without editing config.yaml.
+//
+// Defaults:
+//   - auth.registration_mode  -> "self_serve" (preserves pre-RBAC behaviour)
+//   - auth.default_tenant_mode -> "create_personal" (preserves the
+//     historical registration behaviour)
+//   - tenant.enable_rbac      -> true (enforce role checks unless an
+//     operator explicitly opts into the logging-only rollout window via
+//     config.yaml `enable_rbac: false` or `WEKNORA_TENANT_ENABLE_RBAC=false`).
+//   - tenant.self_service_creation_enabled -> true (preserves ordinary
+//     authenticated users' ability to create workspaces).
+//
+// Env overrides (when set and non-empty):
+//   - WEKNORA_AUTH_DEFAULT_TENANT_MODE ("create_personal"/"tenantless")
+//   - WEKNORA_AUTH_COMPLEX_PASSWORD_ENABLED (boolean)
+//   - WEKNORA_TENANT_SELF_SERVICE_CREATION_ENABLED (boolean)
+//   - WEKNORA_TENANT_ENABLE_RBAC      ("true"/"false", case-insensitive)
+//   - WEKNORA_TENANT_ENABLE_CROSS_TENANT_ACCESS ("true"/"false", case-insensitive).
+//     Read explicitly because viper.AutomaticEnv has no SetEnvPrefix, so the
+//     WEKNORA_-prefixed var is not bound to the nested struct automatically.
+//   - WEKNORA_TENANT_MAX_OWNED_PER_USER (integer; <0 disables the cap,
+//     0 falls back to the handler default, >0 enforces that exact cap).
+//     Unparseable / empty values are ignored so a stale shell variable
+//     can't silently disable the quota for a future deployment.
+//
+// Note: auth.registration_mode has no dedicated env override. The
+// long-standing DISABLE_REGISTRATION=true env var is the single env-layer
+// knob and, when set, coerces registration_mode to invite_only here. That
+// way both the API gate (handler) and the /auth/config-driven UI gate
+// (frontend hides the register entry) stay consistent — without needing
+// two parallel env vars.
+func applyAuthAndTenantDefaults(cfg *Config) {
+	if cfg.Auth == nil {
+		cfg.Auth = &AuthConfig{}
+	}
+	if cfg.Tenant == nil {
+		cfg.Tenant = &TenantConfig{}
+	}
+
+	if legacy := strings.TrimSpace(os.Getenv("DISABLE_REGISTRATION")); strings.EqualFold(legacy, "true") {
+		prev := strings.TrimSpace(cfg.Auth.RegistrationMode)
+		cfg.Auth.RegistrationMode = AuthRegistrationModeInviteOnly
+		if prev != "" && prev != AuthRegistrationModeInviteOnly {
+			fmt.Printf(
+				"[config] DISABLE_REGISTRATION=true overrides auth.registration_mode=%q -> %q\n",
+				prev, AuthRegistrationModeInviteOnly,
+			)
+		}
+	}
+
+	if strings.TrimSpace(cfg.Auth.RegistrationMode) == "" {
+		cfg.Auth.RegistrationMode = AuthRegistrationModeSelfServe
+	}
+
+	if value := strings.TrimSpace(os.Getenv("WEKNORA_AUTH_COMPLEX_PASSWORD_ENABLED")); value != "" {
+		if parsed, err := strconv.ParseBool(value); err == nil {
+			cfg.Auth.ComplexPasswordEnabled = parsed
+		}
+	}
+
+	if value := strings.TrimSpace(os.Getenv("WEKNORA_AUTH_DEFAULT_TENANT_MODE")); value != "" {
+		cfg.Auth.DefaultTenantMode = value
+	}
+	if strings.TrimSpace(cfg.Auth.DefaultTenantMode) == "" {
+		cfg.Auth.DefaultTenantMode = AuthDefaultTenantModeCreatePersonal
+	}
+
+	if value := strings.TrimSpace(os.Getenv("WEKNORA_TENANT_ENABLE_RBAC")); value != "" {
+		v := strings.EqualFold(value, "true")
+		cfg.Tenant.EnableRBAC = &v
+	}
+	if cfg.Tenant.EnableRBAC == nil {
+		// Default: enforce. Operators opt out of enforcement explicitly
+		// via config.yaml `enable_rbac: false` or the env override.
+		on := true
+		cfg.Tenant.EnableRBAC = &on
+	}
+
+	// WEKNORA_TENANT_ENABLE_CROSS_TENANT_ACCESS mirrors the RBAC switch above.
+	// It must be read explicitly: viper.AutomaticEnv has no SetEnvPrefix, so the
+	// WEKNORA_-prefixed env var is never bound to the nested struct field —
+	// without this block, only config.yaml's enable_cross_tenant_access takes
+	// effect and the documented env override is silently ignored. The default
+	// stays whatever config.yaml provides (false unless set there).
+	if value := strings.TrimSpace(os.Getenv("WEKNORA_TENANT_ENABLE_CROSS_TENANT_ACCESS")); value != "" {
+		cfg.Tenant.EnableCrossTenantAccess = strings.EqualFold(value, "true")
+	}
+
+	if value := strings.TrimSpace(os.Getenv("WEKNORA_TENANT_SELF_SERVICE_CREATION_ENABLED")); value != "" {
+		if enabled, err := strconv.ParseBool(value); err == nil {
+			cfg.Tenant.SelfServiceCreationEnabled = &enabled
+		} else {
+			fmt.Printf(
+				"[config] WEKNORA_TENANT_SELF_SERVICE_CREATION_ENABLED=%q is not a boolean, ignoring\n",
+				value,
+			)
+		}
+	}
+	if cfg.Tenant.SelfServiceCreationEnabled == nil {
+		on := true
+		cfg.Tenant.SelfServiceCreationEnabled = &on
+	}
+
+	if value := strings.TrimSpace(os.Getenv("WEKNORA_TENANT_MAX_OWNED_PER_USER")); value != "" {
+		if n, err := strconv.Atoi(value); err == nil {
+			cfg.Tenant.MaxOwnedPerUser = n
+		} else {
+			fmt.Printf(
+				"[config] WEKNORA_TENANT_MAX_OWNED_PER_USER=%q is not an integer, ignoring\n",
+				value,
+			)
+		}
+	}
+}
+
+// applyAuditDefaults fills in defaults for the Audit config section
+// and applies the env override commonly used to extend or disable
+// retention without editing config.yaml.
+//
+// Defaults:
+//   - When the `audit:` section is omitted entirely from YAML,
+//     RetentionDays = 90 (purge rows older than 90 days).
+//
+// Operator intent is otherwise preserved: an explicit
+// `audit.retention_days: 0` in YAML means "disable the purge", which
+// is a supported posture for compliance use cases that handle archival
+// off-database.
+//
+// Env overrides (when set and parseable; out-of-range is ignored):
+//   - WEKNORA_AUDIT_RETENTION_DAYS (non-negative integer)
+func applyAuditDefaults(cfg *Config) {
+	// Section omitted entirely -> apply the default and no env wiring
+	// is needed for the most common path.
+	if cfg.Audit == nil {
+		cfg.Audit = &AuditConfig{RetentionDays: 90}
+	}
+
+	// Env override always wins, but only when explicitly set so a
+	// stale shell variable doesn't suddenly disable the purge for a
+	// future deployment that committed a real value.
+	if value := strings.TrimSpace(os.Getenv("WEKNORA_AUDIT_RETENTION_DAYS")); value != "" {
+		if n, err := strconv.Atoi(value); err == nil && n >= 0 {
+			cfg.Audit.RetentionDays = n
+		}
+	}
+}
+
 // into actual prompt text content. Only xxx_id fields are used;
 // no fallback to default templates.
 func backfillConversationDefaults(cfg *Config) {

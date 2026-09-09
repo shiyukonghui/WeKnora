@@ -24,6 +24,18 @@ type DataSourceService interface {
 	// DeleteDataSource deletes a data source (soft delete)
 	DeleteDataSource(ctx context.Context, id string) error
 
+	// UpdateDataSourceCredentials replaces the connector credential map.
+	// DataSource credentials are per-connector atomic — there is no
+	// individual-field PUT, the whole map gets replaced. Returns the updated
+	// data source so the caller can re-fetch the redacted shape.
+	UpdateDataSourceCredentials(
+		ctx context.Context, id string, credentials map[string]interface{},
+	) (*types.DataSource, error)
+
+	// ClearDataSourceCredentials wipes the connector credential map.
+	// Idempotent on already-empty credentials.
+	ClearDataSourceCredentials(ctx context.Context, id string) error
+
 	// ValidateConnection tests the connection to an external data source
 	ValidateConnection(ctx context.Context, dsID string) error
 
@@ -31,8 +43,15 @@ type DataSourceService interface {
 	// This is used by the frontend "Test Connection" button before creating a data source.
 	ValidateCredentials(ctx context.Context, connectorType string, credentials map[string]interface{}) error
 
-	// ListAvailableResources lists resources available for sync in the external system
-	ListAvailableResources(ctx context.Context, dsID string) ([]types.Resource, error)
+	// ListAvailableResources lists resources available for sync in the external system.
+	// parentID enables lazy loading: "" lists the top level, a resource ExternalID lists its children.
+	ListAvailableResources(ctx context.Context, dsID string, parentID string) ([]types.Resource, error)
+
+	// ResolveResourceAncestors returns the deduplicated ExternalIDs of every
+	// ancestor that must be expanded to reveal the given (possibly deeply nested)
+	// resources in a lazily-loaded picker. Used to restore an existing selection
+	// when editing a data source.
+	ResolveResourceAncestors(ctx context.Context, dsID string, resourceIDs []string) ([]string, error)
 
 	// ManualSync triggers an immediate sync for a data source
 	ManualSync(ctx context.Context, dsID string) (*types.SyncLog, error)
@@ -67,6 +86,9 @@ type DataSourceRepository interface {
 	// Update updates an existing data source
 	Update(ctx context.Context, ds *types.DataSource) error
 
+	// UpdateSyncState updates only fields produced by a sync run.
+	UpdateSyncState(ctx context.Context, ds *types.DataSource) error
+
 	// Delete performs a soft delete
 	Delete(ctx context.Context, id string) error
 
@@ -94,6 +116,9 @@ type SyncLogRepository interface {
 
 	// Update updates an existing sync log entry
 	Update(ctx context.Context, log *types.SyncLog) error
+
+	// UpdateResult updates only fields produced by a sync run.
+	UpdateResult(ctx context.Context, log *types.SyncLog) error
 
 	// CancelPendingByDataSource marks all non-terminal sync logs for a data source as canceled.
 	CancelPendingByDataSource(ctx context.Context, dsID string) error

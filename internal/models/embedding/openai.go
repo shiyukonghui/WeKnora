@@ -15,16 +15,17 @@ import (
 
 // OpenAIEmbedder implements text vectorization functionality using OpenAI API
 type OpenAIEmbedder struct {
-	apiKey               string
-	baseURL              string
-	modelName            string
-	truncatePromptTokens int
-	dimensions           int
-	modelID              string
-	httpClient           *http.Client
-	timeout              time.Duration
-	maxRetries           int
-	customHeaders        map[string]string
+	apiKey                    string
+	baseURL                   string
+	modelName                 string
+	truncatePromptTokens      int
+	dimensions                int
+	modelID                   string
+	httpClient                *http.Client
+	timeout                   time.Duration
+	maxRetries                int
+	customHeaders             map[string]string
+	supportsDimensionOverride bool
 	EmbedderPooler
 }
 
@@ -33,6 +34,7 @@ type OpenAIEmbedRequest struct {
 	Model                string   `json:"model"`
 	Input                []string `json:"input"`
 	EncodingFormat       string   `json:"encoding_format,omitempty"`
+	Dimensions           int      `json:"dimensions,omitempty"`
 	TruncatePromptTokens int      `json:"truncate_prompt_tokens,omitempty"`
 }
 
@@ -62,16 +64,15 @@ func NewOpenAIEmbedder(apiKey, baseURL, modelName string,
 
 	timeout := 60 * time.Second
 
-	// Create HTTP client
-	client := &http.Client{
-		Timeout: timeout,
+	if err := validateEmbeddingBaseURL(baseURL); err != nil {
+		return nil, err
 	}
 
 	return &OpenAIEmbedder{
 		apiKey:               apiKey,
 		baseURL:              baseURL,
 		modelName:            modelName,
-		httpClient:           client,
+		httpClient:           newEmbeddingHTTPClient(timeout),
 		truncatePromptTokens: truncatePromptTokens,
 		EmbedderPooler:       pooler,
 		dimensions:           dimensions,
@@ -85,6 +86,10 @@ func NewOpenAIEmbedder(apiKey, baseURL, modelName string,
 // 保留头（Authorization、Content-Type 等）会在发送时被自动跳过。
 func (e *OpenAIEmbedder) SetCustomHeaders(headers map[string]string) {
 	e.customHeaders = headers
+}
+
+func (e *OpenAIEmbedder) SetSupportsDimensionOverride(supported bool) {
+	e.supportsDimensionOverride = supported
 }
 
 // Embed converts text to vector
@@ -122,8 +127,20 @@ func (e *OpenAIEmbedder) doRequestWithRetry(ctx context.Context, jsonData []byte
 			}
 		}
 
-		// Rebuild request each time to ensure Body is valid
-		req, err := http.NewRequestWithContext(ctx, "POST", url, bytes.NewReader(jsonData))
+		// Rebuild request each time to ensure Body is valid.
+		// IMPORTANT: declare `req` separately (var) so the assignment to `err`
+		// below uses the outer-scope variable, not a fresh loop-local one.
+		// Previously this read `req, err := http.NewRequestWithContext(...)`,
+		// where `:=` introduced a new `err` shadowing the outer one. The
+		// `resp, err = httpClient.Do(req)` line then wrote to the shadowed
+		// `err` only, so when all retries failed with connection errors the
+		// outer `err` stayed nil. The function returned `(nil, nil)`, and
+		// callers (BatchEmbed line 195) blindly dereferenced `resp.Body` →
+		// SIGSEGV nil-pointer panic that took down the whole process.
+		// Reproduce: stop the embedding upstream (e.g. localhost:3130), make
+		// any RAG query → backend SIGSEGV instead of returning HTTP 500.
+		var req *http.Request
+		req, err = http.NewRequestWithContext(ctx, "POST", url, bytes.NewReader(jsonData))
 		if err != nil {
 			logger.GetLogger(ctx).Errorf("OpenAIEmbedder failed to create request: %v", err)
 			continue
@@ -150,6 +167,9 @@ func (e *OpenAIEmbedder) BatchEmbed(ctx context.Context, texts []string) ([][]fl
 		Input:                texts,
 		EncodingFormat:       "float",
 		TruncatePromptTokens: e.truncatePromptTokens,
+	}
+	if e.supportsDimensionsParam() {
+		reqBody.Dimensions = e.dimensions
 	}
 
 	jsonData, err := json.Marshal(reqBody)
@@ -232,6 +252,10 @@ func (e *OpenAIEmbedder) BatchEmbed(ctx context.Context, texts []string) ([][]fl
 // GetModelName returns the model name
 func (e *OpenAIEmbedder) GetModelName() string {
 	return e.modelName
+}
+
+func (e *OpenAIEmbedder) supportsDimensionsParam() bool {
+	return e.supportsDimensionOverride && e.dimensions > 0
 }
 
 // GetDimensions returns the vector dimensions

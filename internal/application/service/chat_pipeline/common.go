@@ -11,11 +11,30 @@ import (
 	"github.com/Tencent/WeKnora/internal/common"
 	"github.com/Tencent/WeKnora/internal/logger"
 	"github.com/Tencent/WeKnora/internal/models/chat"
+	"github.com/Tencent/WeKnora/internal/searchutil"
 	"github.com/Tencent/WeKnora/internal/types"
 	"github.com/Tencent/WeKnora/internal/types/interfaces"
 )
 
 var regThinkTags = regexp.MustCompile(`(?s)<think>.*?</think>`)
+
+const retrievedImageOutputRequirement = `
+
+## Retrieved Image Output Requirement
+The retrieved context for this turn contains Markdown images. Images attached to retrieved passages should be treated as relevant by default.
+- Unless the user explicitly requests text-only output, or every retrieved image is clearly unrelated to the answer, the final answer MUST include at least one relevant Markdown image copied from the retrieved context.
+- Copy the complete Markdown image syntax and its URL verbatim. Never invent, shorten, normalize, or replace the URL.
+- Use ASCII half-width parentheses in image Markdown exactly as ![alt](url). Never use full-width （ or ）.
+- Place each image immediately after the paragraph it supports, rather than collecting images at the end.
+- When multiple retrieved images support different sections of a multi-section answer, include them in their corresponding sections instead of stopping after the first image.
+- Before finishing, silently verify that the answer contains a Markdown image whenever this requirement applies.`
+
+func appendRetrievedImageOutputRequirement(systemPrompt, renderedContexts string) string {
+	if !searchutil.MarkdownImageRegex.MatchString(renderedContexts) {
+		return systemPrompt
+	}
+	return strings.TrimRight(systemPrompt, " \t\r\n") + retrievedImageOutputRequirement
+}
 
 // pipelineInfo logs pipeline info level entries.
 func pipelineInfo(ctx context.Context, stage, action string, fields map[string]interface{}) {
@@ -52,6 +71,12 @@ func prepareChatModel(ctx context.Context, modelService interfaces.ModelService,
 		FrequencyPenalty:    chatManage.SummaryConfig.FrequencyPenalty,
 		PresencePenalty:     chatManage.SummaryConfig.PresencePenalty,
 		Thinking:            chatManage.SummaryConfig.Thinking,
+		PromptCacheKey:      chatManage.SessionID,
+	}
+	if opt.Thinking != nil {
+		pipelineInfo(ctx, "Stream", "thinking_option", map[string]interface{}{
+			"enabled": *opt.Thinking,
+		})
 	}
 
 	return chatModel, opt, nil
@@ -70,26 +95,53 @@ func prepareMessagesWithHistory(chatManage *types.ChatManage) []chat.Message {
 		"language": chatManage.Language,
 		"contexts": chatManage.RenderedContexts,
 	})
+	// Memory goes at the end of the system prompt, after the retrieved-context
+	// placeholders have been rendered, so a remembered sentence can never be
+	// substituted into prompt structure.
+	systemPrompt += chatManage.MemoryPrompt
 
 	chatMessages := []chat.Message{
 		{Role: "system", Content: systemPrompt},
 	}
 
-	// Add conversation history (already limited by maxRounds in load_history/rewrite plugins)
-	for _, history := range chatManage.History {
-		chatMessages = append(chatMessages, chat.Message{Role: "user", Content: history.Query})
-		chatMessages = append(chatMessages, chat.Message{Role: "assistant", Content: history.Answer})
-	}
+	chatMessages = AppendHistoryMessages(chatMessages, chatManage.History)
+
+	// Image-output rules are turn-specific. Putting them on the current user
+	// message keeps the system prefix byte-stable so provider prompt caches
+	// still hit on later turns of the same session.
+	userContent := appendRetrievedImageOutputRequirement(chatManage.UserContent, chatManage.RenderedContexts)
 
 	// Add current user message. Only include images when the chat model supports
 	// vision; non-vision models rely on the text description in UserContent.
-	userMsg := chat.Message{Role: "user", Content: chatManage.UserContent}
+	userMsg := chat.Message{Role: "user", Content: userContent}
 	if chatManage.ChatModelSupportsVision && len(chatManage.Images) > 0 {
 		userMsg.Images = chatManage.Images
 	}
 	chatMessages = append(chatMessages, userMsg)
 
 	return chatMessages
+}
+
+func withPromptCacheMetadata(
+	ctx context.Context,
+	chatModel chat.Chat,
+	messages []chat.Message,
+	opts *chat.ChatOptions,
+	purpose string,
+) context.Context {
+	prefixFingerprint := chat.PromptPrefixFingerprint(messages, opts)
+	_ = chatModel // model identity is already captured by the usage sink
+	return types.WithLLMCallMetadata(ctx, purpose, prefixFingerprint)
+}
+
+// AppendHistoryMessages appends prior Q&A rounds in chronological order.
+// History is already filtered and truncated upstream by the load_history plugin.
+func AppendHistoryMessages(messages []chat.Message, history []*types.History) []chat.Message {
+	for _, history := range history {
+		messages = append(messages, chat.Message{Role: "user", Content: history.Query})
+		messages = append(messages, chat.Message{Role: "assistant", Content: history.Answer})
+	}
+	return messages
 }
 
 // loadAndProcessHistory fetches recent messages, groups them into Q&A pairs,
@@ -114,14 +166,18 @@ func loadAndProcessHistory(
 			h = &types.History{}
 		}
 		if message.Role == "user" {
-			if message.RenderedContent != "" {
-				h.Query = message.RenderedContent
-			} else {
-				h.Query = message.Content
-			}
+			// RenderedContent is a snapshot of the prompt/context format used by
+			// the original turn. Replaying it would mix legacy <context id="…">
+			// envelopes and old citation instructions into the current protocol.
+			// Historical references are carried separately in KnowledgeReferences
+			// and can be re-merged into this turn's freshly rendered context.
+			h.Query = message.Content
 			h.CreateAt = message.CreatedAt
-			if desc := extractImageCaptions(message.Images); desc != "" && message.RenderedContent == "" {
+			if desc := extractImageCaptions(message.Images); desc != "" {
 				h.Query += "\n\n[用户上传图片内容]\n" + desc
+			}
+			if len(message.Attachments) > 0 {
+				h.Query += message.Attachments.BuildPrompt()
 			}
 		} else {
 			h.Answer = regThinkTags.ReplaceAllString(message.Content, "")

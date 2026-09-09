@@ -4,7 +4,9 @@ import (
 	"bytes"
 	"context"
 	"encoding/base64"
+	"errors"
 	"fmt"
+	"html"
 	"image"
 	_ "image/gif"
 	_ "image/jpeg"
@@ -13,12 +15,15 @@ import (
 	"log"
 	"mime"
 	"net/http"
+	"net/url"
+	"os"
 	"path"
 	"path/filepath"
 	"regexp"
 	"strings"
 	"time"
 
+	"github.com/Tencent/WeKnora/internal/searchutil"
 	secutils "github.com/Tencent/WeKnora/internal/utils"
 
 	"github.com/Tencent/WeKnora/internal/types"
@@ -100,19 +105,18 @@ func (r *ImageResolver) ResolveAndStore(
 	for _, ref := range result.ImageRefs {
 		refMap[ref.OriginalRef] = ref
 	}
+	savedRefs := make(map[string]StoredImage)
 
-	// Process each image reference found in the markdown.
-	// The URL group supports one level of balanced parentheses so that URLs
-	// like https://example.com/item_(abc)/123 are captured in full.
-	// Allow spaces in URLs (exclude only parens and newlines) to handle
-	// filenames with spaces, e.g. "images/第 1 页.jpg".
-	imgPattern := regexp.MustCompile(`!\[(.*?)\]\(([^()\n]*(?:\([^)]*\)[^()\n]*)*)\)`)
-	matches := imgPattern.FindAllStringSubmatchIndex(markdown, -1)
+	matches := scanMarkdownImageTargets(markdown)
 
 	// Process in reverse order to preserve positions when replacing
 	for i := len(matches) - 1; i >= 0; i-- {
-		m := matches[i]
-		refPath := markdown[m[4]:m[5]] // group 2: the URL/path
+		match := matches[i]
+		rawTarget := markdown[match.TargetStart:match.TargetEnd]
+		refPath, pathStart, pathEnd, ok := splitMarkdownImageTarget(rawTarget, refMap)
+		if !ok {
+			continue
+		}
 
 		// Skip already-resolved URLs (http/https, unified /files/, or provider:// scheme)
 		if strings.HasPrefix(refPath, "http://") || strings.HasPrefix(refPath, "https://") ||
@@ -121,46 +125,96 @@ func (r *ImageResolver) ResolveAndStore(
 		}
 
 		// Find inline image bytes from the result
-		ref, found := refMap[refPath]
-		if !found || len(ref.ImageData) == 0 {
+		stored, ok := r.saveReferencedImage(ctx, fileSvc, tenantID, refPath, refMap, savedRefs)
+		if !ok {
 			continue
 		}
-
-		// Filter out small icons and decorative images
-		if isIconImage(ref.ImageData) {
-			// Remove the image reference from markdown entirely
-			markdown = markdown[:m[0]] + markdown[m[1]:]
-			continue
-		}
-
-		// Determine extension
-		ext := extFromMime(ref.MimeType)
-		if ext == "" {
-			ext = filepath.Ext(ref.Filename)
-		}
-		if ext == "" {
-			ext = ".png"
-		}
-
-		// Save via FileService — returns provider:// path
-		fileName := uuid.New().String() + ext
-		servingURL, saveErr := fileSvc.SaveBytes(ctx, ref.ImageData, tenantID, fileName, false)
-		if saveErr != nil {
-			log.Printf("WARN: failed to save image %s: %v", refPath, saveErr)
-			continue
-		}
-
-		images = append(images, StoredImage{
-			OriginalRef: refPath,
-			ServingURL:  servingURL,
-			MimeType:    ref.MimeType,
-		})
+		images = appendStoredImage(images, stored)
 
 		// Replace in markdown
-		markdown = markdown[:m[4]] + servingURL + markdown[m[5]:]
+		absolutePathStart := match.TargetStart + pathStart
+		absolutePathEnd := match.TargetStart + pathEnd
+		markdown = markdown[:absolutePathStart] + stored.ServingURL + markdown[absolutePathEnd:]
 	}
 
+	md5, imgRelativeHTML, _ := r.ResolveRelativeHTMLImages(ctx, markdown, fileSvc, tenantID, refMap, savedRefs)
+	markdown = md5
+	images = append(images, imgRelativeHTML...)
+
 	return markdown, images, nil
+}
+
+func appendStoredImage(images []StoredImage, stored StoredImage) []StoredImage {
+	for _, existing := range images {
+		if existing.OriginalRef == stored.OriginalRef && existing.ServingURL == stored.ServingURL {
+			return images
+		}
+	}
+	return append(images, stored)
+}
+
+func (r *ImageResolver) saveReferencedImage(
+	ctx context.Context,
+	fileSvc interfaces.FileService,
+	tenantID uint64,
+	refPath string,
+	refMap map[string]types.ImageRef,
+	savedRefs map[string]StoredImage,
+) (StoredImage, bool) {
+	if stored, ok := savedRefs[refPath]; ok {
+		return stored, true
+	}
+
+	ref, found := refMap[refPath]
+	if !found || len(ref.ImageData) == 0 {
+		return StoredImage{}, false
+	}
+
+	if !ref.IsOriginal && isIconImage(ref.ImageData) {
+		return StoredImage{}, false
+	}
+
+	// Reuse a previously saved upload when the same source image (identified by
+	// ref.Filename) has already been persisted under a different markdown ref
+	// path (e.g. "images/foo.png" vs "./images/foo.png"). This avoids writing
+	// the same bytes to object storage multiple times.
+	if ref.Filename != "" {
+		if cached, ok := savedRefs["__filename__:"+ref.Filename]; ok {
+			stored := StoredImage{
+				OriginalRef: refPath,
+				ServingURL:  cached.ServingURL,
+				MimeType:    cached.MimeType,
+			}
+			savedRefs[refPath] = stored
+			return stored, true
+		}
+	}
+
+	ext := extFromMime(ref.MimeType)
+	if ext == "" {
+		ext = filepath.Ext(ref.Filename)
+	}
+	if ext == "" {
+		ext = ".png"
+	}
+
+	fileName := uuid.New().String() + ext
+	servingURL, saveErr := fileSvc.SaveBytes(ctx, ref.ImageData, tenantID, fileName, false)
+	if saveErr != nil {
+		log.Printf("WARN: failed to save image %s: %v", refPath, saveErr)
+		return StoredImage{}, false
+	}
+
+	stored := StoredImage{
+		OriginalRef: refPath,
+		ServingURL:  servingURL,
+		MimeType:    ref.MimeType,
+	}
+	savedRefs[refPath] = stored
+	if ref.Filename != "" {
+		savedRefs["__filename__:"+ref.Filename] = stored
+	}
+	return stored, true
 }
 
 func extFromMime(mime string) string {
@@ -184,8 +238,37 @@ func extFromMime(mime string) string {
 
 // isProviderScheme checks if the path uses a provider:// scheme (local://, minio://, cos://, tos://).
 func isProviderScheme(p string) bool {
-	for _, prefix := range []string{"local://", "minio://", "cos://", "tos://", "s3://"} {
+	for _, prefix := range []string{"local://", "minio://", "cos://", "tos://", "s3://", "obs://"} {
 		if strings.HasPrefix(p, prefix) {
+			return true
+		}
+	}
+	return false
+}
+
+// isWhitelistedImageHost checks if the image URL's host is in the whitelist.
+// Whitelisted hosts are trusted (e.g. internal MinerU service) — images are
+// still downloaded for validation and OCR/caption analysis, but not uploaded
+// to object storage. The markdown keeps the original URL.
+// Configure via IMAGE_HOST_KEEP_URL env var (comma-separated hosts).
+func isWhitelistedImageHost(rawURL string) bool {
+	whitelist := strings.TrimSpace(os.Getenv("IMAGE_HOST_KEEP_URL"))
+	if whitelist == "" {
+		return false
+	}
+	u, err := url.Parse(rawURL)
+	if err != nil || u.Host == "" {
+		return false
+	}
+	host := strings.ToLower(u.Host)
+	hostname := strings.ToLower(u.Hostname())
+	for _, h := range strings.Split(whitelist, ",") {
+		h = strings.ToLower(strings.TrimSpace(h))
+		if h == "" {
+			continue
+		}
+		// Exact host match (includes port) or hostname match (any port)
+		if host == h || hostname == h {
 			return true
 		}
 	}
@@ -253,6 +336,16 @@ var imgHTMLDataURI = regexp.MustCompile(
 	`(?i)<img\s[^>]*?src\s*=\s*["'](data:image/[^;]+;base64,[^"']+)["'][^>]*?/?\s*>`,
 )
 
+// imgHTMLSrc matches an HTML <img> tag carrying a quoted src attribute. It does
+// not care what the src points at — callers select the references they handle by
+// inspecting the scheme, which is how the relative and the remote paths divide
+// the same tags between them.
+//
+// Shared with the search layer so that an image stored here can always be
+// matched back to the tag it came from. See searchutil.HTMLImageSrcRegex for
+// the submatch layout and the known limits.
+var imgHTMLSrc = searchutil.HTMLImageSrcRegex
+
 // ResolveHTMLDataURIImages finds <img src="data:image/*;base64,..."> tags in markdown,
 // decodes the images, stores them via fileSvc, and replaces each tag with a markdown
 // image reference using the storage URL.
@@ -312,6 +405,41 @@ func (r *ImageResolver) ResolveHTMLDataURIImages(
 		markdown = markdown[:m[0]] + fmt.Sprintf("![image](%s)", servingURL) + markdown[m[1]:]
 		processed++
 	}
+	return markdown, images, nil
+}
+
+// ResolveRelativeHTMLImages finds HTML <img> tags whose src points at a
+// relative document image reference, stores the corresponding bytes via
+// fileSvc, and replaces only the src attribute value with the storage URL.
+func (r *ImageResolver) ResolveRelativeHTMLImages(
+	ctx context.Context,
+	markdown string,
+	fileSvc interfaces.FileService,
+	tenantID uint64,
+	refMap map[string]types.ImageRef,
+	savedRefs map[string]StoredImage,
+) (updatedMarkdown string, images []StoredImage, err error) {
+	matches := imgHTMLSrc.FindAllStringSubmatchIndex(markdown, -1)
+	if len(matches) == 0 {
+		return markdown, nil, nil
+	}
+
+	for i := len(matches) - 1; i >= 0; i-- {
+		m := matches[i]
+		src := strings.TrimSpace(markdown[m[4]:m[5]])
+		if src == "" || strings.HasPrefix(src, "http://") || strings.HasPrefix(src, "https://") ||
+			isProviderScheme(src) || strings.HasPrefix(strings.ToLower(src), "data:image/") {
+			continue
+		}
+
+		stored, ok := r.saveReferencedImage(ctx, fileSvc, tenantID, src, refMap, savedRefs)
+		if !ok {
+			continue
+		}
+		images = appendStoredImage(images, stored)
+		markdown = markdown[:m[4]] + stored.ServingURL + markdown[m[5]:]
+	}
+
 	return markdown, images, nil
 }
 
@@ -619,15 +747,218 @@ func (r *ImageResolver) ResolveDataURIImages(
 	return markdown, images, nil
 }
 
-// ResolveRemoteImages scans a Markdown string for image references whose URL
-// is http:// or https://, downloads each one through an SSRF-safe HTTP client,
-// uploads the bytes via fileSvc, and replaces the original URL with the
-// provider:// serving URL.
+// errRemoteImageIsIcon marks the one skip reason worth aggregating: a page can
+// carry hundreds of tracking pixels and spacer GIFs, and a line for each would
+// drown the reasons an operator actually needs to see.
+var errRemoteImageIsIcon = errors.New("filtered out as icon")
+
+// remoteImageResult describes one image that was fetched successfully.
+type remoteImageResult struct {
+	// ServingURL is empty when KeepOriginalURL is set. The caller fills it in
+	// with the normalized request URL — NOT the raw document bytes. Later stages
+	// both search the document for this string and fetch it, so a padded or
+	// entity-encoded value satisfies neither.
+	ServingURL string
+	MimeType   string
+	// KeepOriginalURL marks a whitelisted host. Its bytes are downloaded so that
+	// OCR/caption analysis can run, but it is not uploaded: the image keeps being
+	// served from its original host, reached through the normalized URL.
+	KeepOriginalURL bool
+}
+
+// fetchAndStoreRemoteImage applies the SSRF policy, downloads the image,
+// rejects icons and uploads the bytes to storage.
 //
-// Images that fail SSRF validation, exceed size limits, or cannot be downloaded
-// are left unchanged (the original URL is preserved).
+// Both the Markdown and the HTML scan go through here so that the SSRF check,
+// the icon filter and the whitelist behaviour cannot drift apart between the
+// two syntaxes.
+func fetchAndStoreRemoteImage(
+	ctx context.Context,
+	client *http.Client,
+	fileSvc interfaces.FileService,
+	tenantID uint64,
+	imgURL string,
+) (*remoteImageResult, error) {
+	whitelisted := isWhitelistedImageHost(imgURL)
+
+	if !whitelisted {
+		if err := secutils.ValidateURLForSSRF(imgURL); err != nil {
+			return nil, fmt.Errorf("blocked by SSRF policy: %w", err)
+		}
+	}
+
+	data, mimeType, err := downloadImage(ctx, client, imgURL)
+	if err != nil {
+		return nil, fmt.Errorf("download: %w", err)
+	}
+
+	if isIconImage(data) {
+		return nil, errRemoteImageIsIcon
+	}
+
+	if whitelisted {
+		return &remoteImageResult{MimeType: mimeType, KeepOriginalURL: true}, nil
+	}
+
+	ext := extFromMime(mimeType)
+	if ext == "" {
+		ext = extFromURLPath(imgURL)
+	}
+	if ext == "" {
+		ext = ".png" // safe default
+	}
+	servingURL, err := fileSvc.SaveBytes(ctx, data, tenantID, uuid.New().String()+ext, false)
+	if err != nil {
+		return nil, fmt.Errorf("save: %w", err)
+	}
+	return &remoteImageResult{ServingURL: servingURL, MimeType: mimeType}, nil
+}
+
+// isRemoteHTTPURL reports whether raw is an absolute http(s) URL.
 //
-// Returns the updated Markdown and a list of successfully stored images.
+// The comparison is deliberately byte-exact. Downstream fetchers compare the
+// scheme the same way, so anything accepted here has to be spelled the way they
+// expect; per-syntax normalization belongs in the SrcOf of the scan that needs
+// it, not in this predicate.
+func isRemoteHTTPURL(raw string) bool {
+	return strings.HasPrefix(raw, "http://") || strings.HasPrefix(raw, "https://")
+}
+
+// remotePassSpec describes one scan of a document: which references it matches,
+// where the URL sits inside a match, and how to turn the raw document bytes into
+// the URL to request.
+type remotePassSpec struct {
+	Pattern  *regexp.Regexp
+	URLGroup int
+	Syntax   string
+	SrcOf    func(string) string
+}
+
+// remotePassStats accumulates the reasons a scan passed a reference over, so
+// that a partially resolved document can be explained afterwards.
+type remotePassStats struct {
+	resolved   int
+	iconSkips  int
+	overBudget int
+}
+
+func (s *remotePassStats) report(syntax string) {
+	if s.iconSkips > 0 {
+		log.Printf("INFO: skipped %d %s remote image(s) as icons", s.iconSkips, syntax)
+	}
+	if s.overBudget > 0 {
+		log.Printf(
+			"WARN: remote image limit of %d reached for %s images; %d reference(s) left unresolved",
+			maxRemoteImages, syntax, s.overBudget,
+		)
+	}
+}
+
+// resolveRemoteImagePass rewrites every remote http(s) reference matched by
+// spec.Pattern, replacing the span of its URL capture group with the URL the
+// image will be served from: the storage URL, or the normalized original for a
+// whitelisted host. Matches are walked in reverse so the spans still to be
+// processed stay valid after each replacement.
+func resolveRemoteImagePass(
+	ctx context.Context,
+	markdown string,
+	spec remotePassSpec,
+	client func() *http.Client,
+	fileSvc interfaces.FileService,
+	tenantID uint64,
+) (string, []StoredImage) {
+	matches := spec.Pattern.FindAllStringSubmatchIndex(markdown, -1)
+	if len(matches) == 0 {
+		return markdown, nil
+	}
+
+	var (
+		images []StoredImage
+		stats  remotePassStats
+	)
+
+	for i := len(matches) - 1; i >= 0; i-- {
+		m := matches[i]
+		start, end := m[2*spec.URLGroup], m[2*spec.URLGroup+1]
+		if start < 0 {
+			continue
+		}
+		imgURL := spec.SrcOf(markdown[start:end])
+		if !isRemoteHTTPURL(imgURL) {
+			continue
+		}
+
+		if ctx.Err() != nil {
+			log.Printf("WARN: remote image resolution cancelled: %v", ctx.Err())
+			break
+		}
+
+		if stats.resolved >= maxRemoteImages {
+			stats.overBudget++
+			continue
+		}
+
+		res, err := fetchAndStoreRemoteImage(ctx, client(), fileSvc, tenantID, imgURL)
+		if err != nil {
+			if errors.Is(err, errRemoteImageIsIcon) {
+				stats.iconSkips++
+			} else {
+				log.Printf("WARN: skipped %s remote image %s: %v", spec.Syntax, imgURL, err)
+			}
+			continue
+		}
+		stats.resolved++
+
+		// A whitelisted host is served from where it already lives, so the
+		// document keeps pointing there. The span is still rewritten with the
+		// normalized URL: later stages both locate the image by searching the
+		// document for its ServingURL and fetch that same string, so the two have
+		// to agree, and an entity-encoded or padded attribute value satisfies
+		// neither.
+		servingURL := res.ServingURL
+		if res.KeepOriginalURL {
+			servingURL = imgURL
+		}
+
+		images = append(images, StoredImage{
+			OriginalRef: imgURL,
+			ServingURL:  servingURL,
+			MimeType:    res.MimeType,
+		})
+		markdown = markdown[:start] + servingURL + markdown[end:]
+	}
+
+	stats.report(spec.Syntax)
+	return markdown, images
+}
+
+// htmlAttrSrc normalizes an HTML src attribute value into the URL to request.
+//
+// Three things are HTML-specific. An attribute value may be padded, so it is
+// trimmed — on both sides of the decode, because an entity can itself expand to
+// whitespace. It may carry entities, and `&amp;` is the correct spelling of a
+// query separator, so it is unescaped. And the scheme may be written in any
+// case, while every fetcher downstream compares it byte-for-byte, so it is
+// lowercased.
+//
+// Markdown targets get none of this: they are handed through unchanged so that
+// existing documents resolve exactly the references they resolve today.
+func htmlAttrSrc(raw string) string {
+	src := strings.TrimSpace(html.UnescapeString(strings.TrimSpace(raw)))
+	if i := strings.Index(src, "://"); i > 0 {
+		src = strings.ToLower(src[:i]) + src[i:]
+	}
+	return src
+}
+
+// markdownSrc hands a Markdown image target through untouched. Markdown has no
+// attribute quoting or entity encoding to undo, and leaving it alone is what
+// keeps existing documents resolving exactly what they resolve today.
+func markdownSrc(raw string) string { return raw }
+
+// ResolveRemoteImages downloads remote http(s) images into storage and points
+// the document at the stored copies. Both Markdown image syntax and HTML <img>
+// tags with a quoted src are covered.
 func (r *ImageResolver) ResolveRemoteImages(
 	ctx context.Context,
 	markdown string,
@@ -636,83 +967,38 @@ func (r *ImageResolver) ResolveRemoteImages(
 ) (updatedMarkdown string, images []StoredImage, err error) {
 	markdown = UnwrapLinkedImages(markdown)
 
-	matches := imgMarkdownPattern.FindAllStringSubmatchIndex(markdown, -1)
-	if len(matches) == 0 {
-		return markdown, nil, nil
+	// The client owns a dedicated transport, so it is built only once a scan
+	// actually has something to fetch.
+	var httpClient *http.Client
+	client := func() *http.Client {
+		if httpClient == nil {
+			httpClient = secutils.NewSSRFSafeHTTPClient(secutils.SSRFSafeHTTPClientConfig{
+				Timeout:      remoteImageFetchTimeout,
+				MaxRedirects: 5,
+			})
+		}
+		return httpClient
 	}
 
-	// Build a shared SSRF-safe HTTP client for all downloads.
-	httpClient := secutils.NewSSRFSafeHTTPClient(secutils.SSRFSafeHTTPClientConfig{
-		Timeout:      remoteImageFetchTimeout,
-		MaxRedirects: 5,
-	})
+	// Two scans, each with its own budget. Sharing one would let HTML images eat
+	// into the number of Markdown images a document already gets resolved today.
+	markdown, mdImages := resolveRemoteImagePass(ctx, markdown, remotePassSpec{
+		Pattern: imgMarkdownPattern,
+		// Group 2 of imgMarkdownPattern is the target; group 1 is the alt text.
+		URLGroup: 2,
+		Syntax:   "markdown",
+		SrcOf:    markdownSrc,
+	}, client, fileSvc, tenantID)
 
-	processed := 0
+	markdown, htmlImages := resolveRemoteImagePass(ctx, markdown, remotePassSpec{
+		Pattern:  imgHTMLSrc,
+		URLGroup: searchutil.HTMLImageSrcURLGroup,
+		Syntax:   "html",
+		SrcOf:    htmlAttrSrc,
+	}, client, fileSvc, tenantID)
 
-	// Process in reverse order so that earlier indices stay valid after replacements.
-	for i := len(matches) - 1; i >= 0; i-- {
-		if processed >= maxRemoteImages {
-			break
-		}
-		m := matches[i]
-		imgURL := markdown[m[4]:m[5]] // group 2: the URL
-
-		// Only process remote http(s) URLs.
-		if !strings.HasPrefix(imgURL, "http://") && !strings.HasPrefix(imgURL, "https://") {
-			continue
-		}
-
-		// Already a provider scheme — skip.
-		if isProviderScheme(imgURL) {
-			continue
-		}
-
-		// --- SSRF check (centralised entry-point with whitelist support) ---
-		if err := secutils.ValidateURLForSSRF(imgURL); err != nil {
-			log.Printf("WARN: remote image blocked by SSRF check (%v): %s", err, imgURL)
-			continue
-		}
-
-		// --- Download ---
-		data, mimeType, dlErr := downloadImage(ctx, httpClient, imgURL)
-		if dlErr != nil {
-			log.Printf("WARN: failed to download remote image %s: %v", imgURL, dlErr)
-			continue
-		}
-
-		// Filter out icons / tiny decorative images.
-		if isIconImage(data) {
-			continue
-		}
-
-		// Determine file extension.
-		ext := extFromMime(mimeType)
-		if ext == "" {
-			ext = extFromURLPath(imgURL)
-		}
-		if ext == "" {
-			ext = ".png" // safe default
-		}
-
-		// --- Upload to storage ---
-		fileName := uuid.New().String() + ext
-		servingURL, saveErr := fileSvc.SaveBytes(ctx, data, tenantID, fileName, false)
-		if saveErr != nil {
-			log.Printf("WARN: failed to save remote image %s: %v", imgURL, saveErr)
-			continue
-		}
-
-		images = append(images, StoredImage{
-			OriginalRef: imgURL,
-			ServingURL:  servingURL,
-			MimeType:    mimeType,
-		})
-
-		// Replace URL in markdown.
-		markdown = markdown[:m[4]] + servingURL + markdown[m[5]:]
-		processed++
-	}
-
+	images = append(images, mdImages...)
+	images = append(images, htmlImages...)
 	return markdown, images, nil
 }
 

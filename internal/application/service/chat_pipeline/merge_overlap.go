@@ -5,13 +5,16 @@ import (
 	"encoding/json"
 	"sort"
 
+	"github.com/Tencent/WeKnora/internal/searchutil"
 	"github.com/Tencent/WeKnora/internal/types"
 )
 
-// mergeOverlappingChunks merges chunks with overlapping or adjacent StartAt/EndAt
-// ranges within a single knowledge source group. Chunks MUST be pre-sorted by
-// StartAt ascending, EndAt ascending. The highest score among merged chunks is kept.
-func (p *PluginMerge) mergeOverlappingChunks(
+// mergeSequentialChunks joins sequential current chunk bodies.
+// Trusted pairs use position-aware merging;
+// any pair involving edited, expanded, or stale content falls back to
+// text matching so current content is never discarded on parser coordinates.
+// Chunks MUST be pre-sorted by ChunkIndex.
+func (p *PluginMerge) mergeSequentialChunks(
 	ctx context.Context,
 	knowledgeID string,
 	chunks []*types.SearchResult,
@@ -20,73 +23,46 @@ func (p *PluginMerge) mergeOverlappingChunks(
 		return nil
 	}
 
-	merged := []*types.SearchResult{chunks[0]}
+	type mergedGroup struct {
+		result    *types.SearchResult
+		lastIndex int
+	}
+	groups := []mergedGroup{{result: chunks[0], lastIndex: chunks[0].ChunkIndex}}
 	for i := 1; i < len(chunks); i++ {
-		lastChunk := merged[len(merged)-1]
+		current := chunks[i]
+		last := &groups[len(groups)-1]
+		lastChunk := last.result
 
-		// Non-overlapping: add as a new entry
-		if chunks[i].StartAt > lastChunk.EndAt {
-			merged = append(merged, chunks[i])
+		switch classifyMerge(lastChunk, last.lastIndex, current) {
+		case mergeSeparate:
+			groups = append(groups, mergedGroup{result: current, lastIndex: current.ChunkIndex})
 			continue
+		case mergeExtend:
+			lastChunk.Content = appendTrustedContent(lastChunk.Content, current.Content, lastChunk.EndAt-current.StartAt)
+			lastChunk.EndAt = current.EndAt
+			recordMergedChild(ctx, knowledgeID, lastChunk, current, "image_merge")
+		case mergeSubsume:
+			recordMergedChild(ctx, knowledgeID, lastChunk, current, "image_merge_contained")
+		case mergeJoinDistinct:
+			lastChunk.Content = searchutil.JoinChunkContent(lastChunk.Content, current.Content, "\n\n")
+			recordMergedChild(ctx, knowledgeID, lastChunk, current, "image_merge_contained")
+		case mergeJoinText:
+			lastChunk.Content = searchutil.JoinChunkContent(lastChunk.Content, current.Content, "\n\n")
+			recordMergedChild(ctx, knowledgeID, lastChunk, current, "image_merge")
 		}
 
-		// Partial overlap: append the non-overlapping suffix.
-		//
-		// Offset math assumes len([]rune(Content)) == EndAt-StartAt, but a
-		// few upstream paths break that invariant:
-		//   - Parent-child chunker prepends table headers, so Content may be
-		//     longer than EndAt-StartAt.
-		//   - Legacy data / mixed chunk sources may carry EndAt-StartAt that
-		//     exceed the actual rune length of Content.
-		// We clamp offset into [0, len(contentRunes)] so the merge degrades
-		// gracefully instead of panicking with a negative slice bound.
-		if chunks[i].EndAt > lastChunk.EndAt {
-			contentRunes := []rune(chunks[i].Content)
-			suffixLen := chunks[i].EndAt - lastChunk.EndAt
-			offset := len(contentRunes) - suffixLen
-			if offset < 0 || offset > len(contentRunes) {
-				pipelineWarn(ctx, "Merge", "overlap_offset_clamp", map[string]interface{}{
-					"knowledge_id":    knowledgeID,
-					"chunk_id":        chunks[i].ID,
-					"content_runes":   len(contentRunes),
-					"chunk_start":     chunks[i].StartAt,
-					"chunk_end":       chunks[i].EndAt,
-					"last_end":        lastChunk.EndAt,
-					"computed_offset": offset,
-				})
-				if offset < 0 {
-					offset = 0
-				} else {
-					offset = len(contentRunes)
-				}
-			}
-			lastChunk.Content = lastChunk.Content + string(contentRunes[offset:])
-			lastChunk.EndAt = chunks[i].EndAt
-			lastChunk.SubChunkID = append(lastChunk.SubChunkID, chunks[i].ID)
-
-			if err := mergeImageInfo(ctx, lastChunk, chunks[i]); err != nil {
-				pipelineWarn(ctx, "Merge", "image_merge", map[string]interface{}{
-					"knowledge_id": knowledgeID,
-					"error":        err.Error(),
-				})
-			}
-		} else {
-			// Fully contained: track the subsumed chunk and merge its ImageInfo
-			if !containsID(lastChunk.SubChunkID, chunks[i].ID) {
-				lastChunk.SubChunkID = append(lastChunk.SubChunkID, chunks[i].ID)
-			}
-			if err := mergeImageInfo(ctx, lastChunk, chunks[i]); err != nil {
-				pipelineWarn(ctx, "Merge", "image_merge_contained", map[string]interface{}{
-					"knowledge_id": knowledgeID,
-					"error":        err.Error(),
-				})
-			}
+		// Extend the merged group's span and keep the higher score.
+		if current.ChunkIndex > last.lastIndex {
+			last.lastIndex = current.ChunkIndex
 		}
-
-		// Keep the higher score
-		if chunks[i].Score > lastChunk.Score {
-			lastChunk.Score = chunks[i].Score
+		if current.Score > lastChunk.Score {
+			lastChunk.Score = current.Score
 		}
+	}
+
+	merged := make([]*types.SearchResult, 0, len(groups))
+	for _, group := range groups {
+		merged = append(merged, group.result)
 	}
 
 	// Sort merged chunks by score (highest first)
@@ -95,6 +71,97 @@ func (p *PluginMerge) mergeOverlappingChunks(
 	})
 
 	return merged
+}
+
+// appendTrustedContent joins a trusted pair using the overlap the coordinates
+// already give us, and only falls back to text search when the overlap does not
+// match character for character (HTML entities or synthetic table headers can
+// keep the length invariant while changing the body).
+//
+// The fallback matters both ways: searching for the longest suffix match would
+// otherwise mistake a repeated table row or log line for the overlap and drop
+// real content, which is exactly what the position path is meant to avoid.
+func appendTrustedContent(acc, next string, positionOverlap int) string {
+	if merged, ok := searchutil.AppendWithExactOverlap(acc, next, positionOverlap); ok {
+		return merged
+	}
+	return searchutil.AppendWithOverlap(acc, next, positionOverlap)
+}
+
+// chunkTrusted reports whether a result's StartAt/EndAt can be trusted for
+// position-based merging: unedited, not pipeline-rewritten, valid range, and
+// splitter-consistent length (runeLen(Content) == EndAt-StartAt).
+func chunkTrusted(chunk *types.SearchResult) bool {
+	return chunk.ContentRevision == 0 &&
+		!chunk.ContentRewritten &&
+		chunk.EndAt > chunk.StartAt &&
+		runeLen(chunk.Content) == chunk.EndAt-chunk.StartAt
+}
+
+// mergeSituation labels how the current result relates to the group's leading
+// result in document order. The classifier decides it once; the merge loop
+// switches on it without nesting.
+type mergeSituation int
+
+const (
+	// mergeSeparate: current is not mergeable, it starts a new group
+	// (position gap, or untrusted pair that is neither text-contained nor
+	// index-sequential).
+	mergeSeparate mergeSituation = iota
+	// mergeExtend: trusted pair with partial overlap or adjacency; the
+	// non-overlapping suffix is appended with text-verified trimming.
+	mergeExtend
+	// mergeSubsume: trusted pair, range-contained and text-verified; current
+	// is recorded without touching the merged content.
+	mergeSubsume
+	// mergeJoinDistinct: trusted pair, range-contained but textually distinct;
+	// current is kept via a text join, breaking the length invariant so later
+	// pairs degrade to the text path.
+	mergeJoinDistinct
+	// mergeJoinText: untrusted pair that is text-contained or index-sequential;
+	// joined via pure text matching.
+	mergeJoinText
+)
+
+// classifyMerge labels the pair relationship so the merge loop can dispatch
+// with a flat switch. It needs the group's running lastIndex for the untrusted
+// sequentiality check.
+func classifyMerge(lastChunk *types.SearchResult, lastIndex int, current *types.SearchResult) mergeSituation {
+	if chunkTrusted(lastChunk) && chunkTrusted(current) && current.StartAt >= lastChunk.StartAt {
+		switch {
+		case current.StartAt > lastChunk.EndAt:
+			return mergeSeparate
+		case current.EndAt > lastChunk.EndAt:
+			return mergeExtend
+		case searchutil.ContainsChunkContent(lastChunk.Content, current.Content):
+			return mergeSubsume
+		default:
+			return mergeJoinDistinct
+		}
+	}
+
+	textContained := searchutil.ContainsChunkContent(lastChunk.Content, current.Content) ||
+		searchutil.ContainsChunkContent(current.Content, lastChunk.Content)
+	sequential := current.ChunkIndex == lastIndex+1
+	if !textContained && !sequential {
+		return mergeSeparate
+	}
+	return mergeJoinText
+}
+
+// recordMergedChild records a merged chunk on the group result: appends its ID
+// to SubChunkID (deduplicated) and merges its ImageInfo, warning on failure.
+// warnKey distinguishes merge contexts in pipeline diagnostics.
+func recordMergedChild(ctx context.Context, knowledgeID string, target, source *types.SearchResult, warnKey string) {
+	if !containsID(target.SubChunkID, source.ID) {
+		target.SubChunkID = append(target.SubChunkID, source.ID)
+	}
+	if err := mergeImageInfo(ctx, target, source); err != nil {
+		pipelineWarn(ctx, "Merge", warnKey, map[string]any{
+			"knowledge_id": knowledgeID,
+			"error":        err.Error(),
+		})
+	}
 }
 
 // mergeImageInfo merges ImageInfo from source into target, deduplicating by URL.

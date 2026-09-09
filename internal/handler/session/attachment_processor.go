@@ -9,6 +9,7 @@ import (
 	"path/filepath"
 	"strings"
 
+	"github.com/Tencent/WeKnora/internal/common"
 	"github.com/Tencent/WeKnora/internal/infrastructure/docparser"
 	"github.com/Tencent/WeKnora/internal/logger"
 	"github.com/Tencent/WeKnora/internal/types"
@@ -116,6 +117,8 @@ func (p *AttachmentProcessor) ProcessAttachment(
 			attachment.Content = fmt.Sprintf("<error><message>Failed to read document</message><details>%v</details></error>", err)
 		}
 	}
+
+	attachment.Content = common.CleanInvalidUTF8(attachment.Content)
 
 	logger.Infof(ctx, "attachment processed: fileName=%s, truncated=%v, contentLen=%d",
 		secutils.SanitizeForLog(baseName), attachment.IsTruncated, len(attachment.Content))
@@ -233,13 +236,39 @@ func (p *AttachmentProcessor) processWithDocumentReader(
 		return fmt.Errorf("DocumentReader not configured")
 	}
 
-	result, err := p.documentReader.Read(ctx, &types.ReadRequest{
-		FileContent: data,
-		FileName:    fileName,
-		FileType:    fileType,
+	normalizedType := strings.TrimPrefix(fileType, ".")
+
+	parserEngine := ""
+	if v := ctx.Value(types.ChatParserEngineContextKey); v != nil {
+		if s, ok := v.(string); ok {
+			parserEngine = s
+		}
+	}
+	overrides := getParserEngineOverridesFromContext(ctx)
+
+	// Engines that parse in this process (anydoc, MinerU, ...) are resolved
+	// through the registry so a chat attachment honours the same engine rules
+	// as an ingested document. Anything the registry cannot build here — a
+	// cloud engine whose credentials this path cannot resolve — falls back to
+	// the docreader, which is where every engine name went before.
+	reader, err := docparser.NewReader(ctx, parserEngine, normalizedType, false, docparser.ReaderDeps{
+		Overrides: overrides,
+		Remote:    p.documentReader,
 	})
 	if err != nil {
-		return fmt.Errorf("DocumentReader failed: %w", err)
+		logger.Warnf(ctx, "parser engine %q unusable for this attachment, using docreader: %v", parserEngine, err)
+		reader = p.documentReader
+	}
+
+	result, err := reader.Read(ctx, &types.ReadRequest{
+		FileContent:           data,
+		FileName:              fileName,
+		FileType:              normalizedType,
+		ParserEngine:          parserEngine,
+		ParserEngineOverrides: overrides,
+	})
+	if err != nil {
+		return fmt.Errorf("document parsing failed: %w", err)
 	}
 
 	// Resolve embedded image refs to storage URLs.
@@ -282,7 +311,7 @@ func isValidFileType(fileName string) bool {
 
 	supportedTypes := []string{
 		// documents
-		"docx", "doc", "pdf", "ppt", "pptx",
+		"docx", "doc", "pdf", "ppt", "pptx", "epub", "mhtml",
 		// spreadsheets
 		"xlsx", "xls",
 		// text / markup
@@ -299,6 +328,16 @@ func isValidFileType(fileName string) bool {
 		}
 	}
 	return false
+}
+
+// getParserEngineOverridesFromContext returns parser engine overrides from tenant in context.
+func getParserEngineOverridesFromContext(ctx context.Context) map[string]string {
+	if v := ctx.Value(types.TenantInfoContextKey); v != nil {
+		if tenant, ok := v.(*types.Tenant); ok && tenant != nil && tenant.ParserEngineConfig != nil {
+			return tenant.ParserEngineConfig.ToOverridesMap()
+		}
+	}
+	return nil
 }
 
 // DecodeBase64Attachment decodes a base64 attachment payload, stripping any data URI prefix.

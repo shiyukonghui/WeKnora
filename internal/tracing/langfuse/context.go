@@ -4,6 +4,8 @@ import (
 	"context"
 
 	"github.com/Tencent/WeKnora/internal/types"
+	"go.opentelemetry.io/otel/propagation"
+	oteltrace "go.opentelemetry.io/otel/trace"
 )
 
 // traceCtxKey is the exported context key defined in types/const.go. It lives
@@ -13,16 +15,12 @@ import (
 // CloneContext call would drop the trace and downstream LLM wrappers would
 // each auto-create their own shallow trace, fragmenting a single HTTP request
 // into many unrelated traces in the Langfuse UI.
+//
+// Span parenting is NOT carried by this key: it flows through the standard
+// OpenTelemetry context (trace.SpanFromContext), which tracer.Start wires up
+// automatically. The *Trace on this key is only for handlers/middleware that
+// need to set trace-level input/output.
 var traceCtxKey = types.LangfuseTraceContextKey
-
-// parentObsCtxKey tracks the current "parent observation" id — i.e. the span
-// that encloses any generation/span started under it. Unlike traceCtxKey, this
-// key is private: spans are a pure tracer concern and logger.CloneContext
-// should reset the parent across request boundaries (we don't want a leftover
-// span id from one request leaking into another's LLM calls).
-type parentObsCtxKeyType struct{}
-
-var parentObsCtxKey = parentObsCtxKeyType{}
 
 // withTrace stores a *Trace on the context so downstream LLM wrappers can
 // attach their generations to it.
@@ -48,20 +46,40 @@ func TraceFromContext(ctx context.Context) (*Trace, bool) {
 	return traceFromCtx(ctx)
 }
 
-// withParentObservation stores the id of the enclosing span so children
-// (sub-spans or generations) can attach via parentObservationId.
-func withParentObservation(ctx context.Context, id string) context.Context {
-	if ctx == nil || id == "" {
-		return ctx
+// TraceparentFromContext returns the W3C traceparent for the active span, or
+// empty when Langfuse is disabled or ctx carries no span. Used to stamp the
+// originating chat trace onto derived work (follow-up suggestions) that may
+// run after the HTTP handler returns, or on a later request.
+func TraceparentFromContext(ctx context.Context) string {
+	mgr := GetManager()
+	if ctx == nil || !mgr.Enabled() {
+		return ""
 	}
-	return context.WithValue(ctx, parentObsCtxKey, id)
+	c := propagation.MapCarrier{}
+	propagator.Inject(ctx, c)
+	return c["traceparent"]
 }
 
-// parentObservationFromCtx returns the enclosing span id if any.
-func parentObservationFromCtx(ctx context.Context) (string, bool) {
-	if ctx == nil {
-		return "", false
+// AttachTraceparent resumes the originating trace from a W3C traceparent
+// previously captured by TraceparentFromContext / InjectTracing. When ctx
+// already has a *Trace (same-request background work), it is left unchanged
+// so we do not replace a live local parent with a remote one.
+//
+// This is the in-process counterpart of AsynqMiddleware's extract path: a
+// later HTTP request (e.g. POST .../suggestions) has no GinMiddleware trace,
+// and without this StartGeneration would auto-create an orphan root named
+// after the LLM call.
+func AttachTraceparent(ctx context.Context, traceparent string) context.Context {
+	mgr := GetManager()
+	if ctx == nil || traceparent == "" || !mgr.Enabled() {
+		return ctx
 	}
-	v, ok := ctx.Value(parentObsCtxKey).(string)
-	return v, ok && v != ""
+	if _, ok := traceFromCtx(ctx); ok {
+		return ctx
+	}
+	ctx = propagator.Extract(ctx, propagation.MapCarrier{"traceparent": traceparent})
+	if sc := oteltrace.SpanContextFromContext(ctx); sc.IsValid() {
+		ctx = withTrace(ctx, &Trace{ID: sc.TraceID().String(), manager: mgr})
+	}
+	return ctx
 }

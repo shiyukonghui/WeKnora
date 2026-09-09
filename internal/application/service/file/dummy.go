@@ -3,9 +3,11 @@ package file
 import (
 	"context"
 	"errors"
+	"fmt"
 	"io"
 	"mime/multipart"
 
+	"github.com/Tencent/WeKnora/internal/logger"
 	"github.com/Tencent/WeKnora/internal/types/interfaces"
 	"github.com/google/uuid"
 )
@@ -29,7 +31,7 @@ func NewDummyFileService() interfaces.FileService {
 func (s *DummyFileService) SaveFile(ctx context.Context,
 	file *multipart.FileHeader, tenantID uint64, knowledgeID string,
 ) (string, error) {
-	return uuid.New().String(), nil
+	return fmt.Sprintf("dummy://%d/%s", tenantID, uuid.New().String()), nil
 }
 
 // GetFile always returns an error as dummy service doesn't store files
@@ -44,7 +46,14 @@ func (s *DummyFileService) DeleteFile(ctx context.Context, filePath string) erro
 
 // SaveBytes pretends to save bytes but just returns a random UUID
 func (s *DummyFileService) SaveBytes(ctx context.Context, data []byte, tenantID uint64, fileName string, temp bool) (string, error) {
-	return uuid.New().String(), nil
+	return fmt.Sprintf("dummy://%d/%s", tenantID, uuid.New().String()), nil
+}
+
+// CopyFile is a no-op for the dummy service: it logs a warning and returns the
+// source path unchanged (the shared reference is intentional in this stub).
+func (s *DummyFileService) CopyFile(ctx context.Context, srcPath string, tenantID uint64, knowledgeID string) (string, error) {
+	logger.Warnf(ctx, "[dummy] CopyFile no-op: returning source path %q unchanged (no real copy performed)", srcPath)
+	return srcPath, nil
 }
 
 // GetFileURL returns the file path as URL (dummy implementation)

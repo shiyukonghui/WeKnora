@@ -37,7 +37,7 @@
 </template>
 
 <script setup lang="ts">
-import { ref, defineProps, computed } from 'vue';
+import { ref, computed } from 'vue';
 import type { RelatedChunksData } from '@/types/tool-results';
 import ContentPopup from './ContentPopup.vue';
 
@@ -144,7 +144,7 @@ const props = defineProps<{
 }
 
 code {
-  font-family: 'Monaco', 'Courier New', monospace;
+  font-family: var(--app-font-family-mono);
   font-size: 11px;
   background: var(--td-bg-color-secondarycontainer);
   padding: 2px 4px;

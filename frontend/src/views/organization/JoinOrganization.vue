@@ -26,11 +26,13 @@ import { useRoute, useRouter } from 'vue-router'
 import { useI18n } from 'vue-i18n'
 import { MessagePlugin } from 'tdesign-vue-next'
 import { useOrganizationStore } from '@/stores/organization'
+import { useAuthStore } from '@/stores/auth'
 
 const route = useRoute()
 const router = useRouter()
 const { t } = useI18n()
 const orgStore = useOrganizationStore()
+const authStore = useAuthStore()
 
 const loading = ref(true)
 const error = ref('')
@@ -43,7 +45,14 @@ onMounted(async () => {
     loading.value = false
     return
   }
-  
+
+  // 后端 POST /organizations/join 要求当前空间角色 ≥ admin，先在前端拦截以给出友好提示
+  if (!authStore.hasRole('admin') && !authStore.canAccessAllTenants) {
+    error.value = t('organization.rbac.cannotJoin')
+    loading.value = false
+    return
+  }
+
   try {
     const result = await orgStore.join(code)
     if (result) {
@@ -65,7 +74,7 @@ const goToOrganizations = () => {
 
 <style scoped lang="less">
 .join-page {
-  min-height: 100vh;
+  min-height: 100%;
   display: flex;
   align-items: center;
   justify-content: center;

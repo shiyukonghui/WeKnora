@@ -71,7 +71,20 @@ func (s *WebSearchService) Search(
 	defer cancel()
 
 	// Perform search
-	results, err := searchProvider.Search(ctx, query, config.MaxResults, config.IncludeDate)
+	var results []*types.WebSearchResult
+	if config.Filters.Country != "" || config.Filters.Freshness != "" {
+		if err := config.Filters.Validate(); err != nil {
+			return nil, err
+		}
+		filtered, ok := searchProvider.(interfaces.FilteredWebSearchProvider)
+		if !ok {
+			return nil, fmt.Errorf("provider %s does not support country/freshness filters; "+
+				"omit them or select Brave", searchProvider.Name())
+		}
+		results, err = filtered.SearchWithFilters(ctx, query, config.MaxResults, config.IncludeDate, config.Filters)
+	} else {
+		results, err = searchProvider.Search(ctx, query, config.MaxResults, config.IncludeDate)
+	}
 	if err != nil {
 		return nil, fmt.Errorf("web search failed: %w", err)
 	}
@@ -94,7 +107,7 @@ func (s *WebSearchService) resolveProvider(
 	if providerID != "" {
 		tenantID, ok := types.TenantIDFromContext(ctx)
 		if !ok {
-			return nil, fmt.Errorf("tenant ID not found in context")
+			return nil, fmt.Errorf("workspace ID not found in context")
 		}
 
 		entity, err := s.providerRepo.GetByID(ctx, tenantID, providerID)

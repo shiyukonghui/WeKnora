@@ -10,19 +10,13 @@
                 {{ $t('menu.knowledgeBase') }}
               </button>
               <t-icon name="chevron-right" class="breadcrumb-separator" />
-              <t-dropdown
-                v-if="knowledgeDropdownOptions.length"
-                :options="knowledgeDropdownOptions"
-                trigger="click"
-                placement="bottom-left"
-                @click="handleKnowledgeDropdownSelect"
+              <KBSwitcherDropdown
+                v-if="knowledgeList.length"
+                :kb-list="knowledgeList"
+                :current-kb-id="props.kbId"
+                @select="(id) => handleKnowledgeDropdownSelect({ value: id })"
               >
-                <button
-                  type="button"
-                  class="breadcrumb-link dropdown"
-                  :disabled="!props.kbId"
-                  @click.stop="handleNavigateToCurrentKB"
-                >
+                <button type="button" class="breadcrumb-link dropdown" :disabled="!props.kbId">
                   <template v-if="!kbInfo">
                     <t-skeleton animation="gradient" :row-col="[{ width: '120px', height: '20px' }]" />
                   </template>
@@ -31,14 +25,9 @@
                     <t-icon name="chevron-down" />
                   </template>
                 </button>
-              </t-dropdown>
-              <button
-                v-else
-                type="button"
-                class="breadcrumb-link"
-                :disabled="!props.kbId"
-                @click="handleNavigateToCurrentKB"
-              >
+              </KBSwitcherDropdown>
+              <button v-else type="button" class="breadcrumb-link" :disabled="!props.kbId"
+                @click="handleNavigateToCurrentKB">
                 <template v-if="!kbInfo">
                   <t-skeleton animation="gradient" :row-col="[{ width: '120px', height: '20px' }]" />
                 </template>
@@ -49,346 +38,173 @@
               <t-icon name="chevron-right" class="breadcrumb-separator" />
               <span class="breadcrumb-current">{{ $t('knowledgeEditor.faq.title') }}</span>
             </h2>
-            <!-- 身份与最后更新：紧凑单行，置于标题行右侧，悬停显示权限说明 -->
-            <div v-if="kbInfo && !authStore.isLiteMode" class="faq-access-meta">
-              <t-tooltip :content="accessPermissionSummary" placement="top">
-                <span class="faq-access-meta-inner">
-                  <t-tag size="small" :theme="isOwner ? 'success' : (effectiveKBPermission === 'admin' ? 'primary' : effectiveKBPermission === 'editor' ? 'warning' : 'default')" class="faq-access-role-tag">
-                    {{ accessRoleLabel }}
-                  </t-tag>
-                  <template v-if="currentSharedKb">
-                    <span class="faq-access-meta-sep">·</span>
-                    <span class="faq-access-meta-text">
-                      {{ $t('knowledgeBase.accessInfo.fromOrg') }}「{{ currentSharedKb.org_name }}」
-                      {{ $t('knowledgeBase.accessInfo.sharedAt') }} {{ formatImportTime(currentSharedKb.shared_at) }}
-                    </span>
-                  </template>
-                  <template v-else-if="effectiveKBPermission">
-                    <span class="faq-access-meta-sep">·</span>
-                    <span class="faq-access-meta-text">{{ $t('knowledgeList.detail.sourceTypeAgent') }}</span>
-                  </template>
-                  <template v-else-if="kbLastUpdated">
-                    <span class="faq-access-meta-sep">·</span>
-                    <span class="faq-access-meta-text">{{ $t('knowledgeBase.accessInfo.lastUpdated') }} {{ kbLastUpdated }}</span>
-                  </template>
-                </span>
+            <div class="kb-title-actions">
+              <KBInfoPopover
+                v-if="kbInfo && !authStore.isLiteMode"
+                :kb-info="kbInfo"
+              />
+              <t-tooltip v-if="canManage" :content="$t('knowledgeBase.settings')" placement="top">
+                <button type="button" class="kb-settings-button" @click="handleOpenKBSettings">
+                  <t-icon name="setting" size="16px" />
+                </button>
               </t-tooltip>
+              <!-- 导入结果：默认仅图标，hover / 点击展开详情 -->
+              <div v-if="showImportResultBadge" class="faq-import-host"
+                :class="{ 'is-expanded': importResultExpanded }">
+                <button type="button" class="faq-import-trigger"
+                  :aria-label="$t('faqManager.import.recentResult')"
+                  @click.stop="importResultExpanded = !importResultExpanded">
+                  <t-icon name="check-circle-filled" size="16px" />
+                </button>
+                <div class="faq-import-panel">
+                  <div class="faq-import-strip faq-import-strip--result faq-import-strip--panel">
+                    <span class="faq-import-strip__text">{{ importResultSummary }}</span>
+                    <t-tag size="small" variant="light"
+                      :theme="importResult!.import_mode === 'append' ? 'primary' : 'warning'">
+                      {{ importResult!.import_mode === 'append' ? $t('faqManager.import.appendMode') :
+                        $t('faqManager.import.replaceMode') }}
+                    </t-tag>
+                    <t-button v-if="importResult!.failed_entries_url && importResult!.failed_count > 0"
+                      variant="text" theme="danger" size="small" class="faq-import-strip__link"
+                      @click="downloadFailedEntries">
+                      {{ $t('faqManager.import.downloadReasons') }}
+                    </t-button>
+                    <span class="faq-import-strip__time">{{ formatImportTime(importResult!.imported_at) }}</span>
+                    <button type="button" class="faq-import-strip__close" :aria-label="$t('common.close')"
+                      @click="closeImportResult">
+                      <t-icon name="close" size="14px" />
+                    </button>
+                  </div>
+                </div>
+              </div>
+              <!-- 导入进行中 -->
+              <div v-else-if="isImportInProgress && importState.taskStatus"
+                class="faq-import-strip faq-import-strip--in-title"
+                :class="`faq-import-strip--${importState.taskStatus.status}`">
+                <t-icon :name="importProgressIcon" size="16px" class="faq-import-strip__icon"
+                  :class="{ 'is-spinning': importState.taskStatus.status === 'running' }" />
+                <span class="faq-import-strip__text">{{ importProgressText }}</span>
+                <div class="faq-import-strip__bar">
+                  <div class="faq-import-strip__bar-fill" :style="{ width: `${importState.taskStatus.progress}%` }" />
+                </div>
+                <span class="faq-import-strip__count">{{ importState.taskStatus.processed }}/{{
+                  importState.taskStatus.total }}</span>
+              </div>
             </div>
-            <t-tooltip v-if="canManage" :content="$t('knowledgeBase.settings')" placement="top">
-              <button
-                type="button"
-                class="kb-settings-button"
-                @click="handleOpenKBSettings"
-              >
-                <t-icon name="setting" size="16px" />
-              </button>
-            </t-tooltip>
           </div>
           <p class="faq-subtitle">{{ $t('knowledgeEditor.faq.subtitle') }}</p>
         </div>
       </div>
 
-      <!-- 导入结果统计（持久化显示） -->
-      <div v-if="importResult && importResult.display_status === 'open' && !importState.taskId" class="faq-import-result-card">
-        <div class="import-result-content">
-          <div class="import-result-header">
-            <div class="header-left">
-              <t-icon name="check-circle-filled" size="20px" class="result-icon" />
-              <span class="result-title">{{ $t('faqManager.import.recentResult') }}</span>
-            </div>
-            <div class="header-right">
-              <span class="result-time">{{ formatImportTime(importResult.imported_at) }}</span>
-              <t-button
-                variant="text"
-                theme="default"
-                size="small"
-                class="result-close-btn"
-                @click="closeImportResult"
-              >
-                <t-icon name="close" size="16px" />
-              </t-button>
-            </div>
-          </div>
-          <div class="import-result-body">
-            <div class="import-result-stats">
-              <div class="stat-item">
-                <span class="stat-label">{{ $t('faqManager.import.totalData') }}</span>
-                <span class="stat-value">{{ importResult.total_entries }}{{ $t('faqManager.import.unit') }}</span>
-              </div>
-              <div class="stat-item success">
-                <span class="stat-label">{{ $t('faqManager.import.success') }}</span>
-                <span class="stat-value">{{ importResult.success_count }}{{ $t('faqManager.import.unit') }}</span>
-              </div>
-              <div v-if="importResult.failed_count > 0" class="stat-item failed">
-                <span class="stat-label">{{ $t('faqManager.import.failed') }}</span>
-                <span class="stat-value">{{ importResult.failed_count }}{{ $t('faqManager.import.unit') }}</span>
-                <t-button
-                  v-if="importResult.failed_entries_url"
-                  variant="outline"
-                  theme="danger"
-                  size="small"
-                  class="download-failed-btn"
-                  @click="downloadFailedEntries"
-                >
-                  <t-icon name="download" size="14px" />
-                  {{ $t('faqManager.import.downloadReasons') }}
-                </t-button>
-              </div>
-              <div v-if="importResult.skipped_count > 0" class="stat-item skipped">
-                <span class="stat-label">{{ $t('faqManager.import.skipped') }}</span>
-                <span class="stat-value">{{ importResult.skipped_count }}{{ $t('faqManager.import.unit') }}</span>
-              </div>
-            </div>
-            <div class="import-mode-tag">
-              <t-tag size="small" variant="light" theme="success">
-                {{ importResult.import_mode === 'append' ? $t('faqManager.import.appendMode') : $t('faqManager.import.replaceMode') }}
-              </t-tag>
-            </div>
-          </div>
-        </div>
-      </div>
-
-      <!-- 导入进度条（显示在列表页面顶部） -->
-      <div v-if="importState.taskId && importState.taskStatus" class="faq-import-progress-bar">
-        <div class="progress-bar-content">
-          <div class="progress-bar-header">
-            <div class="progress-left">
-              <t-icon 
-                :name="importState.taskStatus.status === 'running' ? 'loading' : 
-                       importState.taskStatus.status === 'success' ? 'check-circle' : 
-                       importState.taskStatus.status === 'failed' ? 'error-circle' : 'time'"
-                size="18px" 
-                class="progress-icon"
-                :class="{
-                  'icon-loading': importState.taskStatus.status === 'running',
-                  'icon-success': importState.taskStatus.status === 'success',
-                  'icon-error': importState.taskStatus.status === 'failed'
-                }"
-              />
-              <span class="progress-title">
-                {{ importState.taskStatus.status === 'running' ? $t('faqManager.import.importing') :
-                   importState.taskStatus.status === 'success' ? $t('faqManager.import.importDone') :
-                   importState.taskStatus.status === 'failed' ? $t('faqManager.import.importFailed') : $t('faqManager.import.waiting') }}
-              </span>
-            </div>
-            <div class="progress-right">
-              <span class="progress-count">
-                {{ importState.taskStatus.processed }}/{{ importState.taskStatus.total }} {{ $t('faqManager.import.unit') }}
-              </span>
-              <t-button
-                v-if="importState.taskStatus.status === 'success' || importState.taskStatus.status === 'failed'"
-                variant="text"
-                theme="default"
-                size="small"
-                class="progress-close-btn"
-                @click="handleCloseProgress"
-              >
-                <t-icon name="close" size="14px" />
-              </t-button>
-            </div>
-          </div>
-          <t-progress
-            :percentage="importState.taskStatus.progress"
-            :status="importState.taskStatus.status === 'failed' ? 'error' : 
-                     importState.taskStatus.status === 'success' ? 'success' : 'active'"
-            :label="false"
-            class="progress-bar"
-          />
-          <p v-if="importState.taskStatus.error" class="progress-error">
-            {{ importState.taskStatus.error }}
-          </p>
-        </div>
-      </div>
-
       <div class="faq-main">
-        <aside class="faq-tag-panel">
-          <div class="sidebar-header">
-            <div class="sidebar-title">
-              <span>{{ $t('knowledgeBase.faqCategoryTitle') }}</span>
-              <span class="sidebar-count">({{ sidebarCategoryCount }})</span>
-            </div>
-            <div v-if="canEdit" class="sidebar-actions">
-              <t-button
-                size="small"
-                variant="text"
-                class="create-tag-btn"
-                :aria-label="$t('knowledgeBase.tagCreateAction')"
-                :title="$t('knowledgeBase.tagCreateAction')"
-                @click="startCreateTag"
-              >
-                <t-icon name="add" />
-              </t-button>
-            </div>
-          </div>
-          <div class="tag-search-bar">
-            <t-input
-              v-model.trim="tagSearchQuery"
-              size="small"
-              :placeholder="$t('knowledgeBase.tagSearchPlaceholder')"
-              clearable
-            >
-              <template #prefix-icon>
-                <t-icon name="search" size="14px" />
-              </template>
-            </t-input>
-          </div>
-          <div ref="tagListRef" class="faq-tag-list" @scroll="handleTagListScroll">
-            <template v-if="tagLoading && !filteredTags.length">
-              <div v-for="n in 8" :key="'skel-tag-'+n" class="faq-tag-item" style="cursor: default; pointer-events: none;">
-                <div class="faq-tag-left" style="gap: 12px; width: 100%;">
-                  <t-skeleton animation="gradient" :row-col="[{ width: '80%', height: '18px' }]" />
-                </div>
-              </div>
-            </template>
-            <template v-else>
-              <div v-if="creatingTag" class="faq-tag-item tag-editing" @click.stop>
-              <div class="faq-tag-left">
-                <span class="tag-hash-icon">#</span>
-                <div class="tag-edit-input">
-                  <t-input
-                      ref="newTagInputRef"
-                      v-model="newTagName"
-                      size="small"
-                      :maxlength="40"
-                      :placeholder="$t('knowledgeBase.tagNamePlaceholder')"
-                      @keydown.enter.stop.prevent="submitCreateTag"
-                      @keydown.esc.stop.prevent="cancelCreateTag"
-                    />
-                  </div>
-                </div>
-                <div class="tag-inline-actions">
-                  <t-button
-                    variant="text"
-                  theme="default"
-                    size="small"
-                  class="tag-action-btn confirm"
-                    :loading="creatingTagLoading"
-                    @click.stop="submitCreateTag"
-                  >
-                    <t-icon name="check" size="16px" />
-                  </t-button>
-                <t-button
-                  variant="text"
-                  theme="default"
-                  size="small"
-                  class="tag-action-btn cancel"
-                  @click.stop="cancelCreateTag"
-                >
-                    <t-icon name="close" size="16px" />
-                  </t-button>
-                </div>
-              </div>
-
-              <template v-if="filteredTags.length">
-                <div
-                  v-for="tag in filteredTags"
-                  :key="tag.id"
-                  class="faq-tag-item"
-                  :class="{ active: selectedTagId === tag.seq_id, editing: editingTagId === tag.id }"
-                  @click="handleTagRowClick(tag.seq_id)"
-                >
-              <div class="faq-tag-left">
-                <span class="tag-hash-icon">#</span>
-                <template v-if="editingTagId === tag.id">
-                      <div class="tag-edit-input" @click.stop>
-                        <t-input
-                          :ref="setEditingTagInputRefByTag(tag.id)"
-                          v-model="editingTagName"
-                          size="small"
-                          :maxlength="40"
-                          @keydown.enter.stop.prevent="submitEditTag"
-                          @keydown.esc.stop.prevent="cancelEditTag"
-                        />
-                      </div>
-                    </template>
-                    <template v-else>
-                      <span class="tag-name" :title="tag.name">{{ tag.name }}</span>
-                    </template>
-                  </div>
-                  <div class="faq-tag-right">
-                    <span class="faq-tag-count">{{ tag.chunk_count || 0 }}</span>
-                    <template v-if="editingTagId === tag.id">
-                      <div class="tag-inline-actions" @click.stop>
-                        <t-button
-                          variant="text"
-                          theme="default"
-                          size="small"
-                          class="tag-action-btn confirm"
-                          :loading="editingTagSubmitting"
-                          @click.stop="submitEditTag"
-                        >
-                          <t-icon name="check" size="16px" />
-                        </t-button>
-                        <t-button
-                          variant="text"
-                          theme="default"
-                          size="small"
-                          class="tag-action-btn cancel"
-                          @click.stop="cancelEditTag"
-                        >
-                          <t-icon name="close" size="16px" />
-                        </t-button>
-                      </div>
-                    </template>
-                    <template v-else>
-                      <div v-if="canEdit" class="tag-more" @click.stop>
-                        <t-popup trigger="click" placement="top-right" overlayClassName="tag-more-popup">
-                          <div class="tag-more-btn">
-                            <t-icon name="more" size="14px" />
-                          </div>
-                          <template #content>
-                            <div class="tag-menu">
-                              <div class="tag-menu-item" @click="startEditTag(tag)">
-                                <t-icon class="menu-icon" name="edit" />
-                                <span>{{ $t('knowledgeBase.tagEditAction') }}</span>
-                              </div>
-                              <div class="tag-menu-item danger" @click="confirmDeleteTag(tag)">
-                                <t-icon class="menu-icon" name="delete" />
-                                <span>{{ $t('knowledgeBase.tagDeleteAction') }}</span>
-                              </div>
-                            </div>
-                          </template>
-                        </t-popup>
-                      </div>
-                    </template>
-                  </div>
-                </div>
-              </template>
-              <div v-else class="tag-empty-state">
-                {{ $t('knowledgeBase.tagEmptyResult') }}
-              </div>
-              <div v-if="tagLoadingMore" class="tag-loading-more">
-                <t-loading size="small" />
-              </div>
-            </template>
-          </div>
-        </aside>
-
         <div class="faq-card-area">
-          <!-- 搜索栏与管理 FAQ -->
-          <div class="faq-search-bar">
-            <t-input
-              v-model.trim="entrySearchKeyword"
-              :placeholder="$t('knowledgeEditor.faq.searchPlaceholder')"
-              clearable
-              class="faq-search-input"
-              @clear="loadEntries()"
-              @keydown.enter="loadEntries()"
-            >
+          <!-- 搜索栏与标签筛选 -->
+          <div class="faq-filter-bar">
+            <t-input v-model.trim="entrySearchKeyword" :placeholder="$t('knowledgeEditor.faq.searchPlaceholder')"
+              clearable class="faq-search-input" @clear="loadEntries()" @enter="loadEntries()">
               <template #prefix-icon>
                 <t-icon name="search" size="16px" />
               </template>
             </t-input>
-            <div class="faq-search-actions">
+            <div class="faq-filter-bar__filters">
+              <t-popup v-model:visible="tagFilterPanelVisible" trigger="click" placement="bottom-left"
+                overlay-class-name="tag-filter-popup" :overlay-inner-style="{ padding: 0 }">
+                <template #content>
+                  <div class="tag-filter-panel" @click.stop>
+                    <div class="tag-filter-panel__header">
+                      <div class="tag-filter-panel__title">
+                        <span>{{ $t('knowledgeBase.tagFilterTitle') }}</span>
+                        <span class="tag-filter-panel__count">({{ sidebarCategoryCount }})</span>
+                      </div>
+                    </div>
+                    <div class="tag-search-bar">
+                      <t-input v-model.trim="tagSearchQuery" size="small"
+                        :placeholder="$t('knowledgeBase.tagSearchPlaceholder')" clearable>
+                        <template #prefix-icon>
+                          <t-icon name="search" size="14px" />
+                        </template>
+                      </t-input>
+                    </div>
+                    <div class="tag-filter-panel__body">
+                      <template v-if="tagLoading && !sidebarTags.length">
+                        <div class="tag-filter-chips">
+                          <div v-for="n in 8" :key="'skel-tag-' + n" class="tag-filter-chip-skeleton">
+                            <t-skeleton animation="gradient"
+                              :row-col="[{ width: '56px', height: '24px', type: 'rect' }]" />
+                          </div>
+                        </div>
+                      </template>
+                      <template v-else>
+                        <div class="tag-filter-chips">
+                          <button
+                            v-for="tag in sidebarTags"
+                            :key="tag.id"
+                            type="button"
+                            class="tag-filter-chip"
+                            :class="{ active: isTagFilterActive(tag.id) }"
+                            :title="`${tag.name} (${tag.chunk_count || 0})`"
+                            @click="handleTagRowClick(tag.id)"
+                          >
+                            <span class="tag-filter-chip__label">{{ tag.name }}</span>
+                            <span class="tag-filter-chip__count">{{ tag.chunk_count || 0 }}</span>
+                          </button>
+                        </div>
+                        <div v-if="!sidebarTags.length" class="tag-empty-state">
+                          {{ $t('knowledgeBase.tagEmptyResult') }}
+                        </div>
+                        <div v-if="tagHasMore" class="tag-load-more">
+                          <t-button variant="text" size="small" :loading="tagLoadingMore" @click.stop="loadTags()">
+                            {{ $t('tenant.loadMore') }}
+                          </t-button>
+                        </div>
+                      </template>
+                    </div>
+                    <div v-if="canEdit" class="tag-filter-panel__footer">
+                      <t-button variant="text" size="small" class="tag-manage-link" @click="openTagManageDrawer">
+                        {{ $t('knowledgeBase.tagManageLink') }}
+                      </t-button>
+                    </div>
+                  </div>
+                </template>
+                <div class="doc-filter-field">
+                  <button type="button" class="doc-tag-filter-trigger doc-filter-field__control"
+                    :class="{ open: tagFilterPanelVisible, 'is-placeholder': isTagFilterPlaceholder }"
+                    :aria-label="$t('knowledgeBase.tagFilterTitle')"
+                    :title="activeTagFilterTitle"
+                    @mouseenter="tagFilterTriggerHover = true"
+                    @mouseleave="tagFilterTriggerHover = false">
+                    <span class="doc-tag-filter-trigger__prefix" aria-hidden="true">
+                      <t-icon name="discount" size="16px" />
+                    </span>
+                    <span class="doc-tag-filter-trigger__label">{{ activeTagFilterLabel }}</span>
+                    <span class="doc-tag-filter-trigger__suffix">
+                      <span
+                        v-if="showTagFilterClear"
+                        class="t-input__suffix t-input__suffix-icon t-input__clear"
+                        :aria-label="$t('common.clear')"
+                        @click.stop="clearTagFilter"
+                        @mousedown.stop
+                      >
+                        <t-icon name="close-circle-filled" class="t-input__suffix-clear" />
+                      </span>
+                      <t-icon
+                        v-else
+                        name="chevron-down"
+                        size="16px"
+                        class="doc-tag-filter-trigger__caret"
+                        :class="{ open: tagFilterPanelVisible }"
+                      />
+                    </span>
+                  </button>
+                </div>
+              </t-popup>
+            </div>
+            <div class="faq-filter-bar__trailing">
               <!-- 新建：新建条目 / 导入 -->
               <template v-if="faqCreateOptions.length">
                 <t-tooltip :content="$t('knowledgeEditor.faq.createGroup')" placement="top">
-                  <t-dropdown
-                    :options="faqCreateOptions"
-                    trigger="click"
-                    placement="bottom-right"
-                    @click="handleFaqAction"
-                  >
+                  <t-dropdown :options="faqCreateOptions" trigger="click" placement="bottom-right"
+                    @click="handleFaqAction">
                     <t-button variant="text" theme="default" class="content-bar-icon-btn" size="small">
                       <template #icon><t-icon name="add" size="16px" /></template>
                     </t-button>
@@ -396,45 +212,49 @@
                 </t-tooltip>
               </template>
               <!-- 导出 -->
-              <t-tooltip :content="$t('knowledgeEditor.faqExport.exportButton')" placement="top">
-                <t-button variant="text" theme="default" class="content-bar-icon-btn" size="small" @click="handleFaqAction({ value: 'export' })">
-                  <template #icon><t-icon name="download" size="16px" /></template>
-                </t-button>
-              </t-tooltip>
+              <t-dropdown :options="faqExportOptions" trigger="click" placement="bottom-right"
+                @click="handleFaqAction">
+                <t-tooltip :content="$t('knowledgeEditor.faqExport.exportButton')" placement="top">
+                  <t-button variant="text" theme="default" class="content-bar-icon-btn" size="small"
+                    :loading="exportLoading">
+                    <template #icon><t-icon name="download" size="16px" /></template>
+                  </t-button>
+                </t-tooltip>
+              </t-dropdown>
               <!-- 检索 -->
               <t-tooltip :content="$t('knowledgeEditor.faq.searchTest')" placement="top">
-                <t-button variant="text" theme="default" class="content-bar-icon-btn" size="small" @click="handleFaqAction({ value: 'search' })">
+                <t-button variant="text" theme="default" class="content-bar-icon-btn" size="small"
+                  @click="handleFaqAction({ value: 'search' })">
                   <template #icon><t-icon name="search" size="16px" /></template>
                 </t-button>
               </t-tooltip>
             </div>
           </div>
           <!-- Card List Container with Scroll -->
-          <div ref="scrollContainer" class="faq-scroll-container" @scroll="handleScroll">
+          <div ref="scrollContainer" class="faq-scroll-container"
+            :class="{ 'has-batch-bar': selectedRowKeys.length > 0 && canSelectEntries }" @scroll="handleScroll">
             <!-- FAQ 骨架屏 -->
             <div v-if="loading && entries.length === 0" class="faq-skeleton-grid">
-              <div v-for="n in 6" :key="'faq-skel-'+n" class="faq-card faq-card-skeleton">
+              <div v-for="n in 6" :key="'faq-skel-' + n" class="faq-card faq-card-skeleton">
                 <div class="faq-card-header">
                   <t-skeleton animation="gradient" :row-col="[{ width: '80%', height: '16px' }]" />
                 </div>
                 <div class="faq-card-body">
-                  <t-skeleton animation="gradient" :row-col="[{ width: '100%', height: '13px' }, { width: '90%', height: '13px' }, { width: '60%', height: '13px' }]" />
+                  <t-skeleton animation="gradient"
+                    :row-col="[{ width: '100%', height: '13px' }, { width: '90%', height: '13px' }, { width: '60%', height: '13px' }]" />
                 </div>
                 <div class="faq-skel-footer">
-                  <t-skeleton animation="gradient" :row-col="[[{ width: '50px', height: '18px', type: 'rect' }, { width: '60px', height: '18px', type: 'rect' }]]" />
+                  <t-skeleton animation="gradient"
+                    :row-col="[[{ width: '50px', height: '18px', type: 'rect' }, { width: '60px', height: '18px', type: 'rect' }]]" />
                 </div>
               </div>
             </div>
             <!-- Card List -->
             <template v-else-if="entries.length > 0">
               <div ref="cardListRef" class="faq-card-list">
-                <div
-                  v-for="entry in entries"
-                  :key="entry.id"
-                  class="faq-card"
-                  :class="{ 'selected': selectedRowKeys.includes(entry.id) }"
-                  @click="handleCardSelect(entry.id, !selectedRowKeys.includes(entry.id))"
-                >
+                <div v-for="entry in entries" :key="entry.id" class="faq-card"
+                  :class="{ 'selected': selectedRowKeys.includes(entry.id), 'is-selectable': canSelectEntries }"
+                  @click="handleCardSelect(entry.id, !selectedRowKeys.includes(entry.id))">
                   <!-- Card Header -->
                   <div class="faq-card-header">
                     <div class="faq-header-top">
@@ -442,15 +262,9 @@
                         {{ entry.standard_question }}
                       </div>
                       <div class="faq-card-actions">
-                        <t-popup
-                          v-if="canManage"
-                          v-model="entry.showMore"
-                          overlayClassName="card-more-popup"
-                          trigger="click"
-                          destroy-on-close
-                          placement="bottom-right"
-                          @visible-change="(visible: boolean) => (entry.showMore = visible)"
-                        >
+                        <t-popup v-if="canManage" v-model="entry.showMore" overlayClassName="card-more-popup"
+                          trigger="click" destroy-on-close placement="bottom-right"
+                          @visible-change="(visible: boolean) => (entry.showMore = visible)">
                           <div class="card-more-btn" @click.stop>
                             <img class="more-icon" src="@/assets/img/more.png" alt="" />
                           </div>
@@ -475,33 +289,20 @@
                   <div class="faq-card-body">
                     <!-- Similar Questions Section -->
                     <div v-if="entry.similar_questions?.length" class="faq-section similar">
-                      <div
-                        class="faq-section-label clickable"
-                        @click.stop="entry.similarCollapsed = !entry.similarCollapsed"
-                      >
+                      <div class="faq-section-label clickable"
+                        @click.stop="entry.similarCollapsed = !entry.similarCollapsed">
                         <span>{{ $t('knowledgeEditor.faq.similarQuestions') }}</span>
                         <span class="section-count">
                           ({{ entry.similar_questions.length }})
                         </span>
-                        <t-icon
-                          :name="entry.similarCollapsed ? 'chevron-right' : 'chevron-down'"
-                          class="collapse-icon"
-                        />
+                        <t-icon :name="entry.similarCollapsed ? 'chevron-right' : 'chevron-down'"
+                          class="collapse-icon" />
                       </div>
                       <Transition name="slide-down">
                         <div v-if="!entry.similarCollapsed" class="faq-tags">
-                          <FAQTagTooltip
-                            v-for="question in entry.similar_questions"
-                            :key="question"
-                            :content="question"
-                            type="similar"
-                            placement="top"
-                          >
-                            <t-tag
-                              size="small"
-                              variant="light-outline"
-                              class="question-tag"
-                            >
+                          <FAQTagTooltip v-for="question in entry.similar_questions" :key="question" :content="question"
+                            type="similar" placement="top">
+                            <t-tag size="small" variant="light-outline" class="question-tag">
                               {{ question }}
                             </t-tag>
                           </FAQTagTooltip>
@@ -511,34 +312,20 @@
 
                     <!-- Negative Questions Section -->
                     <div v-if="entry.negative_questions?.length" class="faq-section negative">
-                      <div
-                        class="faq-section-label clickable"
-                        @click.stop="entry.negativeCollapsed = !entry.negativeCollapsed"
-                      >
+                      <div class="faq-section-label clickable"
+                        @click.stop="entry.negativeCollapsed = !entry.negativeCollapsed">
                         <span>{{ $t('knowledgeEditor.faq.negativeQuestions') }}</span>
                         <span class="section-count">
                           ({{ entry.negative_questions.length }})
                         </span>
-                        <t-icon
-                          :name="entry.negativeCollapsed ? 'chevron-right' : 'chevron-down'"
-                          class="collapse-icon"
-                        />
+                        <t-icon :name="entry.negativeCollapsed ? 'chevron-right' : 'chevron-down'"
+                          class="collapse-icon" />
                       </div>
                       <Transition name="slide-down">
                         <div v-if="!entry.negativeCollapsed" class="faq-tags">
-                          <FAQTagTooltip
-                            v-for="question in entry.negative_questions"
-                            :key="question"
-                            :content="question"
-                            type="negative"
-                            placement="top"
-                          >
-                            <t-tag
-                              size="small"
-                              theme="warning"
-                              variant="light-outline"
-                              class="question-tag"
-                            >
+                          <FAQTagTooltip v-for="question in entry.negative_questions" :key="question"
+                            :content="question" type="negative" placement="top">
+                            <t-tag size="small" theme="warning" variant="light-outline" class="question-tag">
                               {{ question }}
                             </t-tag>
                           </FAQTagTooltip>
@@ -548,34 +335,20 @@
 
                     <!-- Answers Section -->
                     <div class="faq-section answers">
-                      <div
-                        class="faq-section-label clickable"
-                        @click.stop="entry.answersCollapsed = !entry.answersCollapsed"
-                      >
+                      <div class="faq-section-label clickable"
+                        @click.stop="entry.answersCollapsed = !entry.answersCollapsed">
                         <span>{{ $t('knowledgeEditor.faq.answers') }}</span>
                         <span v-if="entry.answers?.length" class="section-count">
                           ({{ entry.answers.length }})
                         </span>
-                        <t-icon
-                          :name="entry.answersCollapsed ? 'chevron-right' : 'chevron-down'"
-                          class="collapse-icon"
-                        />
+                        <t-icon :name="entry.answersCollapsed ? 'chevron-right' : 'chevron-down'"
+                          class="collapse-icon" />
                       </div>
                       <Transition name="slide-down">
                         <div v-if="!entry.answersCollapsed" class="faq-tags">
-                          <FAQTagTooltip
-                            v-for="answer in entry.answers"
-                            :key="answer"
-                            :content="answer"
-                            type="answer"
-                            placement="top"
-                          >
-                            <t-tag
-                              size="small"
-                              theme="success"
-                              variant="light-outline"
-                              class="question-tag"
-                            >
+                          <FAQTagTooltip v-for="answer in entry.answers" :key="answer" :content="answer" type="answer"
+                            placement="top">
+                            <t-tag size="small" theme="success" variant="light-outline" class="question-tag">
                               {{ answer }}
                             </t-tag>
                           </FAQTagTooltip>
@@ -588,11 +361,8 @@
                   <div class="faq-card-footer">
                     <div class="faq-card-tag" @click.stop>
                       <template v-if="canEdit && tagList.length">
-                        <t-dropdown
-                          :options="tagDropdownOptions"
-                          trigger="click"
-                          @click="(data: any) => handleEntryTagChange(entry.id, data.value as string)"
-                        >
+                        <t-dropdown :options="tagDropdownOptions" trigger="click"
+                          @click="(data: any) => handleEntryTagChange(entry.id, data.value as string)">
                           <t-tag size="small" variant="light-outline" class="faq-tag-chip">
                             <span class="tag-text">{{ getTagName(entry.tag_id) || $t('knowledgeBase.untagged') }}</span>
                           </t-tag>
@@ -624,21 +394,16 @@
                         </div>
                       </t-tooltip>
                       -->
-                                            <t-tooltip
-                                              :content="entry.is_enabled ? $t('knowledgeEditor.faq.statusEnabled') : $t('knowledgeEditor.faq.statusDisabled')"
-                                              placement="top"
-                                            >
-                                              <div class="status-item-compact">
-                                                <t-switch
-                                                  :key="`${entry.id}-${entry.is_enabled}`"
-                                                  size="small"
-                                                  :value="entry.is_enabled"
-                                                  :loading="!!entryStatusLoading[entry.id]"
-                                                  :disabled="!!entryStatusLoading[entry.id] || !canEdit"
-                                                  @click.stop @change="(value: boolean) => handleEntryStatusChange(entry, value)"
-                                                />
-                                              </div>
-                                            </t-tooltip>
+                      <t-tooltip
+                        :content="entry.is_enabled ? $t('knowledgeEditor.faq.statusEnabled') : $t('knowledgeEditor.faq.statusDisabled')"
+                        placement="top">
+                        <div class="status-item-compact">
+                          <t-switch :key="`${entry.id}-${entry.is_enabled}`" size="small" :value="entry.is_enabled"
+                            :loading="!!entryStatusLoading[entry.id]"
+                            :disabled="!!entryStatusLoading[entry.id] || !canEdit" @click.stop
+                            @change="(value: boolean) => handleEntryStatusChange(entry, value)" />
+                        </div>
+                      </t-tooltip>
                     </div>
                   </div>
                 </div>
@@ -653,35 +418,31 @@
                 </div>
               </div>
             </template>
-          <div v-if="loadingMore" class="faq-load-more">
-            <t-loading size="small" :text="$t('common.loading')" />
+            <div v-if="loadingMore" class="faq-load-more">
+              <t-loading size="small" :text="$t('common.loading')" />
+            </div>
+            <div v-if="hasMore === false && entries.length > 0" class="faq-no-more">
+              {{ $t('common.noMoreData') }}
+            </div>
           </div>
-          <div v-if="hasMore === false && entries.length > 0" class="faq-no-more">
-            {{ $t('common.noMoreData') }}
-          </div>
+          <div class="faq-batch-bar-anchor">
+            <FAQBatchBar :count="selectedRowKeys.length" :enabled-count="selectedEnabledCount"
+              :disabled-count="selectedDisabledCount" :can-edit="canEdit" :can-manage="canManage"
+              :tag-loading="batchTagLoading" :status-action="batchStatusAction"
+              :delete-loading="batchDeleteLoading" @cancel="clearFAQSelection" @batch-tag="openBatchTagDialog"
+              @enable="handleBatchStatusChange(true)" @disable="handleBatchStatusChange(false)"
+              @delete="handleBatchDelete" />
           </div>
         </div>
       </div>
     </div>
     <!-- Editor Drawer -->
-    <t-drawer
-      v-model:visible="editorVisible"
+    <t-drawer v-model:visible="editorVisible"
       :header="editorMode === 'create' ? $t('knowledgeEditor.faq.editorCreate') : $t('knowledgeEditor.faq.editorEdit')"
-      :close-btn="true"
-      size="520px"
-      placement="right"
-      class="faq-editor-drawer"
-      @close="handleEditorClose"
-    >
+      :close-btn="true" size="520px" placement="right" class="faq-editor-drawer" @close="handleEditorClose">
       <div class="faq-editor-drawer-content">
-        <t-form
-          ref="editorFormRef"
-          :data="editorForm"
-          :rules="editorRules"
-          layout="vertical"
-          :label-width="0"
-          class="faq-editor-form"
-        >
+        <t-form ref="editorFormRef" :data="editorForm" :rules="editorRules" layout="vertical" :label-width="0"
+          class="faq-editor-form">
           <div class="settings-group">
             <!-- 标准问 -->
             <div class="setting-row vertical setting-row-primary">
@@ -693,11 +454,7 @@
                 <p class="desc">{{ $t('knowledgeEditor.faq.standardQuestionDesc') }}</p>
               </div>
               <div class="setting-control">
-                <t-input 
-                  v-model="editorForm.standard_question" 
-                  :maxlength="200"
-                  class="full-width-input"
-                />
+                <t-input v-model="editorForm.standard_question" :maxlength="200" class="full-width-input" />
               </div>
             </div>
 
@@ -709,37 +466,19 @@
               </div>
               <div class="setting-control">
                 <div class="full-width-input-wrapper">
-                  <t-input
-                    v-model="similarInput"
-                    :placeholder="$t('knowledgeEditor.faq.similarPlaceholder')"
-                    @keydown.enter.prevent="addSimilar"
-                    class="full-width-input"
-                  />
-                  <t-button
-                    theme="primary"
-                    variant="outline"
-                    :disabled="!similarInput.trim() || editorForm.similar_questions.length >= 10"
-                    @click="addSimilar"
-                    class="add-item-btn"
-                    size="small"
-                  >
+                  <t-input v-model="similarInput" :placeholder="$t('knowledgeEditor.faq.similarPlaceholder')"
+                    @enter="addSimilar" class="full-width-input" />
+                  <t-button theme="primary" variant="outline"
+                    :disabled="!similarInput.trim() || editorForm.similar_questions.length >= 10" @click="addSimilar"
+                    class="add-item-btn" size="small">
                     <t-icon name="add" size="16px" />
                   </t-button>
                 </div>
                 <div v-if="editorForm.similar_questions.length > 0" class="item-list">
-                  <div
-                    v-for="(question, index) in editorForm.similar_questions"
-                    :key="index"
-                    class="item-row"
-                  >
+                  <div v-for="(question, index) in editorForm.similar_questions" :key="index" class="item-row">
                     <div class="item-content">{{ question }}</div>
-                    <t-button
-                      theme="default"
-                      variant="text"
-                      size="small"
-                      @click="removeSimilar(index)"
-                      class="remove-item-btn"
-                    >
+                    <t-button theme="default" variant="text" size="small" @click="removeSimilar(index)"
+                      class="remove-item-btn">
                       <t-icon name="close" size="16px" />
                     </t-button>
                   </div>
@@ -755,37 +494,20 @@
               </div>
               <div class="setting-control">
                 <div class="full-width-input-wrapper">
-                  <t-input
-                    v-model="negativeInput"
-                    :placeholder="$t('knowledgeEditor.faq.negativePlaceholder')"
-                    @keydown.enter.prevent="addNegative"
-                    class="full-width-input"
-                  />
-                  <t-button
-                    theme="primary"
-                    variant="outline"
-                    :disabled="!negativeInput.trim() || editorForm.negative_questions.length >= 10"
-                    @click="addNegative"
-                    class="add-item-btn"
-                    size="small"
-                  >
+                  <t-input v-model="negativeInput" :placeholder="$t('knowledgeEditor.faq.negativePlaceholder')"
+                    @enter="addNegative" class="full-width-input" />
+                  <t-button theme="primary" variant="outline"
+                    :disabled="!negativeInput.trim() || editorForm.negative_questions.length >= 10" @click="addNegative"
+                    class="add-item-btn" size="small">
                     <t-icon name="add" size="16px" />
                   </t-button>
                 </div>
                 <div v-if="editorForm.negative_questions.length > 0" class="item-list">
-                  <div
-                    v-for="(question, index) in editorForm.negative_questions"
-                    :key="index"
-                    class="item-row negative"
-                  >
+                  <div v-for="(question, index) in editorForm.negative_questions" :key="index"
+                    class="item-row negative">
                     <div class="item-content">{{ question }}</div>
-                    <t-button
-                      theme="default"
-                      variant="text"
-                      size="small"
-                      @click="removeNegative(index)"
-                      class="remove-item-btn"
-                    >
+                    <t-button theme="default" variant="text" size="small" @click="removeNegative(index)"
+                      class="remove-item-btn">
                       <t-icon name="close" size="16px" />
                     </t-button>
                   </div>
@@ -805,41 +527,22 @@
               <div class="setting-control">
                 <div class="textarea-container">
                   <div class="full-width-input-wrapper textarea-wrapper">
-                    <t-textarea
-                      v-model="answerInput"
-                      :placeholder="$t('knowledgeEditor.faq.answerPlaceholder')"
-                      :autosize="{ minRows: 3, maxRows: 6 }"
-                      class="full-width-textarea"
-                      @keydown.ctrl.enter="addAnswer"
-                      @keydown.meta.enter="addAnswer"
-                    />
-                    <t-button
-                      theme="primary"
-                      variant="outline"
-                      :disabled="!answerInput.trim() || editorForm.answers.length >= 5"
-                      @click="addAnswer"
-                      class="add-item-btn"
-                      size="small"
-                    >
+                    <t-textarea v-model="answerInput" :placeholder="$t('knowledgeEditor.faq.answerPlaceholder')"
+                      :autosize="{ minRows: 3, maxRows: 6 }" class="full-width-textarea" @keydown.ctrl.enter="addAnswer"
+                      @keydown.meta.enter="addAnswer" />
+                    <t-button theme="primary" variant="outline"
+                      :disabled="!answerInput.trim() || editorForm.answers.length >= 5" @click="addAnswer"
+                      class="add-item-btn" size="small">
                       <t-icon name="add" size="16px" />
                     </t-button>
                   </div>
                   <div class="item-count">{{ editorForm.answers.length }}/5</div>
                 </div>
                 <div v-if="editorForm.answers.length > 0" class="item-list">
-                  <div
-                    v-for="(answer, index) in editorForm.answers"
-                    :key="index"
-                    class="item-row answer-row"
-                  >
+                  <div v-for="(answer, index) in editorForm.answers" :key="index" class="item-row answer-row">
                     <div class="item-content">{{ answer }}</div>
-                    <t-button
-                      theme="default"
-                      variant="text"
-                      size="small"
-                      @click="removeAnswer(index)"
-                      class="remove-item-btn"
-                    >
+                    <t-button theme="default" variant="text" size="small" @click="removeAnswer(index)"
+                      class="remove-item-btn">
                       <t-icon name="close" size="16px" />
                     </t-button>
                   </div>
@@ -849,17 +552,12 @@
 
             <div class="setting-row vertical">
               <div class="setting-info">
-                <label>{{ $t('knowledgeBase.category') }}</label>
+                <label>{{ $t('knowledgeBase.tagLabel') }}</label>
                 <p class="desc">{{ $t('knowledgeEditor.faq.tagDesc') }}</p>
               </div>
               <div class="setting-control">
-                <t-select
-                  v-model="editorForm.tag_id"
-                  class="full-width-input"
-                  :options="tagSelectOptions"
-                  clearable
-                  :placeholder="$t('knowledgeEditor.faq.tagPlaceholder')"
-                />
+                <t-select v-model="editorForm.tag_id" class="full-width-input" :options="tagSelectOptions" clearable
+                  :placeholder="$t('knowledgeEditor.faq.tagPlaceholder')" />
               </div>
             </div>
           </div>
@@ -886,7 +584,7 @@
             <!-- 关闭按钮 -->
             <button class="close-btn" @click="importVisible = false" :aria-label="$t('general.close')">
               <svg width="20" height="20" viewBox="0 0 20 20" fill="currentColor">
-                <path d="M15 5L5 15M5 5L15 15" stroke="currentColor" stroke-width="2" stroke-linecap="round"/>
+                <path d="M15 5L5 15M5 5L15 15" stroke="currentColor" stroke-width="2" stroke-linecap="round" />
               </svg>
             </button>
 
@@ -909,13 +607,8 @@
                 <div class="import-form-item">
                   <div class="file-label-row">
                     <label class="import-form-label required">{{ $t('knowledgeEditor.faqImport.fileLabel') }}</label>
-                    <t-dropdown
-                      :options="downloadExampleOptions"
-                      placement="bottom-right"
-                      trigger="click"
-                      @click="handleDownloadExample"
-                      class="download-example-dropdown"
-                    >
+                    <t-dropdown :options="downloadExampleOptions" placement="bottom-right" trigger="click"
+                      @click="handleDownloadExample" class="download-example-dropdown">
                       <t-button theme="default" variant="outline" size="small" class="download-example-btn">
                         <t-icon name="download" size="16px" />
                         <span>{{ $t('knowledgeEditor.faqImport.downloadExample') }}</span>
@@ -923,21 +616,11 @@
                     </t-dropdown>
                   </div>
                   <div class="file-upload-wrapper">
-                    <input
-                      ref="fileInputRef"
-                      type="file"
-                      accept=".json,.csv,.xlsx,.xls"
-                      @change="handleFileChange"
-                      class="file-input-hidden"
-                    />
-                    <div
-                      class="file-upload-area"
-                      :class="{ 'has-file': importState.file }"
-                      @click="fileInputRef?.click()"
-                      @dragover.prevent
-                      @dragenter.prevent
-                      @drop.prevent="handleFileDrop"
-                    >
+                    <input ref="fileInputRef" type="file" accept=".json,.csv,.xlsx,.xls" @change="handleFileChange"
+                      class="file-input-hidden" />
+                    <div class="file-upload-area" :class="{ 'has-file': importState.file }"
+                      @click="fileInputRef?.click()" @dragover.prevent @dragenter.prevent
+                      @drop.prevent="handleFileDrop">
                       <div class="file-upload-content">
                         <t-icon name="upload" size="32px" class="upload-icon" />
                         <div class="upload-text">
@@ -966,11 +649,7 @@
                     </span>
                   </div>
                   <div class="preview-list">
-                    <div
-                      v-for="(item, index) in importState.preview.slice(0, 5)"
-                      :key="index"
-                      class="preview-item"
-                    >
+                    <div v-for="(item, index) in importState.preview.slice(0, 5)" :key="index" class="preview-item">
                       <span class="preview-index">{{ index + 1 }}</span>
                       <span class="preview-question">{{ item.standard_question }}</span>
                     </div>
@@ -983,23 +662,15 @@
               </div>
 
               <div class="faq-import-footer">
-                <t-button 
-                  theme="default" 
-                  variant="outline" 
-                  @click="handleCancelImport"
-                  :disabled="importState.importing && importState.taskStatus?.status === 'running'"
-                >
+                <t-button theme="default" variant="outline" @click="handleCancelImport"
+                  :disabled="importState.importing && importState.taskStatus?.status === 'running'">
                   {{ $t('common.cancel') }}
                 </t-button>
-                <t-button 
-                  theme="primary" 
-                  @click="handleImport" 
-                  :loading="importState.importing && !importState.taskId"
-                  :disabled="importState.taskStatus?.status === 'running'"
-                >
+                <t-button theme="primary" @click="handleImport" :loading="importState.importing && !importState.taskId"
+                  :disabled="importState.taskStatus?.status === 'running'">
                   {{ importState.taskStatus?.status === 'success' ? $t('common.close') :
-                     importState.taskStatus?.status === 'failed' ? $t('common.retry') :
-                     $t('knowledgeEditor.faqImport.importButton') }}
+                    importState.taskStatus?.status === 'failed' ? $t('common.retry') :
+                      $t('knowledgeEditor.faqImport.importButton') }}
                 </t-button>
               </div>
             </div>
@@ -1014,9 +685,10 @@
         <div v-if="batchTagDialogVisible" class="batch-tag-overlay" @click.self="batchTagDialogVisible = false">
           <div class="batch-tag-modal">
             <!-- 关闭按钮 -->
-            <button class="batch-tag-close-btn" @click="batchTagDialogVisible = false" :aria-label="$t('general.close')">
+            <button class="batch-tag-close-btn" @click="batchTagDialogVisible = false"
+              :aria-label="$t('general.close')">
               <svg width="20" height="20" viewBox="0 0 20 20" fill="currentColor">
-                <path d="M15 5L5 15M5 5L15 15" stroke="currentColor" stroke-width="2" stroke-linecap="round"/>
+                <path d="M15 5L5 15M5 5L15 15" stroke="currentColor" stroke-width="2" stroke-linecap="round" />
               </svg>
             </button>
 
@@ -1032,14 +704,8 @@
                 </div>
                 <t-form layout="vertical" class="batch-tag-form">
                   <t-form-item :label="$t('knowledgeBase.tagLabel')">
-                    <t-select
-                      v-model="batchTagValue"
-                      :options="tagSelectOptions"
-                      :placeholder="$t('knowledgeBase.tagPlaceholder')"
-                      clearable
-                      filterable
-                      class="batch-tag-select"
-                    >
+                    <t-select v-model="batchTagValue" :options="tagSelectOptions"
+                      :placeholder="$t('knowledgeBase.tagPlaceholder')" clearable filterable class="batch-tag-select">
                       <template #empty>
                         <div class="tag-select-empty">
                           {{ $t('knowledgeBase.noTags') }}
@@ -1051,17 +717,11 @@
               </div>
 
               <div class="batch-tag-footer">
-                <t-button 
-                  theme="default" 
-                  variant="outline" 
-                  @click="batchTagDialogVisible = false"
-                >
+                <t-button theme="default" variant="outline" @click="batchTagDialogVisible = false">
                   {{ $t('common.cancel') }}
                 </t-button>
-                <t-button 
-                  theme="primary" 
-                  @click="handleBatchTag"
-                >
+                <t-button theme="primary" :loading="batchTagLoading" :disabled="batchActionLoading"
+                  @click="handleBatchTag">
                   {{ $t('common.confirm') }}
                 </t-button>
               </div>
@@ -1072,14 +732,8 @@
     </Teleport>
 
     <!-- Search Test Drawer -->
-    <t-drawer
-      v-model:visible="searchDrawerVisible"
-      :header="$t('knowledgeEditor.faq.searchTestTitle')"
-      :close-btn="true"
-      size="420px"
-      placement="right"
-      class="faq-search-drawer"
-    >
+    <t-drawer v-model:visible="searchDrawerVisible" :header="$t('knowledgeEditor.faq.searchTestTitle')"
+      :close-btn="true" size="420px" placement="right" class="faq-search-drawer">
       <div class="search-test-content">
         <t-form layout="vertical" class="search-form" :label-width="0">
           <div class="settings-group">
@@ -1090,12 +744,8 @@
                 <p class="desc">{{ $t('knowledgeEditor.faq.queryPlaceholder') }}</p>
               </div>
               <div class="setting-control">
-                <t-input
-                  v-model="searchForm.query"
-                  :placeholder="$t('knowledgeEditor.faq.queryPlaceholder')"
-                  @keydown.enter.prevent="handleSearch"
-                  class="full-width-input"
-                />
+                <t-input v-model="searchForm.query" :placeholder="$t('knowledgeEditor.faq.queryPlaceholder')"
+                  @enter="handleSearch" class="full-width-input" />
               </div>
             </div>
 
@@ -1107,14 +757,8 @@
               </div>
               <div class="setting-control">
                 <div class="slider-wrapper">
-                  <t-slider
-                    v-model="searchForm.vectorThreshold"
-                    :min="0"
-                    :max="1"
-                    :step="0.1"
-                    :show-tooltip="true"
-                    :format-tooltip="(val: number) => val.toFixed(2)"
-                  />
+                  <t-slider v-model="searchForm.vectorThreshold" :min="0" :max="1" :step="0.1" :show-tooltip="true"
+                    :format-tooltip="(val: number) => val.toFixed(2)" />
                   <div class="slider-value">{{ searchForm.vectorThreshold.toFixed(2) }}</div>
                 </div>
               </div>
@@ -1128,13 +772,7 @@
               </div>
               <div class="setting-control">
                 <div class="slider-wrapper">
-                  <t-slider
-                    v-model="searchForm.matchCount"
-                    :min="1"
-                    :max="50"
-                    :step="1"
-                    :show-tooltip="true"
-                  />
+                  <t-slider v-model="searchForm.matchCount" :min="1" :max="50" :step="1" :show-tooltip="true" />
                   <div class="slider-value">{{ searchForm.matchCount }}</div>
                 </div>
               </div>
@@ -1143,13 +781,7 @@
             <!-- 搜索按钮 -->
             <div class="setting-row vertical">
               <div class="setting-control">
-                <t-button
-                  theme="primary"
-                  block
-                  :loading="searching"
-                  @click="handleSearch"
-                  class="search-button"
-                >
+                <t-button theme="primary" block :loading="searching" @click="handleSearch" class="search-button">
                   {{ searching ? $t('knowledgeEditor.faq.searching') : $t('knowledgeEditor.faq.searchButton') }}
                 </t-button>
               </div>
@@ -1166,12 +798,8 @@
             {{ $t('knowledgeEditor.faq.noResults') }}
           </div>
           <div v-else class="results-list">
-            <div
-              v-for="(result, index) in searchResults"
-              :key="result.id"
-              class="result-card"
-              :class="{ 'expanded': result.expanded }"
-            >
+            <div v-for="(result, index) in searchResults" :key="result.id" class="result-card"
+              :class="{ 'expanded': result.expanded }">
               <div class="result-header" @click="toggleResult(result)">
                 <div class="result-question-wrapper">
                   <div class="result-main">
@@ -1179,7 +807,8 @@
                       <span class="result-index">{{ index + 1 }}.</span>
                       {{ result.standard_question }}
                     </div>
-                    <div v-if="result.matched_question && result.matched_question !== result.standard_question" class="matched-question">
+                    <div v-if="result.matched_question && result.matched_question !== result.standard_question"
+                      class="matched-question">
                       <span class="matched-label">{{ $t('knowledgeEditor.faq.matchedQuestion') }}:</span>
                       <span class="matched-text">{{ result.matched_question }}</span>
                     </div>
@@ -1189,10 +818,7 @@
                       {{ (result.score || 0).toFixed(3) }}
                     </t-tag>
                   </div>
-                  <t-icon 
-                    :name="result.expanded ? 'chevron-up' : 'chevron-down'" 
-                    class="expand-icon"
-                  />
+                  <t-icon :name="result.expanded ? 'chevron-up' : 'chevron-down'" class="expand-icon" />
                 </div>
               </div>
               <Transition name="slide-down">
@@ -1200,12 +826,7 @@
                   <div v-if="result.answers?.length" class="result-section">
                     <div class="section-label">{{ $t('knowledgeEditor.faq.answers') }}</div>
                     <div class="result-tags">
-                      <t-tooltip
-                        v-for="answer in result.answers"
-                        :key="answer"
-                        :content="answer"
-                        placement="top"
-                      >
+                      <t-tooltip v-for="answer in result.answers" :key="answer" :content="answer" placement="top">
                         <t-tag size="small" theme="success" variant="light" class="answer-tag">
                           {{ answer }}
                         </t-tag>
@@ -1215,12 +836,8 @@
                   <div v-if="result.similar_questions?.length" class="result-section">
                     <div class="section-label">{{ $t('knowledgeEditor.faq.similarQuestions') }}</div>
                     <div class="result-tags">
-                      <t-tooltip
-                        v-for="question in result.similar_questions"
-                        :key="question"
-                        :content="question"
-                        placement="top"
-                      >
+                      <t-tooltip v-for="question in result.similar_questions" :key="question" :content="question"
+                        placement="top">
                         <t-tag size="small" variant="light-outline" class="question-tag">
                           {{ question }}
                         </t-tag>
@@ -1234,12 +851,18 @@
         </div>
       </div>
     </t-drawer>
+
+    <KbTagManageDrawer
+      v-model:visible="tagManageDrawerVisible"
+      :kb-id="props.kbId"
+      :is-faq="true"
+      @changed="onTagManageChanged"
+    />
   </div>
 </template>
 
 <script setup lang="ts">
 import { ref, reactive, watch, onMounted, computed, nextTick, onUnmounted, h } from 'vue'
-import type { ComponentPublicInstance } from 'vue'
 import { MessagePlugin, DialogPlugin, Icon as TIcon } from 'tdesign-vue-next'
 import type { FormRules, FormInstanceFunctions } from 'tdesign-vue-next'
 import { useI18n } from 'vue-i18n'
@@ -1257,9 +880,6 @@ import {
   exportFAQEntries,
   listKnowledgeTags,
   updateFAQEntryTagBatch,
-  createKnowledgeBaseTag,
-  updateKnowledgeBaseTag,
-  deleteKnowledgeBaseTag,
   getKnowledgeBaseById,
   listKnowledgeBases,
   getFAQImportProgress,
@@ -1268,6 +888,10 @@ import {
 import * as XLSX from 'xlsx'
 import Papa from 'papaparse'
 import FAQTagTooltip from '@/components/FAQTagTooltip.vue'
+import KBInfoPopover from '@/components/KBInfoPopover.vue'
+import KBSwitcherDropdown from '@/components/KBSwitcherDropdown.vue'
+import FAQBatchBar from './FAQBatchBar.vue'
+import KbTagManageDrawer from './KbTagManageDrawer.vue'
 import { useUIStore } from '@/stores/ui'
 
 interface FAQEntry {
@@ -1314,22 +938,21 @@ const uiStore = useUIStore()
 const authStore = useAuthStore()
 const orgStore = useOrganizationStore()
 
-// Permission control: check if current user owns this KB or has edit/manage permission
+// Permission control: check if current user owns this KB or has edit/manage permission.
+//
+// isOwner used to compare kbInfo.tenant_id against the user's effective tenant id,
+// which silently treated "any KB visible to me in my current tenant" as "I created
+// it" — Viewer / Contributor in their home tenant ended up showing every FAQ
+// CRUD entry on every KB and 403'ing when they clicked. Mirror the rule we settled
+// on in KnowledgeBase.vue: explicit creator_id match, with role / org-share fallbacks
+// inside canEdit / canManage. Legacy KBs with empty creator_id stay tenant-owned
+// (Admin+ may manage).
 const isOwner = computed(() => {
   if (!kbInfo.value) return false
-  // Check if the current user's tenant ID matches the KB's tenant ID
-  const userTenantId = authStore.effectiveTenantId
-  return kbInfo.value.tenant_id === userTenantId
-})
-
-// Can edit: owner, admin, or editor
-const canEdit = computed(() => {
-  return orgStore.canEditKB(props.kbId, isOwner.value)
-})
-
-// Can manage (delete, settings, etc.): owner or admin
-const canManage = computed(() => {
-  return orgStore.canManageKB(props.kbId, isOwner.value)
+  const creatorId = (kbInfo.value as any).creator_id || ''
+  const userId = authStore.user?.id || ''
+  if (!creatorId) return false
+  return creatorId === userId
 })
 
 // Current KB's shared record (when accessed via organization share)
@@ -1337,33 +960,42 @@ const currentSharedKb = computed(() =>
   orgStore.sharedKnowledgeBases.find((s) => s.knowledge_base?.id === props.kbId) ?? null,
 )
 
-// Effective permission: from direct org share list or from GET /knowledge-bases/:id (e.g. agent-visible KB)
-const effectiveKBPermission = computed(() => orgStore.getKBPermission(props.kbId) || kbInfo.value?.my_permission || '')
+// Accessed via organization share: presence in the sharedKnowledgeBases list
+// means we reached this KB through a shared space, so the user's local tenant
+// role is irrelevant — only the share grant counts. tenant_id comparison
+// alone is unreliable (a user can be a member of both source and receiving
+// tenants); share-list presence is the authoritative signal.
+const isViaShare = computed(() => !!currentSharedKb.value)
 
-// Display role label: owner or org role (admin/editor/viewer)
-const accessRoleLabel = computed(() => {
-  if (isOwner.value) return t('knowledgeBase.accessInfo.roleOwner')
-  const perm = effectiveKBPermission.value
-  if (perm) return t(`organization.role.${perm}`)
-  return '--'
+// Can edit: when accessed via an organization share, ONLY the share grant
+// counts — even if the current user happens to be the original creator of
+// the KB. The backend's RBAC middleware authorizes based on the active
+// tenant, not on creator_id, so a creator viewing their own KB from a
+// different tenant context will be 403'd on write. Otherwise: KB creator
+// (any role) or tenant Admin+ in the home tenant.
+const canEdit = computed(() => {
+  if (isViaShare.value) return orgStore.canEditKB(props.kbId, false)
+  if (isOwner.value) return true
+  if (authStore.hasRole('admin')) return true
+  return orgStore.canEditKB(props.kbId, false)
 })
 
-// Permission summary text for current role
-const accessPermissionSummary = computed(() => {
-  if (isOwner.value) return t('knowledgeBase.accessInfo.permissionOwner')
-  const perm = effectiveKBPermission.value
-  if (perm === 'admin') return t('knowledgeBase.accessInfo.permissionAdmin')
-  if (perm === 'editor') return t('knowledgeBase.accessInfo.permissionEditor')
-  if (perm === 'viewer') return t('knowledgeBase.accessInfo.permissionViewer')
-  return '--'
+// Can manage (delete, settings, share): same isViaShare-first rule. For
+// shared KBs only an 'admin' share grant qualifies — editor/viewer (and
+// even being the creator viewed via share) never grant delete/settings.
+const canManage = computed(() => {
+  if (isViaShare.value) return orgStore.canManageKB(props.kbId, false)
+  if (isOwner.value) return true
+  if (authStore.hasRole('admin')) return true
+  return orgStore.canManageKB(props.kbId, false)
 })
 
-// Last updated time from kbInfo
-const kbLastUpdated = computed(() => {
-  const raw = kbInfo.value?.updated_at
-  if (!raw) return null
-  return formatImportTime(raw)
-})
+const canSelectEntries = computed(() => canEdit.value || canManage.value)
+
+const faqExportOptions = computed(() => [
+  { content: t('knowledgeEditor.faqExport.exportCSV'), value: 'export_csv' },
+  { content: t('knowledgeEditor.faqExport.exportJSON'), value: 'export_json' },
+])
 
 // FAQ 操作：新建组（新建条目 + 导入）
 const faqCreateOptions = computed(() => {
@@ -1386,6 +1018,12 @@ const handleFaqAction = (data: { value: string }) => {
     case 'search':
       searchDrawerVisible.value = true
       break
+    case 'export_csv':
+      handleExportCSV()
+      break
+    case 'export_json':
+      handleExportJSON()
+      break
     case 'export':
       handleExportCSV()
       break
@@ -1398,20 +1036,37 @@ const entries = ref<FAQEntry[]>([])
 const entryStatusLoading = reactive<Record<number, boolean>>({})
 const entryRecommendedLoading = reactive<Record<number, boolean>>({})
 const selectedRowKeys = ref<number[]>([])
+const batchDeleteLoading = ref(false)
+const batchTagLoading = ref(false)
+const batchStatusAction = ref<'enable' | 'disable' | null>(null)
+const selectedEntries = computed(() => {
+  const selectedIds = new Set(selectedRowKeys.value)
+  return entries.value.filter(entry => selectedIds.has(entry.id))
+})
+const selectedEnabledCount = computed(() => (
+  selectedEntries.value.filter(entry => entry.is_enabled !== false).length
+))
+const selectedDisabledCount = computed(() => selectedEntries.value.length - selectedEnabledCount.value)
+const batchActionLoading = computed(() => (
+  batchDeleteLoading.value
+  || batchTagLoading.value
+  || batchStatusAction.value != null
+))
 const scrollContainer = ref<HTMLElement | null>(null)
 const cardListRef = ref<HTMLElement | null>(null)
 const hasMore = ref(true)
 const pageSize = 20
 let currentPage = 1
 const entrySearchKeyword = ref('')
-let entrySearchDebounce: ReturnType<typeof setTimeout> | null = null
-type TagInputInstance = ComponentPublicInstance<{ focus: () => void; select: () => void }>
+let entrySearchDebounce: number | null = null
 
 const tagList = ref<any[]>([])
 const tagLoading = ref(false)
-const tagListRef = ref<HTMLElement | null>(null)
-// Selected tag seq_id for filtering (0 means show all)
-const selectedTagId = ref<number>(0)
+const selectedTagIds = ref<string[]>([])
+const tagFilterPanelVisible = ref(false)
+const tagFilterTriggerHover = ref(false)
+const tagFilterCleared = ref(false)
+const tagManageDrawerVisible = ref(false)
 const overallFAQTotal = ref(0)
 const tagSearchQuery = ref('')
 const TAG_PAGE_SIZE = 20
@@ -1419,42 +1074,33 @@ const tagPage = ref(1)
 const tagHasMore = ref(false)
 const tagLoadingMore = ref(false)
 const tagTotal = ref(0)
-let tagSearchDebounce: ReturnType<typeof setTimeout> | null = null
-const editingTagInputRefs = new Map<string, TagInputInstance | null>()
-const setEditingTagInputRef = (el: TagInputInstance | null, tagId: string) => {
-  if (el) {
-    editingTagInputRefs.set(tagId, el)
-  } else {
-    editingTagInputRefs.delete(tagId)
-  }
-}
-const setEditingTagInputRefByTag = (tagId: string) => (el: TagInputInstance | null) => {
-  setEditingTagInputRef(el, tagId)
-}
-const newTagInputRef = ref<TagInputInstance | null>(null)
-const creatingTag = ref(false)
-const creatingTagLoading = ref(false)
-const newTagName = ref('')
-const editingTagId = ref<string | null>(null)
-const editingTagName = ref('')
-const editingTagSubmitting = ref(false)
-// tagMap uses seq_id as key for looking up by entry.tag_id
-const tagMap = computed<Record<number, any>>(() => {
-  const map: Record<number, any> = {}
-  tagList.value.forEach((tag) => {
-    map[tag.seq_id] = tag
-  })
-  return map
-})
-// tagMapById uses UUID as key for editing operations
-const tagMapById = computed<Record<string, any>>(() => {
+let tagSearchDebounce: number | null = null
+
+const showTagFilterClear = computed(
+  () => selectedTagIds.value.length > 0 && tagFilterTriggerHover.value,
+)
+
+const isTagFilterPlaceholder = computed(
+  () => selectedTagIds.value.length === 0 && tagFilterCleared.value,
+)
+
+const tagMap = computed<Record<string, any>>(() => {
   const map: Record<string, any> = {}
   tagList.value.forEach((tag) => {
     map[tag.id] = tag
   })
   return map
 })
-// All tags are now regular tags (no pseudo-tag)
+
+// tagMapBySeqId uses seq_id as key for looking up by entry.tag_id
+const tagMapBySeqId = computed<Record<number, any>>(() => {
+  const map: Record<number, any> = {}
+  tagList.value.forEach((tag) => {
+    map[tag.seq_id] = tag
+  })
+  return map
+})
+
 const regularTags = computed(() => tagList.value)
 const tagDropdownOptions = computed(() =>
   regularTags.value.map((tag: any) => ({ content: tag.name, value: String(tag.seq_id) })),
@@ -1462,25 +1108,51 @@ const tagDropdownOptions = computed(() =>
 const tagSelectOptions = computed(() =>
   regularTags.value.map((tag: any) => ({ label: tag.name, value: tag.seq_id })),
 )
-const sidebarCategoryCount = computed(() => tagList.value.length)
-const filteredTags = computed(() => {
-  const query = tagSearchQuery.value.trim().toLowerCase()
-  if (!query) {
-    return tagList.value
+
+const sidebarCategoryCount = computed(() => tagTotal.value || tagList.value.length)
+const sidebarTags = computed(() => {
+  const list = tagList.value
+  const selectedIds = selectedTagIds.value
+  if (!selectedIds.length) {
+    return list
   }
-  return tagList.value.filter((tag) => (tag.name || '').toLowerCase().includes(query))
+  const missingSelected = selectedIds
+    .filter((id) => !list.some((tag) => tag.id === id))
+    .map((id) => tagMap.value[id])
+    .filter(Boolean)
+  if (!missingSelected.length) {
+    return list
+  }
+  return [...missingSelected, ...list]
 })
+
+const activeTagFilterLabel = computed(() => {
+  if (selectedTagIds.value.length === 0) {
+    return tagFilterCleared.value
+      ? t('knowledgeBase.tagFilterPlaceholder')
+      : t('knowledgeBase.allTags')
+  }
+  if (selectedTagIds.value.length === 1) {
+    const id = selectedTagIds.value[0]
+    return tagMap.value[id]?.name || t('knowledgeBase.allTags')
+  }
+  return t('knowledgeBase.tagFilterMulti', { count: selectedTagIds.value.length })
+})
+
+const activeTagFilterTitle = computed(() => {
+  if (selectedTagIds.value.length === 0) {
+    return t('knowledgeBase.tagFilterTitle')
+  }
+  const names = selectedTagIds.value
+    .map((id) => tagMap.value[id]?.name)
+    .filter(Boolean)
+  return names.length > 0 ? names.join('、') : t('knowledgeBase.tagFilterTitle')
+})
+
+const isTagFilterActive = (tagId: string) => selectedTagIds.value.includes(tagId)
 
 const kbInfo = ref<any>(null)
 const knowledgeList = ref<Array<{ id: string; name: string; type?: string }>>([])
-const knowledgeDropdownOptions = computed(() =>
-  knowledgeList.value
-    .map((item) => ({
-      content: item.name,
-      value: item.id,
-      prefixIcon: () => h(TIcon, { name: item.type === 'document' ? 'folder' : 'chat-bubble-help', size: '16px' }),
-    })),
-)
 
 const loadKnowledgeInfo = async (kbId: string) => {
   if (!kbId) {
@@ -1501,25 +1173,25 @@ const loadKnowledgeInfo = async (kbId: string) => {
 const loadKnowledgeList = async () => {
   try {
     const res: any = await listKnowledgeBases()
-    const myKbs = (res?.data || []).map((item: any) => ({
+    const myKbs: typeof knowledgeList.value = (res?.data || []).map((item: any) => ({
       id: String(item.id),
       name: item.name,
       type: item.type,
     }))
-    
+
     // Also include shared knowledge bases from orgStore
-    const sharedKbs = (orgStore.sharedKnowledgeBases || [])
+    const sharedKbs: typeof knowledgeList.value = (orgStore.sharedKnowledgeBases || [])
       .filter(s => s.knowledge_base != null)
       .map(s => ({
         id: String(s.knowledge_base.id),
         name: s.knowledge_base.name,
         type: s.knowledge_base.type,
       }))
-    
+
     // Merge and deduplicate by id (my KBs take precedence)
     const myKbIds = new Set(myKbs.map(kb => kb.id))
     const uniqueSharedKbs = sharedKbs.filter(kb => !myKbIds.has(kb.id))
-    
+
     knowledgeList.value = [...myKbs, ...uniqueSharedKbs]
   } catch (error) {
     console.error('Failed to load knowledge bases:', error)
@@ -1557,21 +1229,26 @@ const importState = reactive({
     progress: number
     total: number
     processed: number
+    message?: string
     error?: string
   } | null,
   pollingInterval: null as ReturnType<typeof setInterval> | null,
 })
 
 // FAQ导入结果状态（持久化的）
-const importResult = ref<{
+type FAQImportResultView = {
   total_entries: number
   success_count: number
   failed_count: number
   skipped_count: number
+  partial_failed_count: number
+  merged_count: number
+  added_count: number
   import_mode: string
   imported_at: string
   task_id: string
   processing_time: number
+  message?: string
   failed_entries_url?: string
   success_entries?: Array<{
     index: number
@@ -1581,7 +1258,73 @@ const importResult = ref<{
     standard_question: string
   }>
   display_status: string
-} | null>(null)
+}
+
+const importResult = ref<FAQImportResultView | null>(null)
+const importResultExpanded = ref(false)
+
+const showImportResultBadge = computed(() => (
+  !!importResult.value
+  && importResult.value.display_status === 'open'
+  && !importState.taskId
+))
+
+const isImportInProgress = computed(() => {
+  const status = importState.taskStatus?.status
+  return !!importState.taskId && (status === 'running' || status === 'pending')
+})
+
+const importResultSummary = computed(() => {
+  const result = importResult.value
+  if (!result) return ''
+  if (result.message?.trim()) {
+    return result.message.trim()
+  }
+  const parts: string[] = []
+  parts.push(`${t('faqManager.import.totalData')} ${result.total_entries}`)
+  if (result.merged_count > 0) {
+    if (result.added_count > 0) {
+      parts.push(`${t('faqManager.import.added')} ${result.added_count}`)
+    }
+    parts.push(`${t('faqManager.import.merged')} ${result.merged_count}`)
+  } else if (result.success_count > 0) {
+    parts.push(`${t('faqManager.import.success')} ${result.success_count}`)
+  }
+  if (result.partial_failed_count > 0) {
+    parts.push(`${t('faqManager.import.partialFailed')} ${result.partial_failed_count}`)
+  }
+  if (result.failed_count > 0) {
+    parts.push(`${t('faqManager.import.failed')} ${result.failed_count}`)
+  }
+  if (result.skipped_count > 0) {
+    parts.push(`${t('faqManager.import.skipped')} ${result.skipped_count}`)
+  }
+  return parts.join(' · ')
+})
+
+const importProgressTitle = computed(() => {
+  const status = importState.taskStatus?.status
+  if (status === 'running') return t('faqManager.import.importing')
+  if (status === 'success') return t('faqManager.import.importDone')
+  if (status === 'failed') return t('faqManager.import.importFailed')
+  return t('faqManager.import.waiting')
+})
+
+const importProgressIcon = computed(() => {
+  const status = importState.taskStatus?.status
+  if (status === 'running') return 'loading'
+  if (status === 'success') return 'check-circle-filled'
+  if (status === 'failed') return 'error-circle-filled'
+  return 'time-filled'
+})
+
+const importProgressText = computed(() => {
+  const status = importState.taskStatus
+  if (!status) return ''
+  if (status.error) return status.error
+  if (status.message?.trim()) return status.message.trim()
+  return importProgressTitle.value
+})
 
 // Search test state
 const searchDrawerVisible = ref(false)
@@ -1595,17 +1338,51 @@ const searchForm = reactive({
 })
 
 
-// 标签列表滚动加载更多
-const handleTagListScroll = () => {
-  const container = tagListRef.value
-  if (!container) return
-  if (tagLoadingMore.value || !tagHasMore.value) return
-  
-  const { scrollTop, scrollHeight, clientHeight } = container
-  // 距离底部 50px 时触发加载
-  if (scrollTop + clientHeight >= scrollHeight - 50) {
-    loadTags()
+const getTagName = (tagId?: number) => {
+  if (!tagId) return t('knowledgeBase.untagged')
+  return tagMapBySeqId.value[tagId]?.name || t('knowledgeBase.untagged')
+}
+
+const handleTagFilterChange = (tagIds: string[]) => {
+  selectedTagIds.value = tagIds
+  uiStore.clearSelectedTagIds()
+  tagIds.forEach((id) => uiStore.toggleSelectedTagId(id))
+}
+
+const handleTagRowClick = (tagId: string) => {
+  const next = new Set(selectedTagIds.value)
+  if (next.has(tagId)) {
+    next.delete(tagId)
+  } else {
+    next.add(tagId)
   }
+  if (next.size > 0) {
+    tagFilterCleared.value = false
+  }
+  handleTagFilterChange([...next])
+}
+
+const clearTagFilter = () => {
+  tagFilterCleared.value = true
+  handleTagFilterChange([])
+}
+
+const openTagManageDrawer = () => {
+  tagFilterPanelVisible.value = false
+  tagManageDrawerVisible.value = true
+}
+
+const onTagManageChanged = (payload?: { deletedTagId?: string }) => {
+  if (!props.kbId) return
+  void loadTags(true)
+  if (payload?.deletedTagId && selectedTagIds.value.includes(payload.deletedTagId)) {
+    selectedTagIds.value = selectedTagIds.value.filter((id) => id !== payload.deletedTagId)
+    handleTagFilterChange([...selectedTagIds.value])
+  }
+  currentPage = 1
+  entries.value = []
+  selectedRowKeys.value = []
+  void loadEntries()
 }
 
 const loadTags = async (reset = false) => {
@@ -1622,15 +1399,17 @@ const loadTags = async (reset = false) => {
     tagList.value = []
     tagTotal.value = 0
     tagHasMore.value = false
+  } else if (tagLoading.value || tagLoadingMore.value) {
+    return
   }
 
-  const currentPage = tagPage.value || 1
-  tagLoading.value = currentPage === 1
-  tagLoadingMore.value = currentPage > 1
+  const currentTagPage = tagPage.value || 1
+  tagLoading.value = currentTagPage === 1
+  tagLoadingMore.value = currentTagPage > 1
 
   try {
     const res: any = await listKnowledgeTags(props.kbId, {
-      page: currentPage,
+      page: currentTagPage,
       page_size: TAG_PAGE_SIZE,
       keyword: tagSearchQuery.value || undefined,
     })
@@ -1643,7 +1422,7 @@ const loadTags = async (reset = false) => {
       id: String(tag.id),
     }))
 
-    if (currentPage === 1) {
+    if (currentTagPage === 1) {
       tagList.value = pageTags
     } else {
       tagList.value = [...tagList.value, ...pageTags]
@@ -1652,7 +1431,7 @@ const loadTags = async (reset = false) => {
     tagTotal.value = pageData.total || tagList.value.length
     tagHasMore.value = tagList.value.length < tagTotal.value
     if (tagHasMore.value) {
-      tagPage.value = currentPage + 1
+      tagPage.value = currentTagPage + 1
     }
   } catch (error: any) {
     MessagePlugin.error(error?.message || t('common.operationFailed'))
@@ -1660,150 +1439,6 @@ const loadTags = async (reset = false) => {
     tagLoading.value = false
     tagLoadingMore.value = false
   }
-}
-
-const getTagName = (tagId?: number) => {
-  if (!tagId) return t('knowledgeBase.untagged')
-  return tagMap.value[tagId]?.name || (t('knowledgeBase.untagged'))
-}
-
-const handleTagFilterChange = (value: number) => {
-  selectedTagId.value = value
-}
-
-const handleTagRowClick = (tagSeqId: number) => {
-  if (editingTagId.value) {
-    cancelEditTag()
-  }
-  if (creatingTag.value) {
-    cancelCreateTag()
-  }
-  if (selectedTagId.value === tagSeqId) {
-    handleTagFilterChange(0)
-    return
-  }
-  handleTagFilterChange(tagSeqId)
-}
-
-const startCreateTag = () => {
-  if (!props.kbId) {
-    MessagePlugin.warning(t('knowledgeEditor.messages.missingId'))
-    return
-  }
-  if (creatingTag.value) {
-    return
-  }
-  cancelEditTag()
-  creatingTag.value = true
-  nextTick(() => {
-    newTagInputRef.value?.focus?.()
-    newTagInputRef.value?.select?.()
-  })
-}
-
-const cancelCreateTag = () => {
-  creatingTag.value = false
-  newTagName.value = ''
-}
-
-const submitCreateTag = async () => {
-  if (!props.kbId) {
-    MessagePlugin.warning(t('knowledgeEditor.messages.missingId'))
-    return
-  }
-  const name = newTagName.value.trim()
-  if (!name) {
-    MessagePlugin.warning(t('knowledgeBase.tagNameRequired'))
-    return
-  }
-  creatingTagLoading.value = true
-  try {
-    await createKnowledgeBaseTag(props.kbId, { name })
-    MessagePlugin.success(t('knowledgeBase.tagCreateSuccess'))
-    cancelCreateTag()
-    await loadTags()
-  } catch (error: any) {
-    MessagePlugin.error(error?.message || t('common.operationFailed'))
-  } finally {
-    creatingTagLoading.value = false
-  }
-}
-
-const startEditTag = (tag: any) => {
-  cancelCreateTag()
-  editingTagId.value = tag.id
-  editingTagName.value = tag.name
-  nextTick(() => {
-    const inputRef = editingTagInputRefs.get(tag.id)
-    inputRef?.focus?.()
-    inputRef?.select?.()
-  })
-}
-
-const cancelEditTag = () => {
-  editingTagId.value = null
-  editingTagName.value = ''
-}
-
-const submitEditTag = async () => {
-  if (!props.kbId || !editingTagId.value) {
-    return
-  }
-  const name = editingTagName.value.trim()
-  if (!name) {
-    MessagePlugin.warning(t('knowledgeBase.tagNameRequired'))
-    return
-  }
-  if (name === tagMapById.value[editingTagId.value]?.name) {
-    cancelEditTag()
-    return
-  }
-  editingTagSubmitting.value = true
-  try {
-    await updateKnowledgeBaseTag(props.kbId, editingTagId.value, { name })
-    MessagePlugin.success(t('knowledgeBase.tagEditSuccess'))
-    cancelEditTag()
-    await loadTags()
-  } catch (error: any) {
-    MessagePlugin.error(error?.message || t('common.operationFailed'))
-  } finally {
-    editingTagSubmitting.value = false
-  }
-}
-
-const confirmDeleteTag = (tag: any) => {
-  if (!props.kbId) {
-    MessagePlugin.warning(t('knowledgeEditor.messages.missingId'))
-    return
-  }
-  if (creatingTag.value) {
-    cancelCreateTag()
-  }
-  if (editingTagId.value) {
-    cancelEditTag()
-  }
-  const confirmDialog = DialogPlugin.confirm({
-    header: t('knowledgeBase.tagDeleteTitle'),
-    body: t('knowledgeBase.tagDeleteDesc', { name: tag.name }),
-    confirmBtn: { content: t('common.delete'), theme: 'danger' },
-    cancelBtn: t('common.cancel'),
-    onConfirm: async () => {
-      try {
-        await deleteKnowledgeBaseTag(props.kbId, tag.seq_id, { force: true })
-        MessagePlugin.success(t('knowledgeBase.tagDeleteSuccess'))
-        if (selectedTagId.value === tag.seq_id) {
-          // Reset to show all entries when current tag is deleted
-          selectedTagId.value = 0
-          handleTagFilterChange(0)
-        }
-        await loadTags()
-        await loadEntries()
-        confirmDialog.hide()
-      } catch (error: any) {
-        MessagePlugin.error(error?.message || t('common.operationFailed'))
-      }
-    },
-  })
 }
 
 const handleEntryTagChange = async (entryId: number, value?: string) => {
@@ -1818,7 +1453,7 @@ const handleEntryTagChange = async (entryId: number, value?: string) => {
     await updateFAQEntryTagBatch(props.kbId, { updates: { [entryId]: normalizedValue } })
     MessagePlugin.success(t('knowledgeEditor.messages.updateSuccess'))
     await loadEntries()
-    await loadTags()
+    await loadTags(true)
   } catch (error: any) {
     if (targetEntry) {
       targetEntry.tag_id = previousTagId
@@ -1847,43 +1482,6 @@ const handleOpenKBSettings = () => {
 const handleKnowledgeDropdownSelect = (data: { value: string }) => {
   if (!data?.value || data.value === props.kbId) return
   router.push(`/platform/knowledge-bases/${data.value}`)
-}
-
-const handleFaqMenuAction = (event: Event) => {
-  const detail = (event as CustomEvent<{ action: string; kbId: string }>).detail
-  if (!detail || detail.kbId !== props.kbId) return
-
-  if (detail.action === 'create') {
-    if (canEdit.value) openEditor()
-  } else if (detail.action === 'import') {
-    if (canEdit.value) openImportDialog()
-  } else if (detail.action === 'search') {
-    searchDrawerVisible.value = true
-  } else if (detail.action === 'export') {
-    // Export is usually allowed for viewers as well
-    handleExportCSV()
-  } else if (detail.action === 'batch') {
-    // 批量操作通过左侧菜单的下拉菜单处理
-    if (selectedRowKeys.value.length === 0) {
-      MessagePlugin.warning(t('knowledgeEditor.faq.selectEntriesFirst'))
-    }
-  } else if (detail.action === 'batchTag') {
-    if (canEdit.value && selectedRowKeys.value.length > 0) {
-      openBatchTagDialog()
-    }
-  } else if (detail.action === 'batchEnable') {
-    if (canEdit.value && selectedRowKeys.value.length > 0) {
-      handleBatchStatusChange(true)
-    }
-  } else if (detail.action === 'batchDisable') {
-    if (canEdit.value && selectedRowKeys.value.length > 0) {
-      handleBatchStatusChange(false)
-    }
-  } else if (detail.action === 'batchDelete') {
-    if (canManage.value && selectedRowKeys.value.length > 0) {
-      handleBatchDelete()
-    }
-  }
 }
 
 const handleEntryStatusChange = async (entry: FAQEntry, value: boolean) => {
@@ -1981,7 +1579,7 @@ const loadEntries = async (append = false) => {
     const res = await listFAQEntries(props.kbId, {
       page: currentPage,
       page_size: pageSize,
-      tag_id: selectedTagId.value || undefined,
+      tag_ids: selectedTagIds.value.length > 0 ? selectedTagIds.value.join(',') : undefined,
       keyword: entrySearchKeyword.value ? entrySearchKeyword.value.trim() : undefined,
     })
     const pageData = (res.data || {}) as {
@@ -1996,7 +1594,7 @@ const loadEntries = async (append = false) => {
       answersCollapsed: true,   // 答案默认折叠
       is_enabled: entry.is_enabled !== false,
     }))
-    
+
     if (append) {
       entries.value = [...entries.value, ...newEntries]
     } else {
@@ -2005,7 +1603,7 @@ const loadEntries = async (append = false) => {
     // 判断是否还有更多数据
     hasMore.value = entries.value.length < (pageData.total || 0)
     currentPage++
-    
+
     // 等待 DOM 更新后重新布局
     await nextTick()
     arrangeCards()
@@ -2014,7 +1612,7 @@ const loadEntries = async (append = false) => {
   } finally {
     loading.value = false
     loadingMore.value = false
-    
+
     // 检查是否需要继续加载以填满可视区域
     // 延迟执行以确保 arrangeCards 的 requestAnimationFrame 完成
     setTimeout(() => {
@@ -2042,11 +1640,11 @@ const checkAndLoadMore = () => {
   if (!scrollContainer.value) return
   if (loadingMore.value || loading.value) return
   if (!hasMore.value) return
-  
+
   const container = scrollContainer.value
   const scrollHeight = container.scrollHeight
   const clientHeight = container.clientHeight
-  
+
   // 如果内容高度小于容器高度 + 50px 的缓冲，说明可能没有滚动条或接近底部，需要继续加载
   if (scrollHeight <= clientHeight + 50) {
     loadEntries(true)
@@ -2054,6 +1652,7 @@ const checkAndLoadMore = () => {
 }
 
 const handleCardSelect = (entryId: number, checked: boolean) => {
+  if (!canSelectEntries.value || batchActionLoading.value) return
   if (checked) {
     if (!selectedRowKeys.value.includes(entryId)) {
       selectedRowKeys.value.push(entryId)
@@ -2064,6 +1663,11 @@ const handleCardSelect = (entryId: number, checked: boolean) => {
       selectedRowKeys.value.splice(index, 1)
     }
   }
+}
+
+const clearFAQSelection = () => {
+  if (batchActionLoading.value) return
+  selectedRowKeys.value = []
 }
 
 const resetEditorForm = () => {
@@ -2179,14 +1783,18 @@ const handleSubmitEntry = async () => {
 }
 
 const handleBatchDelete = async () => {
-  if (!selectedRowKeys.value.length) return
+  if (!canManage.value || !selectedRowKeys.value.length || !props.kbId || batchActionLoading.value) return
+  const selectedIds = [...selectedRowKeys.value]
+  batchDeleteLoading.value = true
   try {
-    await deleteFAQEntries(props.kbId, selectedRowKeys.value)
-    MessagePlugin.success(t('knowledgeEditor.faqImport.deleteSuccess'))
+    await deleteFAQEntries(props.kbId, selectedIds)
+    MessagePlugin.success(t('knowledgeEditor.faq.batchDeleteSuccess', { count: selectedIds.length }))
     selectedRowKeys.value = []
     await loadEntries()
   } catch (error: any) {
     MessagePlugin.error(error?.message || t('common.operationFailed'))
+  } finally {
+    batchDeleteLoading.value = false
   }
 }
 
@@ -2195,16 +1803,18 @@ const batchTagDialogVisible = ref(false)
 const batchTagValue = ref<string>('')
 
 const openBatchTagDialog = () => {
-  if (!selectedRowKeys.value.length) return
+  if (!canEdit.value || !selectedRowKeys.value.length || batchActionLoading.value) return
   batchTagValue.value = ''
   batchTagDialogVisible.value = true
 }
 
 const handleBatchTag = async () => {
-  if (!selectedRowKeys.value.length || !props.kbId) return
+  if (!canEdit.value || !selectedRowKeys.value.length || !props.kbId || batchActionLoading.value) return
+  const selectedIds = [...selectedRowKeys.value]
+  batchTagLoading.value = true
   try {
     const updates: Record<number, number | null> = {}
-    selectedRowKeys.value.forEach(id => {
+    selectedIds.forEach(id => {
       updates[id] = batchTagValue.value ? Number(batchTagValue.value) : null
     })
     await updateFAQEntryTagBatch(props.kbId, { updates })
@@ -2212,17 +1822,21 @@ const handleBatchTag = async () => {
     batchTagDialogVisible.value = false
     selectedRowKeys.value = []
     await loadEntries()
-    await loadTags()
+    await loadTags(true)
   } catch (error: any) {
     MessagePlugin.error(error?.message || t('common.operationFailed'))
+  } finally {
+    batchTagLoading.value = false
   }
 }
 
 const handleBatchStatusChange = async (isEnabled: boolean) => {
-  if (!selectedRowKeys.value.length || !props.kbId) return
+  if (!canEdit.value || !selectedRowKeys.value.length || !props.kbId || batchActionLoading.value) return
+  const selectedIds = [...selectedRowKeys.value]
+  batchStatusAction.value = isEnabled ? 'enable' : 'disable'
   try {
     const by_id: Record<number, { is_enabled: boolean }> = {}
-    selectedRowKeys.value.forEach(id => {
+    selectedIds.forEach(id => {
       by_id[id] = { is_enabled: isEnabled }
     })
     await updateFAQEntryFieldsBatch(props.kbId, { by_id })
@@ -2231,6 +1845,8 @@ const handleBatchStatusChange = async (isEnabled: boolean) => {
     await loadEntries()
   } catch (error: any) {
     MessagePlugin.error(error?.message || t('common.operationFailed'))
+  } finally {
+    batchStatusAction.value = null
   }
 }
 
@@ -2328,7 +1944,7 @@ const parseJSONFile = async (file: File): Promise<FAQEntryPayload[]> => {
 
 const parseCSVFile = async (file: File): Promise<FAQEntryPayload[]> => {
   const text = await file.text()
-  
+
   // 使用 papaparse 解析 CSV，自动处理引号、转义、分隔符等
   return new Promise((resolve, reject) => {
     Papa.parse(text, {
@@ -2354,7 +1970,7 @@ const parseCSVFile = async (file: File): Promise<FAQEntryPayload[]> => {
             Object.keys(row).forEach((key) => {
               record[key] = String(row[key] || '').trim()
             })
-            
+
             const isDisabled = parseBooleanField(record['是否停用'], false)
             payloads.push(
               normalizePayload({
@@ -2363,7 +1979,7 @@ const parseCSVFile = async (file: File): Promise<FAQEntryPayload[]> => {
                 similar_questions: splitByDelimiter(record['相似问题'] || record['similar_questions']),
                 negative_questions: splitByDelimiter(record['反例问题'] || record['negative_questions']),
                 tag_id: record['tag_id'] ? Number(record['tag_id']) : undefined,
-                tag_name: record['分类'] || record['tag_name'] || '',
+                tag_name: record['标签'] || record['分类'] || record['tag_name'] || '',
                 is_enabled: isDisabled !== undefined ? !isDisabled : undefined, // 是否停用：FALSE表示启用，TRUE表示停用，所以取反
               }),
             )
@@ -2386,7 +2002,7 @@ const parseExcelFile = async (file: File): Promise<FAQEntryPayload[]> => {
   const sheetName = workbook.SheetNames[0]
   const worksheet = workbook.Sheets[sheetName]
   // 使用 raw: false 确保正确处理引号和转义
-  const json = XLSX.utils.sheet_to_json<Record<string, string>>(worksheet, { 
+  const json = XLSX.utils.sheet_to_json<Record<string, string>>(worksheet, {
     defval: '',
     raw: false // 确保字符串值被正确解析
   })
@@ -2402,7 +2018,7 @@ const parseExcelFile = async (file: File): Promise<FAQEntryPayload[]> => {
       // 确保值是字符串类型
       normalizedRow[finalKey] = String(row[key] || '').trim()
     })
-    
+
     const isDisabled = parseBooleanField(normalizedRow['是否停用'], false)
     return normalizePayload({
       standard_question: normalizedRow['问题'] || normalizedRow['standard_question'] || normalizedRow['question'] || '',
@@ -2410,7 +2026,7 @@ const parseExcelFile = async (file: File): Promise<FAQEntryPayload[]> => {
       similar_questions: splitByDelimiter(normalizedRow['相似问题'] || normalizedRow['similar_questions']),
       negative_questions: splitByDelimiter(normalizedRow['反例问题'] || normalizedRow['negative_questions']),
       tag_id: normalizedRow['tag_id'] ? Number(normalizedRow['tag_id']) : undefined,
-      tag_name: normalizedRow['分类'] || normalizedRow['tag_name'] || '',
+      tag_name: normalizedRow['标签'] || normalizedRow['分类'] || normalizedRow['tag_name'] || '',
       is_enabled: isDisabled !== undefined ? !isDisabled : undefined, // 是否停用：FALSE表示启用，TRUE表示停用，所以取反
     })
   })
@@ -2421,7 +2037,7 @@ const splitByDelimiter = (value?: string) => {
   // 只使用 ## 作为分隔符，避免错误分割包含逗号、分号等内容
   const trimmedValue = value.trim()
   if (!trimmedValue) return []
-  
+
   // 如果包含 ## 分隔符，按 ## 分割
   if (trimmedValue.includes('##')) {
     return trimmedValue
@@ -2429,7 +2045,7 @@ const splitByDelimiter = (value?: string) => {
       .map(item => item.trim())
       .filter(Boolean)
   }
-  
+
   // 如果没有 ## 分隔符，整个值作为一个答案
   return [trimmedValue]
 }
@@ -2468,10 +2084,10 @@ const startPolling = (taskId: string) => {
   stopPolling()
   // 保存taskId到localStorage，以便刷新后恢复
   saveTaskIdToStorage(taskId)
-  
+
   // 记录上次已处理数量，用于判断是否需要刷新列表
   let lastProcessed = 0
-  
+
   importState.pollingInterval = setInterval(async () => {
     try {
       const res: any = await getFAQImportProgress(taskId)
@@ -2485,17 +2101,19 @@ const startPolling = (taskId: string) => {
         } else if (status === 'completed') {
           status = 'success'
         }
-        
+
         const progress = progressData.progress || 0
         const total = progressData.total || 0
         const processed = progressData.processed || 0
         const error = progressData.error || ''
-        
+        const message = progressData.message || ''
+
         importState.taskStatus = {
           status: status,
           progress: progress,
           total: total,
           processed: processed,
+          message: message,
           error: error,
         }
 
@@ -2503,7 +2121,7 @@ const startPolling = (taskId: string) => {
         if (processed > lastProcessed) {
           lastProcessed = processed
           await loadEntries()
-          await loadTags()
+          await loadTags(true)
         }
 
         // 任务完成或失败，停止轮询（但不自动关闭进度条，让用户手动关闭）
@@ -2514,13 +2132,15 @@ const startPolling = (taskId: string) => {
             if (importState.taskId) {
               saveLastCompletedTaskId(importState.taskId)
             }
-            MessagePlugin.success(t('knowledgeEditor.faqImport.importSuccess'))
+            MessagePlugin.success(progressData.message || t('knowledgeEditor.faqImport.importSuccess'))
             // 清除筛选条件，确保用户能看到所有新导入的数据
-            selectedTagId.value = 0
+            selectedTagIds.value = []
+            tagFilterCleared.value = false
+            uiStore.clearSelectedTagIds()
             entrySearchKeyword.value = ''
             overallFAQTotal.value = 0  // Reset to trigger re-fetch
             await loadEntries()
-            await loadTags()
+            await loadTags(true)
             await loadImportResult() // 加载最新的导入结果统计
             // 任务完成后，3秒后自动关闭进度条
             setTimeout(() => {
@@ -2599,7 +2219,7 @@ const clearTaskIdFromStorage = () => {
 // 恢复导入任务状态（用于刷新后恢复）
 const restoreImportTask = async () => {
   if (!props.kbId) return
-  
+
   const savedTaskId = getTaskIdFromStorage()
   if (!savedTaskId) return
 
@@ -2607,7 +2227,7 @@ const restoreImportTask = async () => {
     // 查询Redis中的进度状态
     const res: any = await getFAQImportProgress(savedTaskId)
     const progressData = res?.data
-    
+
     if (progressData) {
       // 从Redis进度数据中提取状态
       let status = progressData.status
@@ -2616,21 +2236,22 @@ const restoreImportTask = async () => {
       } else if (status === 'completed') {
         status = 'success'
       }
-      
+
       const progress = progressData.progress || 0
       const total = progressData.total || 0
       const processed = progressData.processed || 0
       const error = progressData.error || ''
-      
+
       importState.taskId = savedTaskId
       importState.taskStatus = {
         status: status,
         progress: progress,
         total: total,
         processed: processed,
+        message: progressData.message || '',
         error: error,
       }
-      
+
       // 如果任务还在进行中，恢复轮询
       if (status === 'pending' || status === 'running') {
         startPolling(savedTaskId)
@@ -2677,13 +2298,13 @@ const getLastCompletedTaskId = (): string | null => {
 // 加载持久化的导入结果统计
 const loadImportResult = async () => {
   if (!props.kbId) return
-  
+
   const lastTaskId = getLastCompletedTaskId()
   if (!lastTaskId) {
     importResult.value = null
     return
   }
-  
+
   try {
     const res: any = await getFAQImportProgress(lastTaskId)
     const data = res?.data
@@ -2696,9 +2317,13 @@ const loadImportResult = async () => {
       // Map progress fields to importResult format
       importResult.value = {
         total_entries: data.total,
-        success_count: data.success_count,
-        failed_count: data.failed_count,
+        success_count: data.success_count || 0,
+        failed_count: data.failed_count || 0,
         skipped_count: data.skipped_count || 0,
+        partial_failed_count: data.partial_failed_count || 0,
+        merged_count: data.merged_count || 0,
+        added_count: data.added_count || 0,
+        message: data.message || '',
         import_mode: data.import_mode || 'append',
         imported_at: data.imported_at,
         task_id: data.task_id,
@@ -2718,6 +2343,7 @@ const loadImportResult = async () => {
 
 // 关闭导入结果统计卡片
 const closeImportResult = async () => {
+  importResultExpanded.value = false
   if (!props.kbId) return
   try {
     await updateFAQImportResultDisplayStatus(props.kbId, 'close')
@@ -2775,7 +2401,7 @@ const handleImport = async () => {
       entries: importState.preview,
       mode: importState.mode,
     })
-    
+
     const taskId = res?.data?.task_id
     if (taskId) {
       importState.taskId = taskId
@@ -2784,6 +2410,7 @@ const handleImport = async () => {
         progress: 0,
         total: importState.preview.length,
         processed: 0,
+        message: t('faqManager.import.progressHint'),
       }
       // 开始轮询任务状态
       startPolling(taskId)
@@ -2806,24 +2433,6 @@ const handleImport = async () => {
     stopPolling()
   }
 }
-
-// 监听选中数量变化，通知左侧菜单
-watch(selectedRowKeys, (newKeys, oldKeys) => {
-  const count = newKeys.length
-  // 获取选中条目的状态信息
-  const selectedEntries = entries.value.filter(entry => newKeys.includes(entry.id))
-  const enabledCount = selectedEntries.filter(entry => entry.is_enabled !== false).length
-  const disabledCount = count - enabledCount
-  
-  const event = new CustomEvent('faqSelectionChanged', {
-    detail: { 
-      count,
-      enabledCount,
-      disabledCount
-    }
-  })
-  window.dispatchEvent(event)
-}, { immediate: true, deep: true })
 
 // 组件卸载时清理轮询
 onUnmounted(() => {
@@ -2887,10 +2496,10 @@ const downloadJSONExample = () => {
 
 // 下载 CSV 示例
 const downloadCSVExample = () => {
-  const headers = ['分类(必填)', '问题(必填)', '相似问题(选填-多个用##分隔)', '反例问题(选填-多个用##分隔)', '机器人回答(必填-多个用##分隔)', '是否全部回复(选填-默认FALSE)', '是否停用(选填-默认FALSE)', '是否禁止被推荐(选填-默认False 可被推荐)']
+  const headers = ['标签(必填)', '问题(必填)', '相似问题(选填-多个用##分隔)', '反例问题(选填-多个用##分隔)', '机器人回答(必填-多个用##分隔)', '是否全部回复(选填-默认FALSE)', '是否停用(选填-默认FALSE)', '是否禁止被推荐(选填-默认False 可被推荐)']
   const rows = exampleData.map((item) => {
     return [
-      item.tag_name || '', // 分类
+      item.tag_name || '', // 标签
       item.standard_question,
       item.similar_questions.join('##'),
       item.negative_questions.join('##'),
@@ -2925,7 +2534,7 @@ const downloadCSVExample = () => {
 const downloadExcelExample = () => {
   const worksheet = XLSX.utils.json_to_sheet(
     exampleData.map((item) => ({
-      '分类(必填)': item.tag_name || '',
+      '标签(必填)': item.tag_name || '',
       '问题(必填)': item.standard_question,
       '相似问题(选填-多个用##分隔)': item.similar_questions.join('##'),
       '反例问题(选填-多个用##分隔)': item.negative_questions.join('##'),
@@ -2940,25 +2549,28 @@ const downloadExcelExample = () => {
   XLSX.writeFile(workbook, 'faq_example.xlsx')
 }
 
-// 导出 FAQ 数据为 CSV
+// 导出 FAQ 数据
 const exportLoading = ref(false)
-const handleExportCSV = async () => {
+const downloadExportBlob = (blob: Blob, ext: 'csv' | 'json') => {
+  const url = URL.createObjectURL(blob)
+  const link = document.createElement('a')
+  link.href = url
+  link.download = `faq_export_${new Date().toISOString().slice(0, 10)}.${ext}`
+  document.body.appendChild(link)
+  link.click()
+  document.body.removeChild(link)
+  URL.revokeObjectURL(url)
+}
+const handleExportFAQ = async (format: 'csv' | 'json') => {
   if (!props.kbId) {
     MessagePlugin.warning(t('knowledgeBase.selectKnowledgeBase'))
     return
   }
-  
+
   exportLoading.value = true
   try {
-    const blob = await exportFAQEntries(props.kbId)
-    const url = URL.createObjectURL(blob)
-    const link = document.createElement('a')
-    link.href = url
-    link.download = `faq_export_${new Date().toISOString().slice(0, 10)}.csv`
-    document.body.appendChild(link)
-    link.click()
-    document.body.removeChild(link)
-    URL.revokeObjectURL(url)
+    const blob = await exportFAQEntries(props.kbId, format)
+    downloadExportBlob(blob, format)
     MessagePlugin.success(t('knowledgeEditor.faqExport.exportSuccess'))
   } catch (error: any) {
     console.error('Export failed:', error)
@@ -2967,16 +2579,18 @@ const handleExportCSV = async () => {
     exportLoading.value = false
   }
 }
+const handleExportCSV = () => handleExportFAQ('csv')
+const handleExportJSON = () => handleExportFAQ('json')
 
 watch(
   () => props.kbId,
   async (newKbId) => {
     currentPage = 1
     hasMore.value = true
-    selectedTagId.value = 0
-    overallFAQTotal.value = 0  // Reset to trigger re-fetch
-    cancelCreateTag()
-    cancelEditTag()
+    selectedTagIds.value = []
+    tagFilterCleared.value = false
+    uiStore.clearSelectedTagIds()
+    overallFAQTotal.value = 0
     tagSearchQuery.value = ''
 
     if (!newKbId) {
@@ -3002,9 +2616,9 @@ watch(
   { immediate: true },
 )
 
-watch(selectedTagId, (newVal, oldVal) => {
+watch(selectedTagIds, (newVal, oldVal) => {
   if (oldVal === undefined) return
-  if (newVal !== oldVal) {
+  if (newVal.join(',') !== oldVal.join(',')) {
     currentPage = 1
     entries.value = []
     selectedRowKeys.value = []
@@ -3015,7 +2629,7 @@ watch(selectedTagId, (newVal, oldVal) => {
 watch(tagSearchQuery, (newVal, oldVal) => {
   if (newVal === oldVal) return
   if (tagSearchDebounce) {
-    clearTimeout(tagSearchDebounce)
+    window.clearTimeout(tagSearchDebounce)
   }
   tagSearchDebounce = window.setTimeout(() => {
     loadTags(true)
@@ -3026,7 +2640,7 @@ watch(tagSearchQuery, (newVal, oldVal) => {
 watch(entrySearchKeyword, (newVal, oldVal) => {
   if (newVal === oldVal) return
   if (entrySearchDebounce) {
-    clearTimeout(entrySearchDebounce)
+    window.clearTimeout(entrySearchDebounce)
   }
   entrySearchDebounce = window.setTimeout(() => {
     loadEntries()
@@ -3054,7 +2668,7 @@ const handleSearch = async () => {
       answersCollapsed: true,   // 答案默认折叠
       expanded: false,
     })) as FAQEntry[]
-    
+
     // 按score从大到小排序
     searchResults.value = results.sort((a, b) => (b.score || 0) - (a.score || 0))
   } catch (error: any) {
@@ -3095,15 +2709,15 @@ const debounceArrangeCards = (delay = 100) => {
 // 瀑布流布局函数 - 优化版本，避免闪烁
 const arrangeCards = () => {
   if (!cardListRef.value) return
-  
+
   const cards = cardListRef.value.querySelectorAll('.faq-card') as NodeListOf<HTMLElement>
   if (cards.length === 0) return
-  
+
   // 获取容器宽度和列数
   const containerWidth = cardListRef.value.offsetWidth
   const gap = 12 // 与 CSS gap 保持一致
   let columnCount = 1
-  
+
   // 根据容器宽度计算列数（增加每行的卡片数量）
   if (containerWidth >= 2560) columnCount = 12
   else if (containerWidth >= 1920) columnCount = 10
@@ -3112,12 +2726,12 @@ const arrangeCards = () => {
   else if (containerWidth >= 1024) columnCount = 5
   else if (containerWidth >= 768) columnCount = 4
   else if (containerWidth >= 640) columnCount = 3
-  
+
   const columnWidth = (containerWidth - (gap * (columnCount - 1))) / columnCount
-  
+
   // 初始化每列的高度数组
   const columnHeights = new Array(columnCount).fill(0)
-  
+
   // 使用 requestAnimationFrame 优化性能
   requestAnimationFrame(() => {
     // 先设置宽度，保持当前位置不变
@@ -3129,7 +2743,7 @@ const arrangeCards = () => {
       // 设置宽度以便正确计算高度
       card.style.width = `${columnWidth}px`
     })
-    
+
     // 等待浏览器重新计算布局
     requestAnimationFrame(() => {
       // 计算所有卡片的高度（不改变位置）
@@ -3138,44 +2752,44 @@ const arrangeCards = () => {
         const height = card.offsetHeight || card.getBoundingClientRect().height
         cardHeights.push(height)
       })
-      
+
       // 计算新位置
       const newPositions: Array<{ top: number; left: number }> = []
       cardHeights.forEach((height) => {
         const shortestColumnIndex = columnHeights.indexOf(Math.min(...columnHeights))
         const top = columnHeights[shortestColumnIndex]
         const left = shortestColumnIndex * (columnWidth + gap)
-        
+
         newPositions.push({ top, left })
         columnHeights[shortestColumnIndex] += height + gap
       })
-      
+
       // 批量更新所有卡片位置，使用CSS过渡实现平滑移动
       cards.forEach((card, index) => {
         const { top, left } = newPositions[index]
         const currentTop = parseFloat(card.style.top) || 0
         const currentLeft = parseFloat(card.style.left) || 0
-        
+
         // 如果位置发生变化，添加过渡效果
         if (Math.abs(currentTop - top) > 1 || Math.abs(currentLeft - left) > 1) {
           // 使用 will-change 提示浏览器优化
           card.style.willChange = 'top, left'
           card.style.transition = 'top 0.3s cubic-bezier(0.4, 0, 0.2, 1), left 0.3s cubic-bezier(0.4, 0, 0.2, 1)'
         }
-        
+
         card.style.position = 'absolute'
         card.style.top = `${top}px`
         card.style.left = `${left}px`
         card.style.width = `${columnWidth}px`
       })
-      
+
       // 设置容器高度
       const maxHeight = Math.max(...columnHeights)
       if (cardListRef.value) {
         cardListRef.value.style.height = `${maxHeight}px`
         cardListRef.value.style.position = 'relative'
       }
-      
+
       // 动画完成后移除过渡和 will-change，避免影响后续交互
       setTimeout(() => {
         cards.forEach((card) => {
@@ -3208,31 +2822,15 @@ onMounted(async () => {
   orgStore.fetchSharedKnowledgeBases()
   loadKnowledgeList()
   window.addEventListener('resize', handleResize)
-  window.addEventListener('faqMenuAction', handleFaqMenuAction as EventListener)
   // 如果已有kbId，恢复导入任务状态
   if (props.kbId) {
     await restoreImportTask()
     await loadImportResult() // 加载导入结果
   }
-  // 主动触发一次选中数量事件，确保左侧菜单能接收到初始状态
-  nextTick(() => {
-    const count = selectedRowKeys.value.length
-    const selectedEntries = entries.value.filter(entry => selectedRowKeys.value.includes(entry.id))
-    const enabledCount = selectedEntries.filter(entry => entry.is_enabled !== false).length
-    const disabledCount = count - enabledCount
-    window.dispatchEvent(new CustomEvent('faqSelectionChanged', {
-      detail: { 
-        count,
-        enabledCount,
-        disabledCount
-      }
-    }))
-  })
 })
 
 onUnmounted(() => {
   window.removeEventListener('resize', handleResize)
-  window.removeEventListener('faqMenuAction', handleFaqMenuAction as EventListener)
   if (arrangeCardsTimer) {
     clearTimeout(arrangeCardsTimer)
   }
@@ -3272,6 +2870,123 @@ watch(() => entries.value.map(e => ({
 
 <style lang="less">
 /* 下拉菜单样式已统一至 @/assets/dropdown-menu.less */
+.tag-filter-popup {
+  z-index: 5500 !important;
+}
+
+.tag-filter-popup .t-popup__content {
+  padding: 0 !important;
+  border-radius: 8px !important;
+  background: var(--td-bg-color-container) !important;
+  border: 0.5px solid var(--td-component-stroke) !important;
+  box-shadow:
+    0 0 0 0.5px rgba(0, 0, 0, 0.03),
+    0 2px 4px rgba(0, 0, 0, 0.04),
+    0 8px 24px rgba(0, 0, 0, 0.1) !important;
+}
+
+.tag-filter-panel {
+  width: 320px;
+  max-width: min(320px, calc(100vw - 32px));
+  max-height: min(70vh, 480px);
+  display: flex;
+  flex-direction: column;
+  padding: 12px 14px;
+  box-sizing: border-box;
+  font-size: 12px;
+  color: var(--td-text-color-primary);
+}
+
+.tag-filter-panel__header {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  margin-bottom: 10px;
+}
+
+.tag-filter-panel__title {
+  display: flex;
+  align-items: baseline;
+  gap: 6px;
+  font-size: 14px;
+  font-weight: 600;
+}
+
+.tag-filter-panel__count {
+  font-size: 12px;
+  color: var(--td-text-color-placeholder);
+  font-weight: 400;
+}
+
+.tag-filter-panel .tag-search-bar {
+  margin-bottom: 10px;
+}
+
+.tag-filter-panel__body {
+  display: flex;
+  flex-direction: column;
+  gap: 8px;
+  flex: 1;
+  min-height: 0;
+  overflow-y: auto;
+}
+
+.tag-filter-chips {
+  display: flex;
+  flex-wrap: wrap;
+  gap: 6px;
+}
+
+.tag-filter-chip {
+  display: inline-flex;
+  align-items: center;
+  gap: 4px;
+  height: 24px;
+  padding: 0 8px;
+  border: 1px solid var(--td-component-stroke);
+  border-radius: 4px;
+  background: transparent;
+  color: var(--td-text-color-secondary);
+  font-size: 11px;
+  cursor: pointer;
+}
+
+.tag-filter-chip.active {
+  border-color: color-mix(in srgb, var(--td-brand-color) 35%, var(--td-component-stroke));
+  color: var(--td-brand-color);
+  background-color: color-mix(in srgb, var(--td-brand-color) 6%, transparent);
+}
+
+.tag-filter-chip__label {
+  max-width: 120px;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+
+.tag-filter-chip__count {
+  font-size: 10px;
+  color: var(--td-text-color-placeholder);
+}
+
+.tag-filter-panel__footer {
+  margin-top: 10px;
+  padding-top: 10px;
+  border-top: 1px solid var(--td-component-stroke);
+}
+
+.tag-empty-state {
+  text-align: center;
+  padding: 10px 6px;
+  color: var(--td-text-color-placeholder);
+  font-size: 11px;
+}
+
+.tag-load-more {
+  display: flex;
+  justify-content: center;
+  padding-top: 2px;
+}
 </style>
 <style scoped lang="less">
 .faq-manager {
@@ -3307,420 +3022,148 @@ watch(() => entries.value.map(e => ({
   border: none;
 }
 
-// 贴近整体系统设计语言的极简侧栏
-.faq-tag-panel {
-  width: 180px;
-  background: transparent;
-  border: none;
-  border-right: 1px solid var(--td-component-stroke);
-  box-shadow: 1px 0 0 rgba(0, 0, 0, 0.02);
-  padding: 0 16px 0 0;
-  display: flex;
-  flex-direction: column;
-  flex-shrink: 0;
-  max-height: 100%;
-  min-height: 0;
-  overflow: hidden;
-
-  // t-loading 包裹容器需要撑满剩余空间
-  > .t-loading__parent,
-  > .t-loading {
-    flex: 1;
-    min-height: 0;
-    display: flex;
-    flex-direction: column;
-    overflow: hidden;
-  }
-
-  .sidebar-header {
-    display: flex;
-    align-items: center;
-    justify-content: space-between;
-    margin-bottom: 12px;
-    padding: 0 4px;
-    color: var(--td-text-color-primary);
-
-    .sidebar-title {
-      display: flex;
-      align-items: baseline;
-      gap: 6px;
-      font-size: 14px;
-      font-weight: 600;
-      letter-spacing: 0.5px;
-
-      .sidebar-count {
-        font-size: 12px;
-        color: var(--td-text-color-placeholder);
-        font-weight: 400;
-      }
-    }
-
-    .sidebar-actions {
-      display: flex;
-      gap: 6px;
-      align-items: center;
-
-      .create-tag-btn {
-        width: 24px;
-        height: 24px;
-        padding: 0;
-        border-radius: 4px;
-        display: flex;
-        align-items: center;
-        justify-content: center;
-        color: var(--td-text-color-secondary);
-        transition: all 0.2s ease;
-
-        .t-icon {
-          font-size: 16px;
-        }
-
-        &:hover {
-          background: var(--td-bg-color-secondarycontainer);
-          color: var(--td-brand-color);
-        }
-      }
-
-      .sidebar-action-icon {
-        width: 24px;
-        height: 24px;
-        border-radius: 4px;
-        display: flex;
-        align-items: center;
-        justify-content: center;
-        color: var(--td-text-color-secondary);
-        cursor: pointer;
-        transition: all 0.2s ease;
-
-        &:hover {
-          background: var(--td-bg-color-secondarycontainer);
-          color: var(--td-brand-color);
-        }
-      }
-    }
-  }
-
-  .tag-search-bar {
-    margin-bottom: 12px;
-    padding: 0 4px;
-
-    :deep(.t-input) {
-      font-size: 13px;
-      background-color: var(--td-bg-color-secondarycontainer);
-      border-color: transparent;
-      border-radius: 6px;
-      box-shadow: none !important;
-
-      &:hover,
-      &:focus,
-      &.t-is-focused {
-        border-color: var(--td-brand-color);
-        background-color: var(--td-bg-color-container);
-        box-shadow: none !important;
-      }
-    }
-
-    :deep(.t-input__inner) {
-      font-size: 13px;
-    }
-
-    :deep(.t-input__prefix-icon) {
-      margin-right: 0;
-    }
-  }
-
-  .faq-tag-list {
-    display: flex;
-    flex-direction: column;
-    gap: 5px;
-    flex: 1;
-    min-height: 0;
-    overflow-y: auto;
-    overflow-x: hidden;
-    scrollbar-width: none;
-
-    &::-webkit-scrollbar {
-      display: none;
-    }
-
-    .tag-loading-more {
-      padding: 8px 0;
-      display: flex;
-      justify-content: center;
-      flex-shrink: 0;
-    }
-
-    .faq-tag-item {
-      display: flex;
-      align-items: center;
-      justify-content: space-between;
-      padding: 8px 8px;
-      border-radius: 6px;
-      color: var(--td-text-color-primary);
-      cursor: pointer;
-      transition: all 0.2s ease;
-      font-family: "PingFang SC", -apple-system, BlinkMacSystemFont, sans-serif;
-      font-size: 13px;
-      -webkit-font-smoothing: antialiased;
-
-      .faq-tag-left {
-        display: flex;
-        align-items: center;
-        gap: 8px;
-        min-width: 0;
-        flex: 1;
-
-        .t-icon,
-        .tag-hash-icon {
-          flex-shrink: 0;
-          color: var(--td-text-color-secondary);
-          transition: color 0.2s ease;
-        }
-
-        .t-icon {
-          font-size: 16px;
-        }
-
-        .tag-hash-icon {
-          font-family: ui-monospace, SFMono-Regular, Menlo, Monaco, Consolas, "Liberation Mono", "Courier New", monospace;
-          font-size: 16px;
-          font-weight: 500;
-          width: 16px;
-          text-align: center;
-          display: inline-block;
-        }
-      }
-
-      .tag-name {
-        flex: 1;
-        min-width: 0;
-        overflow: hidden;
-        text-overflow: ellipsis;
-        white-space: nowrap;
-        font-family: "PingFang SC", -apple-system, BlinkMacSystemFont, sans-serif;
-        font-size: 13px;
-        font-weight: 400;
-        line-height: 1.4;
-      }
-
-      .faq-tag-right {
-        display: flex;
-        align-items: center;
-        gap: 6px;
-        margin-left: 8px;
-        flex-shrink: 0;
-      }
-
-      .faq-tag-count {
-        font-size: 12px;
-        color: var(--td-text-color-placeholder);
-        font-weight: 400;
-        transition: all 0.2s ease;
-        text-align: right;
-        padding-left: 8px;
-        background: transparent;
-      }
-
-      &:hover {
-        background: var(--td-bg-color-secondarycontainer);
-        color: var(--td-text-color-primary);
-
-        .faq-tag-left .t-icon,
-        .faq-tag-left .tag-hash-icon {
-          color: var(--td-text-color-secondary);
-        }
-
-        .faq-tag-count {
-          color: var(--td-text-color-secondary);
-        }
-      }
-
-      &.active {
-        background: var(--td-brand-color-light);
-        color: var(--td-brand-color);
-
-        .faq-tag-left .t-icon,
-        .faq-tag-left .tag-hash-icon {
-          color: var(--td-brand-color);
-        }
-
-        .tag-name {
-          font-weight: 500;
-        }
-
-        .faq-tag-count {
-          color: var(--td-brand-color);
-        }
-      }
-
-      &.editing {
-        background: transparent;
-        border: none;
-      }
-
-      &.tag-editing {
-        cursor: default;
-        padding-right: 8px;
-        background: transparent;
-        border: none;
-
-        .tag-edit-input {
-          flex: 1;
-        }
-      }
-
-      &.tag-editing .tag-edit-input {
-        width: 100%;
-      }
-
-      .tag-inline-actions {
-        display: flex;
-        gap: 4px;
-        margin-left: auto;
-
-        :deep(.t-button) {
-          padding: 0 4px;
-          height: 24px;
-        }
-
-        :deep(.tag-action-btn) {
-          border-radius: 4px;
-          transition: all 0.2s ease;
-
-          .t-icon {
-            font-size: 14px;
-          }
-        }
-
-        :deep(.tag-action-btn.confirm) {
-          background: transparent;
-          color: var(--td-text-color-secondary);
-
-          &:hover {
-            background: var(--td-bg-color-secondarycontainer);
-            color: var(--td-brand-color);
-          }
-        }
-
-        :deep(.tag-action-btn.cancel) {
-          background: transparent;
-          color: var(--td-text-color-secondary);
-
-          &:hover {
-            background: var(--td-bg-color-secondarycontainer);
-            color: var(--td-error-color);
-          }
-        }
-      }
-
-      .tag-edit-input {
-        flex: 1;
-        min-width: 0;
-        max-width: 100%;
-
-        :deep(.t-input) {
-          font-size: 13px;
-          background-color: transparent;
-          border: none;
-          border-radius: 0;
-          box-shadow: none;
-          padding: 0;
-        }
-
-        :deep(.t-input__wrap) {
-          background-color: transparent;
-          border: none;
-          border-radius: 0;
-          box-shadow: none;
-        }
-
-        :deep(.t-input__inner) {
-          padding: 0;
-          color: var(--td-text-color-primary);
-          caret-color: var(--td-brand-color);
-        }
-
-        :deep(.t-input:hover),
-        :deep(.t-input.t-is-focused),
-        :deep(.t-input__wrap:hover),
-        :deep(.t-input__wrap.t-is-focused) {
-          border-color: transparent;
-        }
-      }
-
-      .tag-more {
-        display: flex;
-        align-items: center;
-      }
-
-      .tag-more-btn {
-        width: 22px;
-        height: 22px;
-        display: flex;
-        align-items: center;
-        justify-content: center;
-        border-radius: 4px;
-        color: var(--td-text-color-placeholder);
-        transition: all 0.2s ease;
-
-        &:hover {
-          background: var(--td-bg-color-secondarycontainer);
-          color: var(--td-text-color-secondary);
-        }
-      }
-
-      .tag-more-placeholder {
-        width: 22px;
-        height: 22px;
-        flex-shrink: 0;
-      }
-    }
-
-    .tag-empty-state {
-      text-align: center;
-      padding: 10px 6px;
-      color: var(--td-text-color-placeholder);
-      font-size: 11px;
-    }
-  }
-}
-
 .faq-card-area {
+  position: relative;
   flex: 1;
   min-width: 0;
   display: flex;
   flex-direction: column;
   min-height: 0;
-  padding: 0 0 0 16px;
+  padding: 0;
   border: none;
   overflow: hidden;
   background: transparent;
 }
 
-.faq-search-bar {
+.faq-filter-bar {
   padding: 0 0 12px 0;
   flex-shrink: 0;
   display: flex;
-  gap: 12px;
+  flex-wrap: wrap;
   align-items: center;
+  gap: 8px 12px;
 
   .faq-search-input {
-    flex: 1;
+    flex: 1 1 220px;
     min-width: 0;
+    width: auto;
   }
 
-  .faq-search-actions {
-    flex-shrink: 0;
+  &__filters {
+    flex: 0 0 auto;
+    display: flex;
+    align-items: center;
+    gap: 12px;
+    min-width: 0;
+
+    :deep(.t-popup__reference) {
+      display: block;
+    }
+  }
+
+  &__trailing {
+    flex: 0 0 auto;
     display: flex;
     align-items: center;
     gap: 4px;
+    margin-left: auto;
+
     :deep(.content-bar-icon-btn) {
       color: var(--td-text-color-secondary);
       background: transparent;
       border: none;
+
       &:hover {
         color: var(--td-brand-color);
         background: var(--td-bg-color-secondarycontainer);
+      }
+    }
+  }
+
+  @media (max-width: 767px) {
+    .faq-search-input {
+      flex: 1 1 100%;
+    }
+
+    &__filters {
+      flex: 1 1 auto;
+      min-width: 0;
+    }
+
+    &__trailing {
+      flex: 0 0 auto;
+      margin-left: auto;
+    }
+  }
+
+  .doc-filter-field {
+    width: 140px;
+    flex-shrink: 0;
+
+    &__control {
+      width: 100%;
+    }
+  }
+
+  .doc-tag-filter-trigger {
+    display: inline-flex;
+    align-items: center;
+    box-sizing: border-box;
+    width: 100%;
+    height: 32px;
+    padding: 0 8px;
+    border: 1px solid transparent;
+    border-radius: var(--td-radius-default);
+    background: var(--td-bg-color-secondarycontainer);
+    color: var(--td-text-color-primary);
+    font-family: var(--app-font-family);
+    font-size: 14px;
+    line-height: 1;
+    cursor: pointer;
+    transition: background 0.2s ease, border-color 0.2s ease;
+
+    &:hover,
+    &.open {
+      background: var(--td-bg-color-secondarycontainer);
+      border-color: transparent;
+    }
+
+    &.is-placeholder {
+      color: var(--td-text-color-placeholder);
+    }
+
+    &__prefix {
+      flex-shrink: 0;
+      display: inline-flex;
+      align-items: center;
+      margin-right: var(--td-comp-margin-s);
+      color: var(--td-text-color-placeholder);
+    }
+
+    &__label {
+      flex: 1;
+      min-width: 0;
+      overflow: hidden;
+      text-overflow: ellipsis;
+      white-space: nowrap;
+      text-align: left;
+    }
+
+    &__suffix {
+      flex-shrink: 0;
+      display: inline-flex;
+      align-items: center;
+      margin-left: var(--td-comp-margin-s);
+    }
+
+    &__caret {
+      flex-shrink: 0;
+      color: var(--td-text-color-placeholder);
+      transition: transform 0.2s ease, color 0.2s ease;
+
+      &.open {
+        color: var(--td-brand-color);
+        transform: rotate(180deg);
       }
     }
   }
@@ -3758,7 +3201,7 @@ watch(() => entries.value.map(e => ({
   cursor: pointer;
   transition: all 0.2s ease;
   color: var(--td-text-color-primary);
-  font-family: "PingFang SC";
+  font-family: var(--app-font-family);
   font-size: 14px;
   font-weight: 400;
 
@@ -3805,32 +3248,25 @@ watch(() => entries.value.map(e => ({
     align-items: center;
     gap: 8px;
     flex-wrap: wrap;
+    width: 100%;
+
+    .faq-import-strip--in-title {
+      margin-bottom: 0;
+      flex: 0 1 auto;
+      min-width: 0;
+      max-width: min(420px, 40vw);
+
+      .faq-import-strip__text {
+        max-width: 220px;
+      }
+    }
   }
 
-  .faq-access-meta {
-    flex-shrink: 0;
-  }
-
-  .faq-access-meta-inner {
+  .kb-title-actions {
     display: inline-flex;
     align-items: center;
     gap: 6px;
-    font-size: 12px;
-    color: var(--td-text-color-secondary);
-    cursor: default;
-  }
-
-  .faq-access-role-tag {
     flex-shrink: 0;
-  }
-
-  .faq-access-meta-sep {
-    color: var(--td-text-color-placeholder);
-    user-select: none;
-  }
-
-  .faq-access-meta-text {
-    white-space: nowrap;
   }
 
   .faq-breadcrumb {
@@ -3869,7 +3305,7 @@ watch(() => entries.value.map(e => ({
 
     &.dropdown {
       padding-right: 6px;
-      
+
       :deep(.t-icon) {
         font-size: 14px;
         transition: transform 0.12s ease;
@@ -3896,7 +3332,7 @@ watch(() => entries.value.map(e => ({
   h2 {
     margin: 0;
     color: var(--td-text-color-primary);
-    font-family: "PingFang SC";
+    font-family: var(--app-font-family);
     font-size: 24px;
     font-weight: 600;
     line-height: 32px;
@@ -3905,7 +3341,7 @@ watch(() => entries.value.map(e => ({
   .faq-subtitle {
     margin: 0;
     color: var(--td-text-color-placeholder);
-    font-family: "PingFang SC";
+    font-family: var(--app-font-family);
     font-size: 14px;
     font-weight: 400;
     line-height: 20px;
@@ -3913,248 +3349,204 @@ watch(() => entries.value.map(e => ({
 }
 
 
-// 导入进度条样式（显示在列表页面顶部）
-.faq-import-progress-bar {
-  margin-bottom: 16px;
-  background: var(--td-bg-color-container);
-  border: 1px solid var(--td-success-color-focus);
-  border-radius: 10px;
-  padding: 14px 18px;
-  box-shadow: 0 2px 12px rgba(0, 168, 112, 0.08);
+// 导入结果入口：默认仅图标，hover / 点击展开浮层
+.faq-import-host {
+  position: relative;
+  flex-shrink: 0;
 
-  .progress-bar-content {
-    display: flex;
-    flex-direction: column;
-    gap: 10px;
-  }
-
-  .progress-bar-header {
-    display: flex;
+  .faq-import-trigger {
+    display: inline-flex;
     align-items: center;
-    justify-content: space-between;
-    font-size: 14px;
-    color: var(--td-text-color-primary);
+    justify-content: center;
+    border: none;
+    background: transparent;
+    padding: 2px;
+    margin: 0;
+    color: var(--td-success-color);
+    cursor: pointer;
+    line-height: 1;
+    transition: opacity 0.15s ease;
 
-    .progress-left {
-      display: flex;
-      align-items: center;
-      gap: 10px;
-    }
-
-    .progress-right {
-      display: flex;
-      align-items: center;
-      gap: 16px;
-    }
-
-    .progress-icon {
-      flex-shrink: 0;
-
-      &.icon-loading {
-        animation: rotate 1s linear infinite;
-        color: var(--td-success-color);
-      }
-
-      &.icon-success {
-        color: var(--td-success-color);
-      }
-
-      &.icon-error {
-        color: var(--td-error-color);
-      }
-    }
-
-    .progress-title {
-      font-weight: 600;
-      font-size: 14px;
-      color: var(--td-text-color-primary);
-    }
-
-    .progress-count {
-      color: var(--td-text-color-secondary);
-      font-size: 13px;
-      font-weight: 500;
-      background: rgba(0, 168, 112, 0.1);
-      padding: 2px 10px;
-      border-radius: 12px;
-    }
-
-    .progress-close-btn {
-      flex-shrink: 0;
-      padding: 4px;
-      margin-left: 4px;
-      border-radius: 4px;
-      
-      &:hover {
-        background: rgba(0, 0, 0, 0.06);
-      }
+    &:hover {
+      opacity: 0.75;
     }
   }
 
-  .progress-bar {
-    margin: 0;
-    width: 100%;
-    
-    :deep(.t-progress) {
-      width: 100%;
-    }
-    
-    :deep(.t-progress__bar) {
-      width: 100%;
-      height: 8px;
-      border-radius: 4px;
-      background: rgba(0, 168, 112, 0.15);
-    }
-    
-    :deep(.t-progress__inner) {
-      border-radius: 4px;
-    }
+  .faq-import-panel {
+    position: absolute;
+    top: calc(100% + 8px);
+    left: 0;
+    z-index: 200;
+    opacity: 0;
+    visibility: hidden;
+    pointer-events: none;
+    transform: translateY(-4px);
+    transition: opacity 0.15s ease, transform 0.15s ease, visibility 0.15s ease;
   }
 
-  .progress-error {
-    margin: 0;
-    font-size: 13px;
-    color: var(--td-error-color);
-    line-height: 1.5;
-    background: rgba(250, 81, 81, 0.08);
-    padding: 8px 12px;
-    border-radius: 6px;
+  &:hover .faq-import-panel,
+  &.is-expanded .faq-import-panel,
+  &:focus-within .faq-import-panel {
+    opacity: 1;
+    visibility: visible;
+    pointer-events: auto;
+    transform: translateY(0);
+  }
+
+  .faq-import-strip--panel {
+    margin-bottom: 0;
+    padding: 8px 10px;
+    font-size: 12px;
+    white-space: nowrap;
+    box-shadow: 0 4px 16px rgba(0, 0, 0, 0.1);
+
+    .faq-import-strip__text {
+      max-width: 360px;
+    }
   }
 }
 
-@keyframes rotate {
+
+// FAQ 导入提示条（紧凑单行）
+.faq-import-strip {
+  display: inline-flex;
+  align-items: center;
+  width: fit-content;
+  gap: 8px;
+  max-width: 100%;
+  margin-bottom: 10px;
+  padding: 4px 8px 4px 10px;
+  border-radius: 6px;
+  font-size: 12px;
+  line-height: 1.4;
+  color: var(--td-text-color-secondary);
+  background: var(--td-bg-color-secondarycontainer);
+  border: 1px solid var(--td-component-stroke);
+
+  &__icon {
+    flex-shrink: 0;
+    color: var(--td-text-color-placeholder);
+
+    &.is-spinning {
+      animation: faq-import-spin 1s linear infinite;
+    }
+  }
+
+  &__text {
+    flex: 0 1 auto;
+    min-width: 0;
+    white-space: nowrap;
+    overflow: hidden;
+    text-overflow: ellipsis;
+    max-width: 520px;
+  }
+
+  &__bar {
+    flex-shrink: 0;
+    width: 72px;
+    height: 4px;
+    border-radius: 2px;
+    background: rgba(0, 0, 0, 0.08);
+    overflow: hidden;
+  }
+
+  &__bar-fill {
+    height: 100%;
+    border-radius: 2px;
+    background: var(--td-brand-color);
+    transition: width 0.3s ease;
+  }
+
+  &__count {
+    flex-shrink: 0;
+    font-size: 12px;
+    font-variant-numeric: tabular-nums;
+    color: var(--td-text-color-placeholder);
+  }
+
+  &__time {
+    flex-shrink: 0;
+    font-size: 12px;
+    color: var(--td-text-color-placeholder);
+    white-space: nowrap;
+  }
+
+  &__link {
+    flex-shrink: 0;
+    padding: 0 4px;
+    height: auto;
+    font-size: 12px;
+  }
+
+  &__close {
+    display: inline-flex;
+    align-items: center;
+    justify-content: center;
+    flex-shrink: 0;
+    width: 20px;
+    height: 20px;
+    margin: 0;
+    padding: 0;
+    border: none;
+    border-radius: 4px;
+    background: transparent;
+    color: var(--td-text-color-placeholder);
+    cursor: pointer;
+    transition: background 0.15s ease, color 0.15s ease;
+
+    &:hover {
+      background: rgba(0, 0, 0, 0.06);
+      color: var(--td-text-color-secondary);
+    }
+  }
+
+  &--result {
+    .faq-import-strip__icon {
+      color: var(--td-success-color);
+    }
+  }
+
+  &--running {
+    .faq-import-strip__icon {
+      color: var(--td-brand-color);
+    }
+  }
+
+  &--success {
+    .faq-import-strip__icon {
+      color: var(--td-success-color);
+    }
+
+    .faq-import-strip__bar-fill {
+      background: var(--td-success-color);
+    }
+  }
+
+  &--failed {
+    border-color: rgba(227, 77, 89, 0.3);
+    background: rgba(227, 77, 89, 0.06);
+
+    .faq-import-strip__icon {
+      color: var(--td-error-color);
+    }
+
+    .faq-import-strip__text {
+      color: var(--td-error-color);
+    }
+
+    .faq-import-strip__bar-fill {
+      background: var(--td-error-color);
+    }
+  }
+}
+
+@keyframes faq-import-spin {
   from {
     transform: rotate(0deg);
   }
+
   to {
     transform: rotate(360deg);
-  }
-}
-
-// 导入结果统计卡片样式
-.faq-import-result-card {
-  margin-bottom: 16px;
-  background: var(--td-bg-color-container);
-  border: 1px solid var(--td-component-stroke);
-  border-radius: 8px;
-  padding: 16px 20px;
-  box-shadow: 0 1px 4px rgba(0, 0, 0, 0.04);
-
-  .import-result-content {
-    display: flex;
-    flex-direction: column;
-    gap: 12px;
-  }
-
-  .import-result-header {
-    display: flex;
-    align-items: center;
-    justify-content: space-between;
-
-    .header-left {
-      display: flex;
-      align-items: center;
-      gap: 8px;
-
-      .result-icon {
-        color: var(--td-brand-color);
-        flex-shrink: 0;
-      }
-
-      .result-title {
-        font-family: "PingFang SC";
-        font-weight: 600;
-        font-size: 14px;
-        color: var(--td-text-color-primary);
-      }
-    }
-
-    .header-right {
-      display: flex;
-      align-items: center;
-      gap: 12px;
-
-      .result-time {
-        font-family: "PingFang SC";
-        font-size: 13px;
-        color: var(--td-text-color-secondary);
-      }
-
-      .result-close-btn {
-        padding: 4px;
-        border-radius: 4px;
-        color: var(--td-text-color-secondary);
-        transition: all 0.2s ease;
-
-        &:hover {
-          background: var(--td-bg-color-secondarycontainer);
-          color: var(--td-text-color-secondary);
-        }
-      }
-    }
-  }
-
-  .import-result-body {
-    display: flex;
-    align-items: center;
-    justify-content: space-between;
-    flex-wrap: wrap;
-    gap: 12px;
-  }
-
-  .import-result-stats {
-    display: flex;
-    align-items: center;
-    flex-wrap: wrap;
-    gap: 24px;
-
-    .stat-item {
-      display: flex;
-      align-items: center;
-      gap: 6px;
-      font-family: "PingFang SC";
-      font-size: 13px;
-
-      .stat-label {
-        color: var(--td-text-color-secondary);
-      }
-
-      .stat-value {
-        font-weight: 600;
-        color: var(--td-text-color-primary);
-      }
-
-      &.success .stat-value {
-        color: var(--td-brand-color);
-      }
-
-      &.failed .stat-value {
-        color: var(--td-error-color);
-      }
-
-      &.skipped .stat-value {
-        color: var(--td-warning-color);
-      }
-
-      .download-failed-btn {
-        margin-left: 4px;
-        padding: 0 8px;
-        height: 24px;
-        font-size: 12px;
-        border-radius: 4px;
-        display: inline-flex;
-        align-items: center;
-        gap: 4px;
-
-        .t-icon {
-          font-size: 12px;
-        }
-      }
-    }
-  }
-
-  .import-mode-tag {
-    flex-shrink: 0;
   }
 }
 
@@ -4207,11 +3599,38 @@ watch(() => entries.value.map(e => ({
   overflow-y: auto;
   overflow-x: hidden;
   padding-right: 4px;
+
+  &.has-batch-bar {
+    padding-bottom: 76px;
+  }
+}
+
+.faq-batch-bar-anchor {
+  position: absolute;
+  right: 0;
+  bottom: 12px;
+  left: 0;
+  z-index: 6;
+  display: flex;
+  justify-content: center;
+  padding: 0 16px;
+  pointer-events: none;
+
+  &>* {
+    pointer-events: auto;
+  }
 }
 
 @keyframes contentFadeIn {
-  from { opacity: 0; transform: translateY(6px); }
-  to { opacity: 1; transform: translateY(0); }
+  from {
+    opacity: 0;
+    transform: translateY(6px);
+  }
+
+  to {
+    opacity: 1;
+    transform: translateY(0);
+  }
 }
 
 .faq-skeleton-grid {
@@ -4225,13 +3644,16 @@ watch(() => entries.value.map(e => ({
 .faq-card-skeleton {
   cursor: default;
   height: auto;
+
   .faq-card-header {
     padding-bottom: 10px;
     border-bottom: 1px solid var(--td-component-stroke);
   }
+
   .faq-card-body {
     padding: 8px 0;
   }
+
   .faq-skel-footer {
     padding-top: 8px;
     border-top: 1px solid var(--td-component-stroke);
@@ -4258,14 +3680,18 @@ watch(() => entries.value.map(e => ({
   min-width: 0;
   max-width: 100%;
   overflow: hidden;
-  cursor: pointer;
+  cursor: default;
   transition: border-color 0.2s ease, box-shadow 0.2s ease, background-color 0.2s ease;
   box-sizing: border-box;
   height: fit-content;
 
-  &:hover {
-    border-color: var(--td-brand-color);
-    box-shadow: 0 2px 8px rgba(7, 192, 95, 0.1);
+  &.is-selectable {
+    cursor: pointer;
+
+    &:hover {
+      border-color: var(--td-brand-color);
+      box-shadow: 0 2px 8px rgba(7, 192, 95, 0.1);
+    }
   }
 
   &.selected {
@@ -4359,7 +3785,7 @@ watch(() => entries.value.map(e => ({
   border: 1px solid var(--td-component-stroke);
   font-size: 11px;
   color: var(--td-text-color-secondary);
-  font-family: "PingFang SC";
+  font-family: var(--app-font-family);
 
   .status-icon {
     font-size: 13px;
@@ -4428,7 +3854,7 @@ watch(() => entries.value.map(e => ({
     background: var(--td-bg-color-container-hover);
     font-size: 11px;
     font-weight: 400;
-    font-family: "PingFang SC";
+    font-family: var(--app-font-family);
     transition: all 0.2s ease;
 
     &:hover {
@@ -4486,7 +3912,7 @@ watch(() => entries.value.map(e => ({
 .faq-question {
   flex: 1;
   color: var(--td-text-color-primary);
-  font-family: "PingFang SC";
+  font-family: var(--app-font-family);
   font-size: 15px;
   font-weight: 600;
   line-height: 1.5;
@@ -4518,7 +3944,7 @@ watch(() => entries.value.map(e => ({
 
   .faq-section-label {
     color: var(--td-text-color-secondary);
-    font-family: "PingFang SC";
+    font-family: var(--app-font-family);
     font-size: 11px;
     font-weight: 600;
     text-transform: uppercase;
@@ -4589,16 +4015,16 @@ watch(() => entries.value.map(e => ({
   width: 100%;
   overflow: hidden;
   contain: layout style paint; // 优化渲染性能
-  
+
   // 确保每个标签都有最大宽度限制
-  > * {
+  >* {
     max-width: 100%;
     min-width: 0;
     flex: 0 1 auto;
   }
-  
+
   // 当标签单独一行时，限制最大宽度
-  > *:first-child:last-child {
+  >*:first-child:last-child {
     max-width: 100%;
   }
 }
@@ -4609,9 +4035,9 @@ watch(() => entries.value.map(e => ({
   max-width: 100%;
   min-width: 0;
   border-radius: 5px;
-  font-family: "PingFang SC";
+  font-family: var(--app-font-family);
   flex: 0 1 auto;
-  
+
   :deep(.t-tag) {
     max-width: 100% !important;
     min-width: 0 !important;
@@ -4625,7 +4051,7 @@ watch(() => entries.value.map(e => ({
     border-color: var(--td-component-stroke);
     color: var(--td-text-color-primary);
   }
-  
+
   // 针对TDesign tag内部的span元素
   :deep(.t-tag span),
   :deep(.t-tag > span) {
@@ -4658,7 +4084,7 @@ watch(() => entries.value.map(e => ({
   font-size: 12px;
   font-style: italic;
   padding: 8px 0;
-  font-family: "PingFang SC";
+  font-family: var(--app-font-family);
 }
 
 
@@ -4670,7 +4096,7 @@ watch(() => entries.value.map(e => ({
   padding: 24px 16px;
   color: var(--td-text-color-secondary);
   font-size: 13px;
-  font-family: "PingFang SC";
+  font-family: var(--app-font-family);
 }
 
 .faq-no-more {
@@ -4702,7 +4128,7 @@ watch(() => entries.value.map(e => ({
 
   .empty-text {
     color: var(--td-text-color-primary);
-    font-family: "PingFang SC";
+    font-family: var(--app-font-family);
     font-size: 18px;
     font-weight: 600;
     line-height: 28px;
@@ -4710,7 +4136,7 @@ watch(() => entries.value.map(e => ({
 
   .empty-desc {
     color: var(--td-text-color-secondary);
-    font-family: "PingFang SC";
+    font-family: var(--app-font-family);
     font-size: 14px;
     font-weight: 400;
     line-height: 22px;
@@ -4780,7 +4206,7 @@ watch(() => entries.value.map(e => ({
 
   .import-title {
     margin: 0;
-    font-family: "PingFang SC";
+    font-family: var(--app-font-family);
     font-size: 18px;
     font-weight: 600;
     color: var(--td-text-color-primary);
@@ -4794,7 +4220,7 @@ watch(() => entries.value.map(e => ({
   padding: 24px;
   min-height: 0;
   max-height: calc(90vh - 140px); // 减去 header 和 footer 的高度
-  
+
   // 自定义滚动条
   &::-webkit-scrollbar {
     width: 6px;
@@ -4848,7 +4274,7 @@ watch(() => entries.value.map(e => ({
   display: flex;
   align-items: center;
   gap: 6px;
-  font-family: "PingFang SC";
+  font-family: var(--app-font-family);
   font-size: 13px;
   font-weight: 500;
   padding: 6px 14px;
@@ -4879,7 +4305,7 @@ watch(() => entries.value.map(e => ({
 .import-form-label {
   display: block;
   margin-bottom: 0;
-  font-family: "PingFang SC";
+  font-family: var(--app-font-family);
   font-size: 14px;
   font-weight: 500;
   color: var(--td-text-color-primary);
@@ -4891,40 +4317,6 @@ watch(() => entries.value.map(e => ({
     color: var(--td-error-color);
     margin-left: 4px;
     font-weight: 600;
-  }
-}
-
-// 单选按钮组样式 - 符合项目主题风格
-:deep(.import-radio-group) {
-  .t-radio-group--filled {
-    background: var(--td-bg-color-secondarycontainer);
-    border-radius: 6px;
-    padding: 2px;
-  }
-  
-  .t-radio-button {
-    font-family: "PingFang SC";
-    font-size: 14px;
-    border-color: var(--td-component-stroke);
-    transition: all 0.2s ease;
-
-    &:hover:not(.t-is-disabled) {
-      border-color: var(--td-brand-color);
-      color: var(--td-brand-color);
-    }
-
-    &.t-is-checked {
-      background: var(--td-brand-color);
-      border-color: var(--td-brand-color);
-      color: var(--td-text-color-anti);
-      font-weight: 500;
-
-      &:hover:not(.t-is-disabled) {
-        background: var(--td-brand-color);
-        border-color: var(--td-brand-color-active);
-        color: var(--td-text-color-anti);
-      }
-    }
   }
 }
 
@@ -4994,20 +4386,20 @@ watch(() => entries.value.map(e => ({
 }
 
 .upload-primary-text {
-  font-family: "PingFang SC";
+  font-family: var(--app-font-family);
   font-size: 14px;
   font-weight: 500;
   color: var(--td-text-color-primary);
 }
 
 .upload-secondary-text {
-  font-family: "PingFang SC";
+  font-family: var(--app-font-family);
   font-size: 12px;
   color: var(--td-text-color-secondary);
 }
 
 .upload-file-name {
-  font-family: "PingFang SC";
+  font-family: var(--app-font-family);
   font-size: 14px;
   font-weight: 500;
   color: var(--td-brand-color);
@@ -5017,7 +4409,7 @@ watch(() => entries.value.map(e => ({
 // 导入表单提示
 .import-form-tip {
   margin-top: 8px;
-  font-family: "PingFang SC";
+  font-family: var(--app-font-family);
   font-size: 12px;
   color: var(--td-text-color-disabled);
   line-height: 18px;
@@ -5047,7 +4439,7 @@ watch(() => entries.value.map(e => ({
 }
 
 .preview-title {
-  font-family: "PingFang SC";
+  font-family: var(--app-font-family);
   font-size: 14px;
   font-weight: 500;
   color: var(--td-text-color-primary);
@@ -5086,14 +4478,14 @@ watch(() => entries.value.map(e => ({
   background: linear-gradient(135deg, var(--td-brand-color) 0%, var(--td-brand-color-active) 100%);
   color: var(--td-text-color-anti);
   border-radius: 4px;
-  font-family: "PingFang SC";
+  font-family: var(--app-font-family);
   font-size: 12px;
   font-weight: 600;
 }
 
 .preview-question {
   flex: 1;
-  font-family: "PingFang SC";
+  font-family: var(--app-font-family);
   font-size: 13px;
   color: var(--td-text-color-primary);
   line-height: 1.5;
@@ -5104,7 +4496,7 @@ watch(() => entries.value.map(e => ({
   margin-top: 8px;
   padding-top: 8px;
   border-top: 1px solid var(--td-component-stroke);
-  font-family: "PingFang SC";
+  font-family: var(--app-font-family);
   font-size: 12px;
   color: var(--td-text-color-secondary);
   text-align: center;
@@ -5127,7 +4519,7 @@ watch(() => entries.value.map(e => ({
   .t-drawer__header {
     padding: 20px 24px;
     border-bottom: 1px solid var(--td-component-stroke);
-    font-family: "PingFang SC";
+    font-family: var(--app-font-family);
     font-size: 18px;
     font-weight: 600;
     color: var(--td-text-color-primary);
@@ -5144,7 +4536,7 @@ watch(() => entries.value.map(e => ({
   overflow-y: auto;
   overflow-x: hidden;
   min-height: 0;
-  
+
   // 自定义滚动条
   &::-webkit-scrollbar {
     width: 6px;
@@ -5191,7 +4583,7 @@ watch(() => entries.value.map(e => ({
   .full-width-textarea {
     flex: 1;
     min-width: 0;
-    
+
     :deep(.t-textarea__inner) {
       min-height: 80px;
     }
@@ -5208,7 +4600,7 @@ watch(() => entries.value.map(e => ({
     height: 32px;
     min-width: 32px;
     padding: 0;
-    font-family: "PingFang SC";
+    font-family: var(--app-font-family);
     transition: all 0.2s ease;
     border-radius: 8px;
   }
@@ -5259,7 +4651,7 @@ watch(() => entries.value.map(e => ({
 .item-count {
   font-size: 13px;
   color: var(--td-text-color-secondary);
-  font-family: "PingFang SC";
+  font-family: var(--app-font-family);
   font-weight: 500;
   text-align: right;
   padding-right: 40px;
@@ -5315,7 +4707,7 @@ watch(() => entries.value.map(e => ({
     font-size: 14px;
     line-height: 1.6;
     color: var(--td-text-color-primary);
-    font-family: "PingFang SC";
+    font-family: var(--app-font-family);
     white-space: pre-wrap;
     word-break: break-word;
     padding: 0;
@@ -5361,7 +4753,7 @@ watch(() => entries.value.map(e => ({
   margin-top: 6px;
   font-size: 12px;
   color: var(--td-text-color-disabled);
-  font-family: "PingFang SC";
+  font-family: var(--app-font-family);
 }
 
 // FAQ编辑器表单样式 - 完全参考设置页面
@@ -5586,7 +4978,7 @@ watch(() => entries.value.map(e => ({
 
 // Input 组件样式 - 与登录页面一致
 :deep(.t-input) {
-  font-family: "PingFang SC";
+  font-family: var(--app-font-family);
   font-size: 14px;
   border: 1px solid var(--td-component-stroke);
   border-radius: 8px;
@@ -5608,7 +5000,7 @@ watch(() => entries.value.map(e => ({
     outline: none !important;
     background: transparent;
     font-size: 14px;
-    font-family: "PingFang SC";
+    font-family: var(--app-font-family);
     padding: 6px 12px;
     color: var(--td-text-color-primary);
 
@@ -5631,7 +5023,7 @@ watch(() => entries.value.map(e => ({
 
 // Textarea 组件样式
 :deep(.t-textarea) {
-  font-family: "PingFang SC";
+  font-family: var(--app-font-family);
   font-size: 14px;
   border: 1px solid var(--td-component-stroke);
   border-radius: 8px;
@@ -5653,7 +5045,7 @@ watch(() => entries.value.map(e => ({
     outline: none !important;
     background: transparent;
     font-size: 14px;
-    font-family: "PingFang SC";
+    font-family: var(--app-font-family);
     line-height: 1.6;
     resize: vertical;
     padding: 6px 12px;
@@ -5668,16 +5060,6 @@ watch(() => entries.value.map(e => ({
     &::placeholder {
       color: var(--td-text-color-placeholder);
     }
-  }
-}
-
-:deep(.t-button--theme-primary) {
-  background-color: var(--td-brand-color);
-  border-color: var(--td-brand-color);
-  
-  &:hover {
-    background-color: var(--td-brand-color-active);
-    border-color: var(--td-brand-color-active);
   }
 }
 
@@ -5732,7 +5114,7 @@ watch(() => entries.value.map(e => ({
   .t-drawer__header {
     padding: 20px 24px;
     border-bottom: 1px solid var(--td-component-stroke);
-    font-family: "PingFang SC";
+    font-family: var(--app-font-family);
     font-size: 18px;
     font-weight: 600;
     color: var(--td-text-color-primary);
@@ -5840,38 +5222,13 @@ watch(() => entries.value.map(e => ({
 :deep(.slider-wrapper .t-slider) {
   flex: 1;
   min-width: 0;
-
-  .t-slider__rail {
-    background: var(--td-bg-color-secondarycontainer);
-    height: 4px;
-    border-radius: 2px;
-  }
-
-  .t-slider__track {
-    background: var(--td-brand-color);
-    height: 4px;
-    border-radius: 2px;
-  }
-
-  .t-slider__button {
-    width: 16px;
-    height: 16px;
-    border: 2px solid var(--td-brand-color);
-    background: var(--td-bg-color-container);
-    box-shadow: var(--td-shadow-1);
-
-    &:hover {
-      border-color: var(--td-brand-color-active);
-      box-shadow: 0 2px 8px rgba(7, 192, 95, 0.2);
-    }
-  }
 }
 
 .slider-value {
   flex-shrink: 0;
   min-width: 50px;
   text-align: right;
-  font-family: "PingFang SC";
+  font-family: var(--app-font-family);
   font-size: 14px;
   font-weight: 500;
   color: var(--td-text-color-primary);
@@ -5883,7 +5240,7 @@ watch(() => entries.value.map(e => ({
 .search-button {
   height: 36px;
   border-radius: 8px;
-  font-family: "PingFang SC";
+  font-family: var(--app-font-family);
   font-size: 14px;
   font-weight: 500;
   transition: all 0.2s ease;
@@ -5915,7 +5272,7 @@ watch(() => entries.value.map(e => ({
   margin-left: 0;
   margin-right: 0;
   padding-left: 0;
-  font-family: "PingFang SC";
+  font-family: var(--app-font-family);
   font-size: 14px;
   font-weight: 600;
   color: var(--td-text-color-primary);
@@ -5933,7 +5290,7 @@ watch(() => entries.value.map(e => ({
   justify-content: center;
   padding: 48px 16px;
   color: var(--td-text-color-secondary);
-  font-family: "PingFang SC";
+  font-family: var(--app-font-family);
   font-size: 14px;
   text-align: center;
   background: var(--td-bg-color-container);
@@ -6010,7 +5367,7 @@ watch(() => entries.value.map(e => ({
 }
 
 .result-question {
-  font-family: "PingFang SC";
+  font-family: var(--app-font-family);
   font-size: 14px;
   font-weight: 600;
   color: var(--td-text-color-primary);
@@ -6075,7 +5432,7 @@ watch(() => entries.value.map(e => ({
   font-size: 12px;
   padding: 4px 8px;
   border-radius: 6px;
-  font-family: "PingFang SC";
+  font-family: var(--app-font-family);
 }
 
 .result-body {
@@ -6091,15 +5448,15 @@ watch(() => entries.value.map(e => ({
 
 // Slide down animation - 优化性能
 .slide-down-enter-active {
-  transition: opacity 0.2s cubic-bezier(0.4, 0, 0.2, 1), 
-              transform 0.2s cubic-bezier(0.4, 0, 0.2, 1);
+  transition: opacity 0.2s cubic-bezier(0.4, 0, 0.2, 1),
+    transform 0.2s cubic-bezier(0.4, 0, 0.2, 1);
   overflow: hidden;
   will-change: opacity, transform;
 }
 
 .slide-down-leave-active {
-  transition: opacity 0.2s cubic-bezier(0.4, 0, 0.2, 1), 
-              transform 0.2s cubic-bezier(0.4, 0, 0.2, 1);
+  transition: opacity 0.2s cubic-bezier(0.4, 0, 0.2, 1),
+    transform 0.2s cubic-bezier(0.4, 0, 0.2, 1);
   overflow: hidden;
   will-change: opacity, transform;
 }
@@ -6130,7 +5487,7 @@ watch(() => entries.value.map(e => ({
   gap: 8px;
 }
 
-// 批量分类弹窗样式 - 与导入对话框风格一致
+// 批量标签弹窗样式 - 与导入对话框风格一致
 .batch-tag-overlay {
   position: fixed;
   inset: 0;
@@ -6258,7 +5615,7 @@ watch(() => entries.value.map(e => ({
 }
 
 .section-label {
-  font-family: "PingFang SC";
+  font-family: var(--app-font-family);
   font-size: 12px;
   font-weight: 600;
   color: var(--td-text-color-secondary);
@@ -6291,6 +5648,3 @@ watch(() => entries.value.map(e => ({
   line-height: 1.4;
 }
 </style>
-
-
-

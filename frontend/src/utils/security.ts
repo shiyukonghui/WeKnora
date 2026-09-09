@@ -3,8 +3,54 @@
  */
 
 import DOMPurify from 'dompurify';
+import { applyProtectedFile, responseFileName, RESOURCE_PREVIEW_EVENT, type LoadedProtectedFile } from './protectedResource.ts';
+import type { Config, NodeHook } from 'dompurify';
+import {
+  domPurifySecurityHooks,
+  domPurifySecurityOptions,
+  markdownDomPurifyConfig,
+  markdownDomPurifySecurityHooks,
+} from './markdownDomPurify.ts';
+import {
+  buildProtectedFileRequest,
+  isProtectedFileProxyPath,
+  isProviderFileURL,
+  PROVIDER_SCHEME_PATTERN,
+  resolveProtectedFileAccess,
+  type ProtectedFileAccessContext,
+} from './protectedFileAccess.ts';
 
 const PROVIDER_IMAGE_PLACEHOLDER = 'data:image/gif;base64,R0lGODlhAQABAIAAAAAAAP///ywAAAAAAQABAAACAUwAOw==';
+const PROVIDER_IMG_SRC_RE = new RegExp(
+  `<img\\b([^>]*?)\\ssrc=(["'])(${PROVIDER_SCHEME_PATTERN}):(?:\\/\\/|&#x2f;&#x2f;|&#47;&#47;)([^"']+)\\2([^>]*)>`,
+  'gi',
+);
+const STORAGE_BACKEND_IMG_SRC_RE = new RegExp(
+  `<img\\b([^>]*?)\\ssrc=(["'])storage:\\/\\/([0-9A-Za-z_-]+)\\/(${PROVIDER_SCHEME_PATTERN}):(?:\\/\\/|&#x2f;&#x2f;|&#47;&#47;)([^"']+)\\2([^>]*)>`,
+  'gi',
+);
+
+type SecurityHooks = {
+  beforeSanitizeElements: NodeHook;
+  afterSanitizeElements: NodeHook;
+};
+
+const DOCUMENT_PREVIEW_IMAGE_ATTRS = ['loading', 'decoding', 'fetchpriority'] as const;
+
+function sanitizeWithSecurityHooks(
+  html: string,
+  config: Config,
+  hooks: SecurityHooks,
+): string {
+  DOMPurify.addHook('beforeSanitizeElements', hooks.beforeSanitizeElements);
+  DOMPurify.addHook('afterSanitizeElements', hooks.afterSanitizeElements);
+  try {
+    return DOMPurify.sanitize(html, config);
+  } finally {
+    DOMPurify.removeHook('afterSanitizeElements', hooks.afterSanitizeElements);
+    DOMPurify.removeHook('beforeSanitizeElements', hooks.beforeSanitizeElements);
+  }
+}
 
 // 配置 DOMPurify 的安全策略
 const DOMPurifyConfig = {
@@ -14,7 +60,7 @@ const DOMPurifyConfig = {
     'h1', 'h2', 'h3', 'h4', 'h5', 'h6',
     'ul', 'ol', 'li', 'blockquote', 'pre', 'code',
     'a', 'img', 'table', 'thead', 'tbody', 'tr', 'th', 'td',
-    'div', 'span', 'figure', 'figcaption', 'think',
+    'div', 'span', 'figure', 'figcaption', 'details', 'summary', 'think', 'button',
     // Mermaid SVG 支持的标签
     'svg', 'g', 'path', 'rect', 'circle', 'ellipse', 'line', 'polygon',
     'polyline', 'text', 'tspan', 'defs', 'marker', 'filter', 'use',
@@ -25,8 +71,10 @@ const DOMPurifyConfig = {
   ],
   // 允许的属性
   ALLOWED_ATTR: [
-    'href', 'title', 'alt', 'src', 'class', 'id', 'style', 'data-protected-src',
-    'target', 'rel', 'width', 'height',
+    'href', 'title', 'alt', 'src', 'class', 'id', 'style', 'data-protected-src', 'data-img-loading',
+    'data-artifact-index', 'data-protected-resource', 'download',
+    'target', 'rel', 'width', 'height', 'open',
+    'type', 'aria-label', 'disabled', 'role', 'tabindex',
     // Mermaid SVG 支持的属性
     'd', 'fill', 'stroke', 'stroke-width', 'stroke-linecap', 'stroke-linejoin',
     'stroke-dasharray', 'stroke-dashoffset', 'stroke-miterlimit', 'stroke-opacity',
@@ -45,54 +93,7 @@ const DOMPurifyConfig = {
     'mathvariant', 'encoding', 'aria-hidden'
   ],
   USE_PROFILES: { html: true, svg: true, mathMl: true },
-  // 允许的协议
-  ALLOWED_URI_REGEXP: /^(?:(?:(?:f|ht)tps?|mailto|tel|callto|cid|xmpp):|(?:local|minio|cos|tos|s3|oss):|[^a-z]|[a-z+.\-]+(?:[^a-z+.\-:]|$))/i,
-  // 禁止的标签和属性
-  FORBID_TAGS: ['script', 'object', 'embed', 'form', 'input', 'button'],
-  FORBID_ATTR: ['onerror', 'onload', 'onclick', 'onmouseover', 'onfocus', 'onblur'],
-  // 其他安全配置
-  KEEP_CONTENT: true,
-  RETURN_DOM: false,
-  RETURN_DOM_FRAGMENT: false,
-  RETURN_DOM_IMPORT: false,
-  SANITIZE_DOM: true,
-  SANITIZE_NAMED_PROPS: true,
-  WHOLE_DOCUMENT: false,
-  // 自定义钩子函数
-  HOOKS: {
-    // 在清理前处理
-    beforeSanitizeElements: (currentNode: Element) => {
-      // 移除所有 script 标签
-      if (currentNode.tagName === 'SCRIPT') {
-        currentNode.remove();
-        return null;
-      }
-      // 移除所有事件处理器
-      const eventAttrs = ['onclick', 'onload', 'onerror', 'onmouseover', 'onfocus', 'onblur'];
-      eventAttrs.forEach(attr => {
-        if (currentNode.hasAttribute(attr)) {
-          currentNode.removeAttribute(attr);
-        }
-      });
-    },
-    // 在清理后处理
-    afterSanitizeElements: (currentNode: Element) => {
-      // 确保所有链接都有 rel="noopener noreferrer"
-      if (currentNode.tagName === 'A') {
-        const href = currentNode.getAttribute('href');
-        if (href && href.startsWith('http')) {
-          currentNode.setAttribute('rel', 'noopener noreferrer');
-          currentNode.setAttribute('target', '_blank');
-        }
-      }
-      // 确保所有图片都有 alt 属性
-      if (currentNode.tagName === 'IMG') {
-        if (!currentNode.getAttribute('alt')) {
-          currentNode.setAttribute('alt', '');
-        }
-      }
-    }
-  }
+  ...domPurifySecurityOptions,
 };
 
 /**
@@ -107,7 +108,11 @@ export function sanitizeHTML(html: string): string {
   
   try {
     const preparedHTML = protectProviderImageSrcInHTML(html);
-    return DOMPurify.sanitize(preparedHTML, DOMPurifyConfig);
+    return sanitizeWithSecurityHooks(
+      preparedHTML,
+      DOMPurifyConfig as unknown as Config,
+      domPurifySecurityHooks,
+    );
   } catch (error) {
     console.error('HTML sanitization failed:', error);
     // 如果清理失败，返回转义的纯文本
@@ -115,23 +120,184 @@ export function sanitizeHTML(html: string): string {
   }
 }
 
-function protectProviderImageSrcInHTML(html: string): string {
+export function applyDocumentPreviewImageAttributes(currentNode: Node): void {
+  if (!('tagName' in currentNode) || !('setAttribute' in currentNode)) return;
+  const element = currentNode as Element;
+  if (element.tagName !== 'IMG') return;
+  element.setAttribute('loading', 'lazy');
+  element.setAttribute('decoding', 'async');
+  element.setAttribute('fetchpriority', 'low');
+}
+
+const documentPreviewDomPurifyConfig = {
+  ...DOMPurifyConfig,
+  ADD_ATTR: [...DOCUMENT_PREVIEW_IMAGE_ATTRS],
+};
+
+const documentPreviewSecurityHooks: SecurityHooks = {
+  beforeSanitizeElements: domPurifySecurityHooks.beforeSanitizeElements,
+  afterSanitizeElements: (currentNode) => {
+    domPurifySecurityHooks.afterSanitizeElements(currentNode);
+    applyDocumentPreviewImageAttributes(currentNode);
+  },
+};
+
+/** Sanitize DocumentPreview Markdown and enforce a single image loading policy. */
+export function sanitizeDocumentPreviewHTML(html: string): string {
+  if (!html || typeof html !== 'string') {
+    return '';
+  }
+
+  try {
+    const preparedHTML = protectProviderImageSrcInHTML(html);
+    return sanitizeWithSecurityHooks(
+      preparedHTML,
+      documentPreviewDomPurifyConfig as unknown as Config,
+      documentPreviewSecurityHooks,
+    );
+  } catch (error) {
+    console.error('Document preview HTML sanitization failed:', error);
+    return escapeHTML(html);
+  }
+}
+
+/** Sanitize assistant markdown HTML (code/mermaid toolbars, KaTeX, SVG). */
+export function sanitizeMarkdownHTML(html: string): string {
+  if (!html || typeof html !== 'string') {
+    return '';
+  }
+
+  try {
+    const preparedHTML = protectProviderImageSrcInHTML(html);
+    return sanitizeWithSecurityHooks(
+      preparedHTML,
+      markdownDomPurifyConfig as unknown as Config,
+      markdownDomPurifySecurityHooks,
+    );
+  } catch (error) {
+    console.error('Markdown HTML sanitization failed:', error);
+    return escapeHTML(html);
+  }
+}
+
+function isRasterProtectedImage(file: LoadedProtectedFile): boolean {
+  return file.blob.type.startsWith('image/') && !file.blob.type.includes('svg');
+}
+
+function imageAltFromTag(before: string, after: string): string {
+  const match = `${before} ${after}`.match(/\salt=(["'])(.*?)\1/i);
+  return match?.[2] ?? '';
+}
+
+function escapeAttr(value: string): string {
+  return value
+    .replace(/&/g, '&amp;')
+    .replace(/"/g, '&quot;')
+    .replace(/'/g, '&#x27;')
+    .replace(/</g, '&lt;');
+}
+
+function buildProtectedFileCardTag(file: LoadedProtectedFile, source: string, alt: string): string {
+  const name = file.fileName || alt || 'download';
+  const label = alt || name;
+  return `<a href="${escapeAttr(file.blobURL)}" download="${escapeAttr(name)}" class="protected-resource-card" data-protected-resource="${escapeAttr(source)}" title="${escapeAttr(name)}">${escapeHTML(label)}</a>`;
+}
+
+function buildProtectedImageTag(
+  before: string,
+  quote: string,
+  protectedSrc: string,
+  after: string,
+): string {
+  // A definitive 404 should not leave a skeleton behind. Streaming
+  // re-renders call this function repeatedly, so remember the missing
+  // source until the explicit end-of-stream retry clears the cache.
+  if (protectedFileMissingSources.has(protectedSrc)) {
+    return '';
+  }
+  // Reuse the already-hydrated file if we have one, so repeated re-renders
+  // (typewriter streaming) keep the same stable image or download card
+  // instead of flashing back to the placeholder every frame.
+  const cached = protectedFileBySource.get(protectedSrc);
+  if (cached) {
+    if (isRasterProtectedImage(cached)) {
+      return `<img${before} src=${quote}${cached.blobURL}${quote} data-protected-src=${quote}${protectedSrc}${quote}${after}>`;
+    }
+    return buildProtectedFileCardTag(cached, protectedSrc, imageAltFromTag(before, after));
+  }
+  // Not hydrated yet: render the 1x1 placeholder but tag it so CSS can give
+  // it a stable skeleton box. Otherwise width:auto/height:auto collapse the
+  // 1x1 gif to a ~1px line that violently jumps to full size once loaded.
+  return `<img${before} src=${quote}${PROVIDER_IMAGE_PLACEHOLDER}${quote} data-protected-src=${quote}${protectedSrc}${quote} data-img-loading=${quote}1${quote}${after}>`;
+}
+
+export function protectProviderImageSrcInHTML(html: string): string {
   if (!html) return html;
-  const decodeProviderURL = (raw: string): string =>
-    raw
-      .replace(/&#x2f;/gi, '/')
-      .replace(/&#47;/g, '/')
-      .replace(/&amp;/g, '&')
-      .replace(/&quot;/g, '"');
-  return html.replace(
-    /<img\b([^>]*?)\ssrc=(["'])(local|minio|cos|tos|s3|oss):(?:\/\/|&#x2f;&#x2f;|&#47;&#47;)([^"']+)\2([^>]*)>/gi,
+  const withProviderImages = html.replace(
+    PROVIDER_IMG_SRC_RE,
     (_m, before, quote, provider, restPathRaw, after) => {
       const restPath = decodeProviderURL(restPathRaw);
-      const protectedSrc = `${provider}://${restPath}`;
-      const fileProxyURL = `/files?${new URLSearchParams({ file_path: protectedSrc }).toString()}`;
-      return `<img${before} src=${quote}${fileProxyURL}${quote} data-protected-src=${quote}${protectedSrc}${quote}${after}>`;
+      return buildProtectedImageTag(before, quote, `${provider}://${restPath}`, after);
     },
   );
+  return withProviderImages.replace(
+    STORAGE_BACKEND_IMG_SRC_RE,
+    (_m, before, quote, backendID, provider, restPathRaw, after) => {
+      const restPath = decodeProviderURL(restPathRaw);
+      return buildProtectedImageTag(
+        before,
+        quote,
+        `storage://${backendID}/${provider}://${restPath}`,
+        after,
+      );
+    },
+  );
+}
+
+function decodeProviderURL(raw: string): string {
+  return raw
+    .trim()
+    .replace(/&#x2f;/gi, '/')
+    .replace(/&#47;/g, '/')
+    .replace(/&amp;/g, '&')
+    .replace(/&quot;/g, '"');
+}
+
+function providerSourceFromImageSrc(src: string): string | null {
+  const decodedSrc = decodeProviderURL(src);
+  if (isProviderFileURL(decodedSrc)) {
+    return decodedSrc;
+  }
+
+  try {
+    const baseURL = typeof window !== 'undefined' ? window.location.origin : 'http://localhost';
+    const url = new URL(decodedSrc, baseURL);
+    if (!isProtectedFileProxyPath(url.pathname)) {
+      return null;
+    }
+
+    const filePath = (url.searchParams.get('file_path') || '').trim();
+    return isProviderFileURL(filePath) ? filePath : null;
+  } catch {
+    return null;
+  }
+}
+
+function normalizeProtectedImageElement(img: HTMLImageElement): string | null {
+  const protectedSrc = providerSourceFromImageSrc(
+    img.getAttribute('data-protected-src') || '',
+  );
+  const src = img.getAttribute('src') || '';
+  const sourceURL = protectedSrc || providerSourceFromImageSrc(src);
+  if (!sourceURL) {
+    return null;
+  }
+
+  img.setAttribute('data-protected-src', sourceURL);
+  if (!src.trim().startsWith('blob:')) {
+    img.setAttribute('src', PROVIDER_IMAGE_PLACEHOLDER);
+  }
+  return sourceURL;
 }
 
 /**
@@ -178,7 +344,7 @@ export function isValidURL(url: string): boolean {
   }
 
   // 允许 provider:// 形式，由前端后续鉴权拉取并替换为 blob URL
-  if (/^(local|minio|cos|tos|s3|oss):\/\/\S+$/i.test(trimmed)) {
+  if (isProviderFileURL(trimmed)) {
     return true;
   }
   
@@ -265,99 +431,246 @@ export function createSafeImage(src: string, alt: string = '', title: string = '
   return `<img src="${safeSrc}" alt="${safeAlt}" title="${safeTitle}" class="markdown-image" style="max-width: 100%; height: auto;">`;
 }
 
-const protectedFileBlobCache = new Map<string, string>();
+type ProtectedFileLoadResult =
+  | ({ status: 'loaded' } & LoadedProtectedFile)
+  | { status: 'missing' }
+  | { status: 'failed' };
 
-function getProtectedFileRequestHeaders(): Record<string, string> {
-  const headers: Record<string, string> = {};
-  try {
-    const token = (localStorage.getItem('weknora_token') || '').trim();
-    if (token) {
-      headers['Authorization'] = `Bearer ${token}`;
-    }
+type ProtectedFileCacheState = {
+  blobByRequest: Map<string, LoadedProtectedFile>;
+  fileBySource: Map<string, LoadedProtectedFile>;
+  missingSources: Set<string>;
+  failures: Map<string, number>;
+  inflight: Map<string, Promise<ProtectedFileLoadResult>>;
+};
 
-    const selectedTenantId = (localStorage.getItem('weknora_selected_tenant_id') || '').trim();
-    const tenantRaw = localStorage.getItem('weknora_tenant');
-    if (selectedTenantId) {
-      try {
-        const tenant = tenantRaw ? JSON.parse(tenantRaw) : null;
-        const defaultTenantId = tenant?.id ? String(tenant.id) : '';
-        if (selectedTenantId !== defaultTenantId) {
-          headers['X-Tenant-ID'] = selectedTenantId;
-        }
-      } catch {
-        // ignore tenant parse error and skip X-Tenant-ID
-      }
-    }
-  } catch {
-    // ignore localStorage read errors
-  }
-  return headers;
-}
+// Keep object URLs alive across Vite hot updates. A hot update replaces this
+// module but not the page document, so module-local Maps would forget valid
+// blob URLs and make already-loaded images fall back to the 1x1 placeholder.
+const protectedFileCacheState = (() => {
+  const fresh = (): ProtectedFileCacheState => ({
+    blobByRequest: new Map(),
+    fileBySource: new Map(),
+    missingSources: new Set(),
+    failures: new Map(),
+    inflight: new Map(),
+  });
+  if (typeof window === 'undefined') return fresh();
+  const scope = window as typeof window & {
+    __weknoraProtectedFileCacheV3__?: ProtectedFileCacheState;
+  };
+  scope.__weknoraProtectedFileCacheV3__ ||= fresh();
+  return scope.__weknoraProtectedFileCacheV3__;
+})();
+
+const protectedFileBlobCache = protectedFileCacheState.blobByRequest;
+// File keyed by the protected source URL (e.g. `resource://...`). Once an
+// image or download card has been hydrated, re-renders of the same markdown
+// can emit the blob src / card HTML directly instead of the placeholder.
+const protectedFileBySource = protectedFileCacheState.fileBySource;
+const protectedFileMissingSources = protectedFileCacheState.missingSources;
+// Throttle retries of failed file fetches. During streaming the same markdown
+// is re-rendered on every chunk, producing brand-new <img> elements (so the
+// per-element `authHydrated` flag is reset each time). Without throttling a
+// not-yet-generated file (404) would be re-requested on every chunk. We record
+// the last failure time per URL and skip re-fetching within a cooldown window,
+// while still allowing a later attempt once the file becomes available.
+const protectedFileFailureCache = protectedFileCacheState.failures;
+const protectedFileInflight = protectedFileCacheState.inflight;
+const PROTECTED_FILE_RETRY_COOLDOWN_MS = 5000;
 
 /**
  * 将 Markdown 里通过 /files 代理的图片，改为用带鉴权 Header 的 fetch 拉取后再显示。
  * 用于避免在 URL 中暴露 token。
  */
-export async function hydrateProtectedFileImages(root: ParentNode | null | undefined): Promise<void> {
+/**
+ * 清除失败重试冷却记录。在流式结束等场景调用，让此前因文件尚未生成而 404
+ * 的图片可以立即重新尝试加载，而无需等待冷却窗口结束。
+ */
+export function clearProtectedFileFailureCache(): void {
+  protectedFileFailureCache.clear();
+  protectedFileMissingSources.clear();
+}
+
+function protectedImageSource(img: HTMLImageElement): string {
+  return normalizeProtectedImageElement(img)
+    || (img.getAttribute('data-protected-src') || '').trim()
+    || (img.getAttribute('src') || '').trim();
+}
+
+function forEachProtectedImageWithSource(
+  root: ParentNode,
+  sourceURL: string,
+  callback: (img: HTMLImageElement) => void,
+): void {
+  root.querySelectorAll<HTMLImageElement>('img[data-protected-src]').forEach((candidate) => {
+    if (protectedImageSource(candidate) === sourceURL) callback(candidate);
+  });
+}
+
+function removeMissingProtectedImages(root: ParentNode, sourceURL: string): void {
+  forEachProtectedImageWithSource(root, sourceURL, (img) => {
+    const parent = img.parentElement;
+    img.remove();
+    // Markdown emits a dedicated paragraph for a standalone image. Remove that
+    // wrapper too so a missing image leaves no vertical placeholder/gap.
+    if (parent?.tagName === 'P' && !parent.textContent?.trim() && parent.children.length === 0) {
+      parent.remove();
+    }
+  });
+}
+
+function applyHydratedProtectedImage(root: ParentNode, sourceURL: string, file: LoadedProtectedFile): void {
+  forEachProtectedImageWithSource(root, sourceURL, (img) => {
+    if (!isRasterProtectedImage(file)) {
+      applyProtectedFile(img, file, sourceURL);
+      return;
+    }
+    img.src = file.blobURL;
+    img.dataset.authHydrated = '1';
+    img.removeAttribute('data-img-loading');
+  });
+}
+
+function ensureProtectedResourceCardClicks(): void {
+  if (typeof window === 'undefined') return;
+  const scope = window as typeof window & { __weknoraProtectedCardClicks__?: boolean };
+  if (scope.__weknoraProtectedCardClicks__) return;
+  scope.__weknoraProtectedCardClicks__ = true;
+  window.addEventListener('click', (event) => {
+    const target = event.target as Element | null;
+    const link = target?.closest?.('a.protected-resource-card');
+    if (!(link instanceof HTMLAnchorElement)) return;
+    if (event.ctrlKey || event.metaKey || event.shiftKey || event.altKey) return;
+    const source = link.dataset.protectedResource || '';
+    const file = protectedFileBySource.get(source);
+    if (!file) return;
+    const preview = new CustomEvent(RESOURCE_PREVIEW_EVENT, {
+      detail: file,
+      cancelable: true,
+    });
+    if (!window.dispatchEvent(preview)) event.preventDefault();
+    event.stopPropagation();
+  }, true);
+}
+
+/**
+ * 将内容里的受保护图片（resource:// 等）通过对应的文件代理带鉴权拉取，
+ * 再以 blob URL 替换显示。
+ *
+ * 走哪条代理由 {@link resolveProtectedFileAccess} 决定：应用入口注册的默认
+ * 上下文（如嵌入应用的 Embed 平面）优先，组件只在同一鉴权平面内用
+ * `access` 细化作用域（如知识库）。
+ */
+export async function hydrateProtectedFileImages(
+  root: ParentNode | null | undefined,
+  access?: ProtectedFileAccessContext,
+): Promise<void> {
   if (!root || typeof window === 'undefined') {
     return;
   }
 
+  ensureProtectedResourceCardClicks();
+
   const images = root.querySelectorAll<HTMLImageElement>(
-    'img[data-protected-src], img[src^="local://"], img[src^="minio://"], img[src^="cos://"], img[src^="tos://"], img[src^="s3://"], img[src^="oss://"]',
+    'img[data-protected-src], img[src^="resource://"], img[src^="storage://"], img[src^="local://"], img[src^="minio://"], img[src^="cos://"], img[src^="tos://"], img[src^="s3://"], img[src^="oss://"], img[src^="ks3://"], img[src^="obs://"]',
   );
   if (!images.length) {
     return;
   }
 
-  const headers = getProtectedFileRequestHeaders();
+  const resolvedAccess = resolveProtectedFileAccess(access);
 
   await Promise.all(Array.from(images).map(async (img) => {
+    const normalizedSourceURL = normalizeProtectedImageElement(img);
     const protectedSrc = (img.getAttribute('data-protected-src') || '').trim();
     const src = (img.getAttribute('src') || '').trim();
-    const sourceURL = protectedSrc || src;
+    const sourceURL = normalizedSourceURL || protectedSrc || src;
     if (!sourceURL) {
       return;
     }
     if (img.dataset.authHydrated === '1') {
       return;
     }
+    if (protectedFileMissingSources.has(sourceURL)) {
+      removeMissingProtectedImages(root, sourceURL);
+      return;
+    }
     img.dataset.authHydrated = '1';
 
-    const isProviderScheme = /^(local|minio|cos|tos|s3|oss):\/\//.test(sourceURL);
-    const requestURL = isProviderScheme
-      ? `/files?${new URLSearchParams({ file_path: sourceURL }).toString()}`
-      : sourceURL;
+    // A null request means this source cannot be fetched under the current
+    // access context (not a storage path, or the embed token has not arrived
+    // yet). Leave the placeholder so a later pass can retry.
+    const request = buildProtectedFileRequest(sourceURL, resolvedAccess);
+    if (!request) {
+      img.dataset.authHydrated = '0';
+      return;
+    }
+    const { url: requestURL, headers } = request;
+    const requestKey = JSON.stringify([requestURL, headers]);
 
-    if (!requestURL.startsWith('/files?') || !requestURL.includes('file_path=')) {
+    const cachedBlobURL = protectedFileBlobCache.get(requestKey);
+    if (cachedBlobURL) {
+      applyHydratedProtectedImage(root, sourceURL, cachedBlobURL);
+      return;
+    }
+
+    const lastFailure = protectedFileFailureCache.get(requestKey);
+    if (lastFailure !== undefined && Date.now() - lastFailure < PROTECTED_FILE_RETRY_COOLDOWN_MS) {
       img.dataset.authHydrated = '0';
       return;
     }
 
-    const cachedBlobURL = protectedFileBlobCache.get(requestURL);
-    if (cachedBlobURL) {
-      img.src = cachedBlobURL;
-      return;
+    // Every component that references the same image awaits the shared task.
+    // The previous Set-based de-dupe made later components return immediately;
+    // only the component that started the fetch was updated, leaving all other
+    // occurrences stuck on the transparent placeholder forever.
+    let loadTask = protectedFileInflight.get(requestKey);
+    if (!loadTask) {
+      loadTask = (async (): Promise<ProtectedFileLoadResult> => {
+        try {
+          const resp = await fetch(requestURL, {
+            method: 'GET',
+            headers,
+            credentials: 'include',
+          });
+          if (!resp.ok) {
+            if (resp.status === 404) {
+              protectedFileFailureCache.set(requestKey, Date.now());
+              return { status: 'missing' };
+            }
+            throw new Error(`HTTP ${resp.status}`);
+          }
+          const blob = await resp.blob();
+          const blobURL = URL.createObjectURL(blob);
+          const file = { blobURL, blob, fileName: responseFileName(resp.headers.get("Content-Disposition"), sourceURL) };
+          protectedFileBlobCache.set(requestKey, file);
+          protectedFileFailureCache.delete(requestKey);
+          return { status: 'loaded', ...file };
+        } catch (error) {
+          console.warn('[security] hydrateProtectedFileImages failed:', error);
+          protectedFileFailureCache.set(requestKey, Date.now());
+          return { status: 'failed' };
+        } finally {
+          protectedFileInflight.delete(requestKey);
+        }
+      })();
+      protectedFileInflight.set(requestKey, loadTask);
     }
 
-    try {
-      const resp = await fetch(requestURL, {
-        method: 'GET',
-        headers,
-        credentials: 'include',
-      });
-      if (!resp.ok) {
-        throw new Error(`HTTP ${resp.status}`);
-      }
-      const blob = await resp.blob();
-      const blobURL = URL.createObjectURL(blob);
-      protectedFileBlobCache.set(requestURL, blobURL);
-      img.src = blobURL;
-      if (protectedSrc) {
-        img.removeAttribute('data-protected-src');
-      }
-    } catch (error) {
-      console.warn('[security] hydrateProtectedFileImages failed:', error);
+    const result = await loadTask;
+    if (result.status === 'loaded') {
+      protectedFileBySource.set(sourceURL, result);
+      protectedFileMissingSources.delete(sourceURL);
+      applyHydratedProtectedImage(root, sourceURL, result);
+      return;
+    }
+    if (result.status === 'missing') {
+      protectedFileMissingSources.add(sourceURL);
+      removeMissingProtectedImages(root, sourceURL);
+      return;
+    }
+    if (result.status === 'failed') {
       img.dataset.authHydrated = '0';
     }
   }));

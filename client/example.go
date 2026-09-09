@@ -21,11 +21,18 @@ import (
 // - Cleaning up resources
 func ExampleUsage() {
 	// Create a client instance
+	tenantID := uint64(10000) // default tenant for all requests from this client
 	apiClient := NewClient(
 		"http://localhost:8080",
 		WithToken("your-auth-token"),
 		WithTimeout(30*time.Second),
+		WithTenantID(tenantID), // default tenant for all requests from this client
 	)
+
+	// Per-request tenant override example:
+	// You can override the tenant for a single request by setting the "TenantID" value in the context.
+	// e.g. ctx := context.WithValue(context.Background(), "TenantID", &tenantID)
+	// then pass `ctx` to any client method to use tenant 2 for that request only.
 
 	// 1. Create a knowledge base
 	fmt.Println("1. Creating knowledge base...")
@@ -64,7 +71,7 @@ func ExampleUsage() {
 			"source": "local",
 			"type":   "document",
 		}
-		knowledge, err := apiClient.CreateKnowledgeFromFile(context.Background(), createdKB.ID, filePath, metadata, nil, "", "")
+		knowledge, err := apiClient.CreateKnowledgeFromFile(context.Background(), createdKB.ID, filePath, metadata, nil, "", "", nil)
 		if err != nil {
 			fmt.Printf("Failed to upload knowledge file: %v\n", err)
 		} else {
@@ -83,8 +90,8 @@ func ExampleUsage() {
 	fmt.Println("\n3. Creating model...")
 	modelRequest := &CreateModelRequest{
 		Name:        "Test Model",
-		Type:        ModelTypeChat,
-		Source:      ModelSourceInternal,
+		Type:        ModelTypeKnowledgeQA,
+		Source:      ModelSourceLocal,
 		Description: "This is a test model",
 		Parameters: ModelParameters{
 			"temperature": 0.7,

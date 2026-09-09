@@ -3,11 +3,10 @@ package qdrant
 import (
 	"context"
 	"fmt"
-	"maps"
-	"slices"
 	"strings"
 	"unicode/utf8"
 
+	"github.com/Tencent/WeKnora/internal/common"
 	"github.com/Tencent/WeKnora/internal/logger"
 	"github.com/Tencent/WeKnora/internal/types"
 	"github.com/Tencent/WeKnora/internal/types/interfaces"
@@ -196,7 +195,7 @@ func (q *qdrantRepository) Save(ctx context.Context,
 	})
 	if err != nil {
 		log.Errorf("[Qdrant] Failed to save index: %v", err)
-		return err
+		return fmt.Errorf("failed to save index for chunk ID %s: %w", embedding.ChunkID, err)
 	}
 
 	log.Infof("[Qdrant] Successfully saved index for chunk ID: %s, point ID: %s", embedding.ChunkID, pointID)
@@ -242,19 +241,28 @@ func (q *qdrantRepository) BatchSave(ctx context.Context,
 
 	// Save points to each dimension-specific collection
 	totalSaved := 0
+	const batchSize = 100
 	for dimension, points := range pointsByDimension {
 		if err := q.ensureCollection(ctx, dimension); err != nil {
 			return err
 		}
 
 		collectionName := q.getCollectionName(dimension)
-		_, err := q.client.Upsert(ctx, &qdrant.UpsertPoints{
-			CollectionName: collectionName,
-			Points:         points,
-		})
-		if err != nil {
-			log.Errorf("[Qdrant] Failed to execute batch operation for dimension %d: %v", dimension, err)
-			return fmt.Errorf("failed to batch save (dimension %d): %w", dimension, err)
+
+		for i := 0; i < len(points); i += batchSize {
+			end := i + batchSize
+			if end > len(points) {
+				end = len(points)
+			}
+			batch := points[i:end]
+
+			_, err := q.client.Upsert(ctx, &qdrant.UpsertPoints{
+				CollectionName: collectionName,
+				Points:         batch,
+			})
+			if err != nil {
+				return fmt.Errorf("failed to upsert batch: %w", err)
+			}
 		}
 		totalSaved += len(points)
 		log.Infof("[Qdrant] Saved %d points to collection %s", len(points), collectionName)
@@ -394,7 +402,7 @@ func (q *qdrantRepository) BatchUpdateChunkEnabledStatus(ctx context.Context, ch
 		if len(enabledChunkIDs) > 0 {
 			_, err := q.client.SetPayload(ctx, &qdrant.SetPayloadPoints{
 				CollectionName: collectionName,
-				Payload:        qdrant.NewValueMap(map[string]any{fieldIsEnabled: true}),
+				Payload:        newQdrantValueMap(map[string]any{fieldIsEnabled: true}),
 				PointsSelector: qdrant.NewPointsSelectorFilter(&qdrant.Filter{
 					Must: []*qdrant.Condition{
 						qdrant.NewMatchKeywords(fieldChunkID, enabledChunkIDs...),
@@ -410,7 +418,7 @@ func (q *qdrantRepository) BatchUpdateChunkEnabledStatus(ctx context.Context, ch
 		if len(disabledChunkIDs) > 0 {
 			_, err := q.client.SetPayload(ctx, &qdrant.SetPayloadPoints{
 				CollectionName: collectionName,
-				Payload:        qdrant.NewValueMap(map[string]any{fieldIsEnabled: false}),
+				Payload:        newQdrantValueMap(map[string]any{fieldIsEnabled: false}),
 				PointsSelector: qdrant.NewPointsSelectorFilter(&qdrant.Filter{
 					Must: []*qdrant.Condition{
 						qdrant.NewMatchKeywords(fieldChunkID, disabledChunkIDs...),
@@ -462,7 +470,7 @@ func (q *qdrantRepository) BatchUpdateChunkTagID(ctx context.Context, chunkTagMa
 		for tagID, chunkIDs := range tagGroups {
 			_, err := q.client.SetPayload(ctx, &qdrant.SetPayloadPoints{
 				CollectionName: collectionName,
-				Payload:        qdrant.NewValueMap(map[string]any{fieldTagID: tagID}),
+				Payload:        newQdrantValueMap(map[string]any{fieldTagID: tagID}),
 				PointsSelector: qdrant.NewPointsSelectorFilter(&qdrant.Filter{
 					Must: []*qdrant.Condition{
 						qdrant.NewMatchKeywords(fieldChunkID, chunkIDs...),
@@ -801,7 +809,7 @@ func (q *qdrantRepository) CopyIndices(ctx context.Context,
 			if v, ok := payload[fieldIsEnabled]; ok {
 				isEnabled = v.GetBoolValue()
 			}
-			newPayload := qdrant.NewValueMap(map[string]any{
+			newPayload := newQdrantValueMap(map[string]any{
 				fieldContent:         payload[fieldContent].GetStringValue(),
 				fieldSourceID:        targetSourceID,
 				fieldSourceType:      payload[fieldSourceType].GetIntegerValue(),
@@ -840,7 +848,7 @@ func (q *qdrantRepository) CopyIndices(ctx context.Context,
 			})
 			if err != nil {
 				log.Errorf("[Qdrant] Failed to batch upsert target points: %v", err)
-				return err
+				return fmt.Errorf("failed to batch upsert target points during copy: %w", err)
 			}
 
 			totalCopied += len(targetPoints)
@@ -872,7 +880,20 @@ func createPayload(embedding *QdrantVectorEmbedding) map[string]*qdrant.Value {
 		fieldTagID:           embedding.TagID,
 		fieldIsEnabled:       embedding.IsEnabled,
 	}
-	return qdrant.NewValueMap(payload)
+	return newQdrantValueMap(payload)
+}
+
+func newQdrantValueMap(payload map[string]any) map[string]*qdrant.Value {
+	sanitizedPayload := make(map[string]any, len(payload))
+	for key, value := range payload {
+		if stringValue, ok := value.(string); ok {
+			if strings.IndexByte(stringValue, 0) != -1 || !utf8.ValidString(stringValue) {
+				value = common.CleanInvalidUTF8(stringValue)
+			}
+		}
+		sanitizedPayload[key] = value
+	}
+	return qdrant.NewValueMap(sanitizedPayload)
 }
 
 func buildRetrieveResult(results []*types.IndexWithScore, retrieverType types.RetrieverType) []*types.RetrieveResult {
@@ -931,9 +952,11 @@ func toQdrantVectorEmbedding(embedding *types.IndexInfo, additionalParams map[st
 		TagID:           embedding.TagID,
 		IsEnabled:       embedding.IsEnabled,
 	}
-	if additionalParams != nil && slices.Contains(slices.Collect(maps.Keys(additionalParams)), fieldEmbedding) {
-		if embeddingMap, ok := additionalParams[fieldEmbedding].(map[string][]float32); ok {
-			vector.Embedding = embeddingMap[embedding.SourceID]
+	if additionalParams != nil {
+		if val, exists := additionalParams[fieldEmbedding]; exists {
+			if embeddingMap, ok := val.(map[string][]float32); ok {
+				vector.Embedding = embeddingMap[embedding.SourceID]
+			}
 		}
 	}
 	return vector

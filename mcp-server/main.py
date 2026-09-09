@@ -7,6 +7,10 @@ WeKnora MCP Server 主入口点
 1. python main.py
 2. python -m weknora_mcp_server
 3. weknora-mcp-server (安装后)
+
+注意：在 stdio 传输下，stdout 是 JSON-RPC 通道，所有诊断/提示信息必须写入
+stderr，否则会破坏 MCP 协议流导致客户端判定"启动失败"。本文件所有 print
+均通过 stderr 输出。
 """
 
 import argparse
@@ -32,8 +36,8 @@ def check_dependencies():
 
         return True
     except ImportError as e:
-        print(f"缺少依赖: {e}")
-        print("请运行: pip install -r requirements.txt")
+        print(f"缺少依赖: {e}", file=sys.stderr)
+        print("请运行: pip install -r requirements.txt", file=sys.stderr)
         return False
 
 
@@ -42,17 +46,17 @@ def check_environment_variables():
     base_url = os.getenv("WEKNORA_BASE_URL")
     api_key = os.getenv("WEKNORA_API_KEY")
 
-    print("=== WeKnora MCP Server 环境检查 ===")
-    print(f"Base URL: {base_url or 'http://localhost:8080/api/v1 (默认)'}")
-    print(f"API Key: {'已设置' if api_key else '未设置 (警告)'}")
+    print("=== WeKnora MCP Server 环境检查 ===", file=sys.stderr)
+    print(f"Base URL: {base_url or 'http://localhost:8080/api/v1 (默认)'}", file=sys.stderr)
+    print(f"API Key: {'已设置' if api_key else '未设置 (警告)'}", file=sys.stderr)
 
     if not base_url:
-        print("提示: 可以设置 WEKNORA_BASE_URL 环境变量")
+        print("提示: 可以设置 WEKNORA_BASE_URL 环境变量", file=sys.stderr)
 
     if not api_key:
-        print("警告: 建议设置 WEKNORA_API_KEY 环境变量")
+        print("警告: 建议设置 WEKNORA_API_KEY 环境变量", file=sys.stderr)
 
-    print("=" * 40)
+    print("=" * 40, file=sys.stderr)
     return True
 
 
@@ -68,8 +72,9 @@ def parse_arguments():
   python main.py --verbose          # 启用详细日志
   
 环境变量:
-  WEKNORA_BASE_URL    WeKnora API 基础 URL (默认: http://localhost:8080/api/v1)
-  WEKNORA_API_KEY     WeKnora API 密钥
+  WEKNORA_BASE_URL       WeKnora API 基础 URL (默认: http://localhost:8080/api/v1)
+  WEKNORA_API_KEY        WeKnora API 密钥
+  MCP_SERVER_AUTH_TOKEN  SSE/HTTP 传输必填，客户端通过 Authorization: Bearer 传递
         """,
     )
 
@@ -80,7 +85,25 @@ def parse_arguments():
     parser.add_argument("--verbose", "-v", action="store_true", help="启用详细日志输出")
 
     parser.add_argument(
-        "--version", action="version", version="WeKnora MCP Server 1.0.0"
+        "--version", action="version", version="WeKnora MCP Server 1.1.1"
+    )
+
+    parser.add_argument(
+        "--transport",
+        choices=["stdio", "sse", "http"],
+        default=os.getenv("MCP_TRANSPORT", "stdio"),
+        help="Transport type: stdio (default), sse, or http",
+    )
+    parser.add_argument(
+        "--host",
+        default=os.getenv("MCP_HOST", "127.0.0.1"),
+        help="Bind host for network transports (default: 127.0.0.1)",
+    )
+    parser.add_argument(
+        "--port",
+        type=int,
+        default=int(os.getenv("MCP_PORT", "8000")),
+        help="Bind port for network transports (default: 8000)",
     )
 
     return parser.parse_args()
@@ -102,7 +125,7 @@ async def main():
 
     # 如果只是检查环境，则退出
     if args.check_only:
-        print("环境检查完成。")
+        print("环境检查完成。", file=sys.stderr)
         return
 
     # 设置日志级别
@@ -110,24 +133,35 @@ async def main():
         import logging
 
         logging.basicConfig(level=logging.DEBUG)
-        print("已启用详细日志模式")
+        print("已启用详细日志模式", file=sys.stderr)
 
     try:
-        print("正在启动 WeKnora MCP Server...")
+        print(f"正在启动 WeKnora MCP Server (transport={args.transport})...", file=sys.stderr)
 
-        # 导入并运行服务器
-        from weknora_mcp_server import run
+        from weknora_mcp_server import run_stdio, run_sse, run_http
 
-        await run()
+        # Select transport mode based on CLI argument or MCP_TRANSPORT env var
+        # - stdio: Default, used by VS Code Copilot for local integration
+        # - sse: Server-Sent Events over HTTP, suitable for cloud/remote deployments
+        # - http: Streamable HTTP sessions (MCP 2025-03-26 spec), compatible with REST clients
+        if args.transport == "stdio":
+            # Stdio mode: communication via stdin/stdout pipes (typical for CLI integrations)
+            await run_stdio()
+        elif args.transport == "sse":
+            # SSE mode: HTTP server with Server-Sent Events for bidirectional streaming
+            await run_sse(args.host, args.port)
+        elif args.transport == "http":
+            # HTTP mode: HTTP REST server with request/response model
+            await run_http(args.host, args.port)
 
     except ImportError as e:
-        print(f"导入错误: {e}")
-        print("请确保所有文件都在正确的位置")
+        print(f"导入错误: {e}", file=sys.stderr)
+        print("请确保所有文件都在正确的位置", file=sys.stderr)
         sys.exit(1)
     except KeyboardInterrupt:
-        print("\n服务器已停止")
+        print("\n服务器已停止", file=sys.stderr)
     except Exception as e:
-        print(f"服务器运行错误: {e}")
+        print(f"服务器运行错误: {e}", file=sys.stderr)
         if args.verbose:
             import traceback
 

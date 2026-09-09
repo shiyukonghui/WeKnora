@@ -2,10 +2,15 @@ package session
 
 import (
 	"context"
+	"encoding/json"
 	"fmt"
+	"strings"
 	"sync"
 	"time"
 
+	"github.com/Tencent/WeKnora/internal/agent/skills"
+	agenttools "github.com/Tencent/WeKnora/internal/agent/tools"
+	"github.com/Tencent/WeKnora/internal/application/service"
 	"github.com/Tencent/WeKnora/internal/event"
 	"github.com/Tencent/WeKnora/internal/logger"
 	"github.com/Tencent/WeKnora/internal/types"
@@ -18,36 +23,85 @@ import (
 type AgentStreamHandler struct {
 	ctx                context.Context
 	sessionID          string
+	tenantID           uint64 // Tenant that owns this session; used when persisting skill artifacts.
 	assistantMessageID string
 	requestID          string
+	receivedAt         time.Time // Handler entry timestamp, used for TTFB logging
+	ttfbLogged         bool      // Guards one-shot TTFB log on first answer chunk
 	assistantMessage   *types.Message
 	streamManager      interfaces.StreamManager
 
 	eventBus *event.EventBus
 
+	// artifactCollector drains skill-generated files from the session
+	// sandbox after the agent completes. Nil when the sandbox backend
+	// doesn't support artifact collection or WeKnora was built without it.
+	artifactCollector *service.ArtifactCollector
+
 	// State tracking
 	knowledgeRefs   []*types.SearchResult
 	finalAnswer     string
+	answerSegments  []*answerSegment     // Per-answer-event-ID accumulation, so superseded preambles can be dropped
 	eventStartTimes map[string]time.Time // Track start time for duration calculation
 	mu              sync.Mutex
+}
+
+// answerSegment accumulates the streamed content of a single final-answer event
+// ID. A non-terminal round may stream a preamble ("let me search…") under its
+// own answer ID and then be marked superseded once the round turns out to call
+// tools; tracking segments separately lets us exclude that preamble from the
+// persisted assistant message instead of leaking it into the final answer.
+type answerSegment struct {
+	id         string
+	content    string
+	superseded bool
+}
+
+// findAnswerSegment returns the segment for an answer event ID, or nil.
+// Callers must hold h.mu.
+func (h *AgentStreamHandler) findAnswerSegment(id string) *answerSegment {
+	for _, seg := range h.answerSegments {
+		if seg.id == id {
+			return seg
+		}
+	}
+	return nil
+}
+
+// composeFinalAnswer rebuilds the persisted answer from all non-superseded
+// segments in arrival order. Callers must hold h.mu.
+func (h *AgentStreamHandler) composeFinalAnswer() string {
+	var b strings.Builder
+	for _, seg := range h.answerSegments {
+		if !seg.superseded {
+			b.WriteString(seg.content)
+		}
+	}
+	return b.String()
 }
 
 // NewAgentStreamHandler creates a new handler for agent SSE streaming
 func NewAgentStreamHandler(
 	ctx context.Context,
 	sessionID, assistantMessageID, requestID string,
+	tenantID uint64,
+	receivedAt time.Time,
 	assistantMessage *types.Message,
 	streamManager interfaces.StreamManager,
 	eventBus *event.EventBus,
+	artifactCollector *service.ArtifactCollector,
 ) *AgentStreamHandler {
 	return &AgentStreamHandler{
 		ctx:                ctx,
 		sessionID:          sessionID,
+		tenantID:           tenantID,
 		assistantMessageID: assistantMessageID,
 		requestID:          requestID,
+		receivedAt:         receivedAt,
 		assistantMessage:   assistantMessage,
 		streamManager:      streamManager,
 		eventBus:           eventBus,
+		artifactCollector:  artifactCollector,
 		knowledgeRefs:      make([]*types.SearchResult, 0),
 		eventStartTimes:    make(map[string]time.Time),
 	}
@@ -61,11 +115,17 @@ func (h *AgentStreamHandler) Subscribe() {
 	h.eventBus.On(event.EventAgentToolCall, h.handleToolCall)
 	h.eventBus.On(event.EventAgentToolResult, h.handleToolResult)
 	h.eventBus.On(event.EventAgentReferences, h.handleReferences)
+	h.eventBus.On(event.EventMemoryRecalled, h.handleMemoryRecalled)
+	h.eventBus.On(event.EventContextCompacted, h.handleContextCompacted)
 	h.eventBus.On(event.EventAgentFinalAnswer, h.handleFinalAnswer)
 	h.eventBus.On(event.EventAgentReflection, h.handleReflection)
 	h.eventBus.On(event.EventError, h.handleError)
 	h.eventBus.On(event.EventSessionTitle, h.handleSessionTitle)
 	h.eventBus.On(event.EventAgentComplete, h.handleComplete)
+	h.eventBus.On(event.EventToolApprovalRequired, h.handleToolApprovalRequired)
+	h.eventBus.On(event.EventToolApprovalResolved, h.handleToolApprovalResolved)
+	h.eventBus.On(event.EventMCPOAuthRequired, h.handleMCPOAuthRequired)
+	h.eventBus.On(event.EventMCPOAuthResolved, h.handleMCPOAuthResolved)
 }
 
 // handleThought handles agent thought events
@@ -124,13 +184,29 @@ func (h *AgentStreamHandler) handleToolCall(ctx context.Context, evt event.Event
 	}
 
 	h.mu.Lock()
-	// Track start time for this tool call (use tool_call_id as key)
-	h.eventStartTimes[data.ToolCallID] = time.Now()
+	_, first := h.eventStartTimes[data.ToolCallID]
+	if !first {
+		h.eventStartTimes[data.ToolCallID] = time.Now()
+		// Any answer text streamed before this tool call was a non-terminal round's
+		// preamble, not the final answer (the agent only ends by stopping naturally
+		// with plain text and no tool calls). Drop those segments from the persisted
+		// answer so the preamble never leaks into Message.Content.
+		supersededAny := false
+		for _, seg := range h.answerSegments {
+			if !seg.superseded && seg.content != "" {
+				seg.superseded = true
+				supersededAny = true
+			}
+		}
+		if supersededAny {
+			h.finalAnswer = h.composeFinalAnswer()
+		}
+	}
 	h.mu.Unlock()
 
 	metadata := map[string]interface{}{
 		"tool_name":    data.ToolName,
-		"arguments":    data.Arguments,
+		"arguments":    agenttools.SanitizeSandboxFileCallArgs(data.ToolName, data.Arguments),
 		"tool_call_id": data.ToolCallID,
 	}
 
@@ -170,10 +246,10 @@ func (h *AgentStreamHandler) handleToolResult(ctx context.Context, evt event.Eve
 
 	// Send SSE response (both success and failure)
 	responseType := types.ResponseTypeToolResult
-	content := data.Output
+	content := agenttools.StreamContentForToolResult(data.ToolName, data.Success, data.Error, data.Data)
 	if !data.Success {
 		responseType = types.ResponseTypeError
-		if data.Error != "" {
+		if content == "" && data.Error != "" {
 			content = data.Error
 		}
 	}
@@ -182,17 +258,19 @@ func (h *AgentStreamHandler) handleToolResult(ctx context.Context, evt event.Eve
 	metadata := map[string]interface{}{
 		"tool_name":    data.ToolName,
 		"success":      data.Success,
-		"output":       data.Output,
 		"error":        data.Error,
 		"duration_ms":  durationMs,
 		"tool_call_id": data.ToolCallID,
 	}
 
-	// Merge tool result data (contains display_type, formatted results, etc.)
-	if data.Data != nil {
-		for k, v := range data.Data {
-			metadata[k] = v
-		}
+	clientData := agenttools.SanitizeToolResultForClient(data.ToolName, &types.ToolResult{
+		Success: data.Success,
+		Output:  data.Output,
+		Error:   data.Error,
+		Data:    data.Data,
+	})
+	for k, v := range clientData {
+		metadata[k] = v
 	}
 
 	// Append event to stream
@@ -207,6 +285,103 @@ func (h *AgentStreamHandler) handleToolResult(ctx context.Context, evt event.Eve
 		logger.GetLogger(h.ctx).Error("Append tool result event to stream failed", "error", err)
 	}
 
+	return nil
+}
+
+func toolApprovalDataToMap(v interface{}) map[string]interface{} {
+	b, err := json.Marshal(v)
+	if err != nil {
+		return map[string]interface{}{}
+	}
+	var m map[string]interface{}
+	if err := json.Unmarshal(b, &m); err != nil {
+		return map[string]interface{}{}
+	}
+	return m
+}
+
+// handleToolApprovalRequired persists MCP tool human-approval prompts for SSE / replay (issue #1173).
+func (h *AgentStreamHandler) handleToolApprovalRequired(ctx context.Context, evt event.Event) error {
+	data, ok := evt.Data.(event.ToolApprovalRequiredData)
+	if !ok {
+		return nil
+	}
+	meta := toolApprovalDataToMap(data)
+	meta["pending_id"] = data.PendingID
+	if err := h.streamManager.AppendEvent(h.ctx, h.sessionID, h.assistantMessageID, interfaces.StreamEvent{
+		ID:        evt.ID,
+		Type:      types.ResponseTypeToolApprovalRequired,
+		Content:   "MCP tool requires human approval",
+		Done:      true,
+		Timestamp: time.Now(),
+		Data:      meta,
+	}); err != nil {
+		logger.GetLogger(h.ctx).Error("Append tool approval required event failed", "error", err)
+	}
+	return nil
+}
+
+// handleToolApprovalResolved persists the outcome of a tool approval (issue #1173).
+func (h *AgentStreamHandler) handleToolApprovalResolved(ctx context.Context, evt event.Event) error {
+	data, ok := evt.Data.(event.ToolApprovalResolvedData)
+	if !ok {
+		return nil
+	}
+	meta := toolApprovalDataToMap(data)
+	meta["pending_id"] = data.PendingID
+	if err := h.streamManager.AppendEvent(h.ctx, h.sessionID, h.assistantMessageID, interfaces.StreamEvent{
+		ID:        evt.ID,
+		Type:      types.ResponseTypeToolApprovalResolved,
+		Content:   "MCP tool approval resolved",
+		Done:      true,
+		Timestamp: time.Now(),
+		Data:      meta,
+	}); err != nil {
+		logger.GetLogger(h.ctx).Error("Append tool approval resolved event failed", "error", err)
+	}
+	return nil
+}
+
+// handleMCPOAuthRequired forwards an in-conversation "authorize this MCP
+// service" prompt to the SSE stream so the UI can render an Authorize card.
+func (h *AgentStreamHandler) handleMCPOAuthRequired(ctx context.Context, evt event.Event) error {
+	data, ok := evt.Data.(event.MCPOAuthRequiredData)
+	if !ok {
+		return nil
+	}
+	meta := toolApprovalDataToMap(data)
+	meta["pending_id"] = data.PendingID
+	if err := h.streamManager.AppendEvent(h.ctx, h.sessionID, h.assistantMessageID, interfaces.StreamEvent{
+		ID:        evt.ID,
+		Type:      types.ResponseTypeMCPOAuthRequired,
+		Content:   "MCP service requires OAuth authorization",
+		Done:      true,
+		Timestamp: time.Now(),
+		Data:      meta,
+	}); err != nil {
+		logger.GetLogger(h.ctx).Error("Append mcp oauth required event failed", "error", err)
+	}
+	return nil
+}
+
+// handleMCPOAuthResolved forwards the outcome of an in-conversation OAuth prompt.
+func (h *AgentStreamHandler) handleMCPOAuthResolved(ctx context.Context, evt event.Event) error {
+	data, ok := evt.Data.(event.MCPOAuthResolvedData)
+	if !ok {
+		return nil
+	}
+	meta := toolApprovalDataToMap(data)
+	meta["pending_id"] = data.PendingID
+	if err := h.streamManager.AppendEvent(h.ctx, h.sessionID, h.assistantMessageID, interfaces.StreamEvent{
+		ID:        evt.ID,
+		Type:      types.ResponseTypeMCPOAuthResolved,
+		Content:   "MCP OAuth authorization resolved",
+		Done:      true,
+		Timestamp: time.Now(),
+		Data:      meta,
+	}); err != nil {
+		logger.GetLogger(h.ctx).Error("Append mcp oauth resolved event failed", "error", err)
+	}
 	return nil
 }
 
@@ -231,28 +406,7 @@ func (h *AgentStreamHandler) handleReferences(ctx context.Context, evt event.Eve
 				h.knowledgeRefs = append(h.knowledgeRefs, sr)
 			} else if refMap, ok := ref.(map[string]interface{}); ok {
 				// Parse from map if needed
-				searchResult := &types.SearchResult{
-					ID:                   getString(refMap, "id"),
-					Content:              getString(refMap, "content"),
-					Score:                getFloat64(refMap, "score"),
-					KnowledgeID:          getString(refMap, "knowledge_id"),
-					KnowledgeTitle:       getString(refMap, "knowledge_title"),
-					ChunkIndex:           int(getFloat64(refMap, "chunk_index")),
-					KnowledgeDescription: getString(refMap, "knowledge_description"),
-					KnowledgeBaseID:      getString(refMap, "knowledge_base_id"),
-				}
-
-				if meta, ok := refMap["metadata"].(map[string]interface{}); ok {
-					metadata := make(map[string]string)
-					for k, v := range meta {
-						if strVal, ok := v.(string); ok {
-							metadata[k] = strVal
-						}
-					}
-					searchResult.Metadata = metadata
-				}
-
-				h.knowledgeRefs = append(h.knowledgeRefs, searchResult)
+				h.knowledgeRefs = append(h.knowledgeRefs, searchResultFromMap(refMap))
 			}
 		}
 	}
@@ -277,6 +431,68 @@ func (h *AgentStreamHandler) handleReferences(ctx context.Context, evt event.Eve
 	return nil
 }
 
+// handleMemoryRecalled records the long-term memories injected into this turn.
+// The list is both persisted on the assistant message and streamed, so the
+// panel is present live and after a reload.
+func (h *AgentStreamHandler) handleMemoryRecalled(ctx context.Context, evt event.Event) error {
+	data, ok := evt.Data.(event.MemoryRecalledData)
+	if !ok {
+		return nil
+	}
+	used, ok := data.Memories.(types.UsedMemories)
+	if !ok || len(used) == 0 {
+		return nil
+	}
+
+	h.mu.Lock()
+	h.assistantMessage.UsedMemories = used
+	h.mu.Unlock()
+
+	if err := h.streamManager.AppendEvent(h.ctx, h.sessionID, h.assistantMessageID, interfaces.StreamEvent{
+		ID:        evt.ID,
+		Type:      types.ResponseTypeMemoryRecalled,
+		Done:      false,
+		Timestamp: time.Now(),
+		Data:      map[string]interface{}{"memories": used},
+	}); err != nil {
+		logger.GetLogger(h.ctx).Error("Append memory recalled event to stream failed", "error", err)
+	}
+	return nil
+}
+
+// handleContextCompacted forwards a compaction to the UI.
+//
+// The summary itself is carried so the user can expand it and see exactly what
+// the agent kept, which is the only way to tell an agent that forgot something
+// from an agent that never had it.
+func (h *AgentStreamHandler) handleContextCompacted(_ context.Context, evt event.Event) error {
+	data, ok := evt.Data.(event.ContextCompactedData)
+	if !ok {
+		return nil
+	}
+
+	if err := h.streamManager.AppendEvent(h.ctx, h.sessionID, h.assistantMessageID, interfaces.StreamEvent{
+		ID:        evt.ID,
+		Type:      types.ResponseTypeContextCompacted,
+		Done:      true,
+		Timestamp: time.Now(),
+		Data: map[string]interface{}{
+			"reason":          data.Reason,
+			"round":           data.Round,
+			"tokens_before":   data.TokensBefore,
+			"tokens_after":    data.TokensAfter,
+			"messages_before": data.MessagesBefore,
+			"messages_after":  data.MessagesAfter,
+			"summary":         data.Summary,
+			"degraded":        data.Degraded,
+			"split_turn":      data.SplitTurn,
+		},
+	}); err != nil {
+		logger.GetLogger(h.ctx).Error("Append context compacted event to stream failed", "error", err)
+	}
+	return nil
+}
+
 // handleFinalAnswer handles final answer events
 func (h *AgentStreamHandler) handleFinalAnswer(ctx context.Context, evt event.Event) error {
 	data, ok := evt.Data.(event.AgentFinalAnswerData)
@@ -285,13 +501,34 @@ func (h *AgentStreamHandler) handleFinalAnswer(ctx context.Context, evt event.Ev
 	}
 
 	h.mu.Lock()
+
 	// Track start time on first chunk
 	if _, exists := h.eventStartTimes[evt.ID]; !exists {
 		h.eventStartTimes[evt.ID] = time.Now()
 	}
 
-	// Accumulate final answer locally for assistant message (database)
-	h.finalAnswer += data.Content
+	// Emit a one-shot TTFB log the first time *any* answer chunk reaches
+	// the stream handler. This lets us compare the backend's "request in →
+	// first token out" timing against the frontend-observed TTFB and pin
+	// down where latency lives (network vs server vs LLM).
+	if !h.ttfbLogged && !h.receivedAt.IsZero() {
+		h.ttfbLogged = true
+		ttfb := time.Since(h.receivedAt)
+		logger.GetLogger(h.ctx).Infof("TTFB:first_answer_chunk request_id=%s, session_id=%s, ttfb_ms=%d",
+			h.requestID, h.sessionID, ttfb.Milliseconds())
+	}
+
+	// Accumulate final answer locally for assistant message (database). Track
+	// per event ID so a later supersede can subtract this segment's content.
+	if data.Content != "" {
+		seg := h.findAnswerSegment(evt.ID)
+		if seg == nil {
+			seg = &answerSegment{id: evt.ID}
+			h.answerSegments = append(h.answerSegments, seg)
+		}
+		seg.content += data.Content
+		h.finalAnswer = h.composeFinalAnswer()
+	}
 	if data.IsFallback {
 		h.assistantMessage.IsFallback = true
 	}
@@ -441,9 +678,56 @@ func (h *AgentStreamHandler) handleComplete(ctx context.Context, evt event.Event
 		// Update agent steps if provided
 		if data.AgentSteps != nil {
 			if steps, ok := data.AgentSteps.([]types.AgentStep); ok {
-				h.assistantMessage.AgentSteps = steps
+				h.assistantMessage.AgentSteps = agenttools.SanitizeAgentStepsForStorage(steps)
 			}
 		}
+
+		// Persist the turn's aggregated LLM usage with the message so history
+		// reads still carry it after the live stream is gone.
+		if usage, ok := data.Usage.(*types.TokenUsage); ok && usage != nil {
+			h.assistantMessage.Usage = usage
+		}
+
+		// Drain skill-generated files from the sandbox into persistent
+		// storage. Best-effort: any failure is logged and the turn is
+		// persisted without artifacts. Collect is a no-op when either the
+		// collector wasn't wired in, no sandbox is bound, or no files were
+		// produced — those cases must not disturb the completion path.
+		var previous types.MessageArtifacts
+		if h.artifactCollector != nil {
+			collectCtx := context.WithoutCancel(h.ctx)
+			artifacts, err := h.artifactCollector.CollectWithNotify(
+				collectCtx,
+				h.sessionID,
+				h.assistantMessageID,
+				h.tenantID,
+				skills.ArtifactOutputDir(),
+				h.emitArtifactsPending,
+			)
+			if err != nil {
+				logger.GetLogger(h.ctx).Warnf(
+					"artifact collect failed session=%s message=%s: %v",
+					h.sessionID, h.assistantMessageID, err,
+				)
+			} else if len(artifacts) > 0 {
+				h.assistantMessage.Artifacts = artifacts
+				// The answer text names generated files the way the model saw
+				// them in the sandbox. Bind those names to artifact indices now
+				// that the index space is final, so a reloaded conversation
+				// renders them instead of showing a broken link.
+				h.assistantMessage.Content = rewriteArtifactReferences(
+					h.assistantMessage.Content, artifacts,
+				)
+				logger.GetLogger(h.ctx).Infof(
+					"artifact collect attached %d file(s) to message=%s session=%s",
+					len(artifacts), h.assistantMessageID, h.sessionID,
+				)
+			}
+			previous = h.artifactCollector.ReferencedHistory(collectCtx, h.sessionID,
+				h.assistantMessageID, h.assistantMessage.Content)
+		}
+		h.assistantMessage.Content = types.ClarifyArtifactVersions(h.assistantMessage.Content,
+			h.assistantMessage.Artifacts, previous, types.LanguageFromContextOrDefault(h.ctx))
 	}
 
 	// Fallback: if no answer events were streamed but we have a final answer,
@@ -487,19 +771,81 @@ func (h *AgentStreamHandler) handleComplete(ctx context.Context, evt event.Event
 	}
 
 	// Send completion event to stream manager so SSE can detect completion
+	completeData := map[string]interface{}{
+		"total_steps":       data.TotalSteps,
+		"total_duration_ms": data.TotalDurationMs,
+		"final_content":     h.assistantMessage.Content,
+	}
+	// Attach the freshly-collected artifacts so the frontend can render the
+	// download button without waiting for a page refresh. We strip the
+	// storage URL and any other server-only fields via publicArtifactViews
+	// — clients only ever download through /artifacts/:index which enforces
+	// tenant ownership.
+	if len(h.assistantMessage.Artifacts) > 0 {
+		completeData["artifacts"] = publicArtifactViews(h.assistantMessage.Artifacts)
+	}
+	// Carry the turn's aggregated LLM usage both inside data (map consumers)
+	// and on the typed event field, which buildStreamResponse promotes to the
+	// response's top-level usage.
+	turnUsage, _ := data.Usage.(*types.TokenUsage)
+	if turnUsage != nil {
+		completeData["usage"] = turnUsage
+	}
 	if err := h.streamManager.AppendEvent(h.ctx, h.sessionID, h.assistantMessageID, interfaces.StreamEvent{
 		ID:        evt.ID,
 		Type:      types.ResponseTypeComplete,
 		Content:   "",
 		Done:      true,
 		Timestamp: time.Now(),
-		Data: map[string]interface{}{
-			"total_steps":       data.TotalSteps,
-			"total_duration_ms": data.TotalDurationMs,
-		},
+		Data:      completeData,
+		Usage:     turnUsage,
 	}); err != nil {
 		logger.GetLogger(h.ctx).Errorf("Append complete event to stream failed: %v", err)
 	}
 
 	return nil
+}
+
+// emitArtifactsPending tells the live UI that sandbox files exist and are
+// being uploaded. It must not take h.mu — Collect calls it while
+// handleComplete already holds the lock.
+func (h *AgentStreamHandler) emitArtifactsPending(count int) {
+	if h == nil || h.streamManager == nil || count <= 0 {
+		return
+	}
+	if err := h.streamManager.AppendEvent(h.ctx, h.sessionID, h.assistantMessageID, interfaces.StreamEvent{
+		ID:        fmt.Sprintf("artifacts-pending-%d", time.Now().UnixMilli()),
+		Type:      types.ResponseTypeArtifactsPending,
+		Timestamp: time.Now(),
+		Data: map[string]interface{}{
+			"count": count,
+		},
+	}); err != nil {
+		logger.GetLogger(h.ctx).Warnf(
+			"append artifacts_pending failed session=%s message=%s: %v",
+			h.sessionID, h.assistantMessageID, err,
+		)
+	}
+}
+
+// publicArtifactViews returns a redacted view of the artifact list suitable
+// for direct serialization onto the SSE stream. The physical storage path is
+// stripped; the resource handle is kept because it is what the answer body
+// references, and the frontend needs it to tie an inline reference to the file
+// it names. Bytes are fetched through /artifacts/:index/download.
+func publicArtifactViews(list types.MessageArtifacts) []map[string]interface{} {
+	out := make([]map[string]interface{}, 0, len(list))
+	for i, a := range list {
+		out = append(out, map[string]interface{}{
+			"index":       i,
+			"handle":      artifactHandle(a),
+			"file_name":   a.FileName,
+			"file_type":   a.FileType,
+			"file_size":   a.FileSize,
+			"source_path": a.SourcePath,
+			"mod_time":    a.ModTime,
+			"created_at":  a.CreatedAt,
+		})
+	}
+	return out
 }

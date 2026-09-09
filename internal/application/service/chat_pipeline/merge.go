@@ -2,9 +2,9 @@ package chatpipeline
 
 import (
 	"context"
-	"encoding/json"
 	"sort"
 
+	"github.com/Tencent/WeKnora/internal/searchutil"
 	"github.com/Tencent/WeKnora/internal/types"
 	"github.com/Tencent/WeKnora/internal/types/interfaces"
 )
@@ -36,10 +36,10 @@ func (p *PluginMerge) ActivationEvents() []types.EventType {
 //  2. Deduplicate by ID and content signature
 //  3. Inject relevant history references
 //  4. Resolve parent chunks (child → parent content)
-//  5. Group by knowledge source + chunk type, merge overlapping ranges
+//  5. Group by knowledge source + chunk type, merge sequential current bodies
 //  6. Populate FAQ answers
 //  7. Expand short contexts with neighboring chunks
-//  7.5. Re-merge overlapping ranges introduced by expansion
+//     7.5. Re-merge sequential or contained bodies introduced by expansion
 //  8. Final deduplication (ID + signature + partial content overlap)
 func (p *PluginMerge) OnEvent(ctx context.Context,
 	eventType types.EventType, chatManage *types.ChatManage, next func() *PluginError,
@@ -77,7 +77,7 @@ func (p *PluginMerge) OnEvent(ctx context.Context,
 	searchResult = p.resolveParentChunks(ctx, chatManage, searchResult)
 
 	// Step 5: Group by knowledge/chunkType and merge overlapping ranges
-	mergedChunks := p.groupAndMergeOverlapping(ctx, searchResult)
+	mergedChunks := p.groupAndMergeCurrentContent(ctx, searchResult)
 
 	// Step 6: Populate FAQ answers
 	mergedChunks = p.populateFAQAnswers(ctx, chatManage, mergedChunks)
@@ -86,7 +86,7 @@ func (p *PluginMerge) OnEvent(ctx context.Context,
 	mergedChunks = p.expandShortContextWithNeighbors(ctx, chatManage, mergedChunks)
 
 	// Step 7.5: Re-merge overlapping ranges introduced by expansion
-	mergedChunks = p.groupAndMergeOverlapping(ctx, mergedChunks)
+	mergedChunks = p.groupAndMergeCurrentContent(ctx, mergedChunks)
 
 	// Step 8: Final dedup — catches exact duplicates plus partial content overlaps
 	mergedChunks = p.dedup(ctx, "final_dedup", mergedChunks)
@@ -144,9 +144,9 @@ func (p *PluginMerge) injectHistoryResults(
 	return removeDuplicateResults(combined)
 }
 
-// groupAndMergeOverlapping groups chunks by KnowledgeID + ChunkType, then merges
-// overlapping ranges within each group using mergeOverlappingChunks.
-func (p *PluginMerge) groupAndMergeOverlapping(ctx context.Context, results []*types.SearchResult) []*types.SearchResult {
+// groupAndMergeCurrentContent groups chunks by KnowledgeID + ChunkType, then joins
+// sequential current bodies without consulting source character offsets.
+func (p *PluginMerge) groupAndMergeCurrentContent(ctx context.Context, results []*types.SearchResult) []*types.SearchResult {
 	// Group by KnowledgeID → ChunkType
 	knowledgeGroup := make(map[string]map[string][]*types.SearchResult)
 	for _, chunk := range results {
@@ -181,13 +181,13 @@ func (p *PluginMerge) groupAndMergeOverlapping(ctx context.Context, results []*t
 		})
 
 		sort.Slice(u.chunks, func(i, j int) bool {
-			if u.chunks[i].StartAt == u.chunks[j].StartAt {
-				return u.chunks[i].EndAt < u.chunks[j].EndAt
+			if u.chunks[i].ChunkIndex == u.chunks[j].ChunkIndex {
+				return u.chunks[i].ID < u.chunks[j].ID
 			}
-			return u.chunks[i].StartAt < u.chunks[j].StartAt
+			return u.chunks[i].ChunkIndex < u.chunks[j].ChunkIndex
 		})
 
-		grouped := p.mergeOverlappingChunks(ctx, u.knowledgeID, u.chunks)
+		grouped := p.mergeSequentialChunks(ctx, u.knowledgeID, u.chunks)
 
 		pipelineInfo(ctx, "Merge", "group_output", map[string]interface{}{
 			"knowledge_id":  u.knowledgeID,
@@ -201,15 +201,20 @@ func (p *PluginMerge) groupAndMergeOverlapping(ctx context.Context, results []*t
 		mergedChunks = append(mergedChunks, g...)
 	}
 
+	// Global sort restores relevance order after map-based grouping.
+	// n is typically < 100, O(n log n) is negligible here.
+	sortSearchResultsDeterministically(mergedChunks)
+
 	pipelineInfo(ctx, "Merge", "output", map[string]interface{}{
 		"merged_total": len(mergedChunks),
 	})
 	return mergedChunks
 }
 
-// resolveParentChunks replaces child chunk content with parent chunk content
-// for results that have ParentChunkID set. This provides fuller context
-// for small child chunks used in parent-child chunking strategy.
+// resolveParentChunks expands parent-child retrieval results with current
+// parent_text context. Text children and image grandchildren share the same
+// behavior, while image Markdown is scoped to the matched text child by
+// durable URLs rather than parser coordinates.
 func (p *PluginMerge) resolveParentChunks(
 	ctx context.Context,
 	chatManage *types.ChatManage,
@@ -260,48 +265,54 @@ func (p *PluginMerge) resolveParentChunks(
 		parentMap[c.ID] = c
 	}
 
-	// Check if any results are image chunks; only then do we need
-	// grandparent resolution and the extra DB round-trip.
-	hasImageResults := false
+	// Image hits have an image -> text -> parent_text chain. Fetch the
+	// grandparent only for those results so they retain parent-child context
+	// without using editable StartAt/EndAt coordinates.
+	imageTextParentIDs := make(map[string]struct{})
 	for _, r := range results {
 		if r.ChunkType == string(types.ChunkTypeImageOCR) || r.ChunkType == string(types.ChunkTypeImageCaption) {
-			hasImageResults = true
-			break
+			imageTextParentIDs[r.ParentChunkID] = struct{}{}
 		}
 	}
-
-	var grandparentIDs []string
-	if hasImageResults {
-		// Fetch grandparent chunks for the image → text → parent_text chain.
-		for _, pc := range parentChunks {
-			if pc.ParentChunkID != "" && pc.ChunkType == types.ChunkTypeText {
-				if _, already := parentMap[pc.ParentChunkID]; !already {
-					grandparentIDs = append(grandparentIDs, pc.ParentChunkID)
-				}
+	if len(imageTextParentIDs) > 0 {
+		grandparentIDs := make([]string, 0)
+		grandparentSeen := make(map[string]struct{})
+		for _, parent := range parentChunks {
+			if _, needed := imageTextParentIDs[parent.ID]; !needed {
+				continue
 			}
+			if parent.ParentChunkID == "" || parent.ChunkType != types.ChunkTypeText {
+				continue
+			}
+			if _, already := parentMap[parent.ParentChunkID]; already {
+				continue
+			}
+			if _, already := grandparentSeen[parent.ParentChunkID]; already {
+				continue
+			}
+			grandparentSeen[parent.ParentChunkID] = struct{}{}
+			grandparentIDs = append(grandparentIDs, parent.ParentChunkID)
 		}
 		if len(grandparentIDs) > 0 {
-			gpChunks, err := p.chunkRepo.ListChunksByID(ctx, tenantID, grandparentIDs)
-			if err != nil {
+			grandparents, fetchErr := p.chunkRepo.ListChunksByID(ctx, tenantID, grandparentIDs)
+			if fetchErr != nil {
 				pipelineWarn(ctx, "Merge", "grandparent_fetch_failed", map[string]interface{}{
-					"error": err.Error(),
+					"error": fetchErr.Error(),
 				})
 			} else {
-				for _, c := range gpChunks {
-					parentMap[c.ID] = c
+				for _, grandparent := range grandparents {
+					parentMap[grandparent.ID] = grandparent
 				}
 			}
 		}
 	}
 
-	// Collect merged ImageInfo for each parent by fetching ALL sibling
-	// child chunks. Individual child chunks only carry ImageInfo for images
-	// within their own range, but the parent content spans all children.
-	imageInfoIDs := ids
-	if len(grandparentIDs) > 0 {
-		imageInfoIDs = append(append([]string(nil), ids...), grandparentIDs...)
+	// Batch-fetch image_info scoped to matched text children only.
+	textChildIDs := collectScopedTextChildIDs(results, parentMap)
+	var scopedImageInfo map[string]string
+	if len(textChildIDs) > 0 {
+		scopedImageInfo = searchutil.CollectImageInfoByChunkIDs(ctx, p.chunkRepo, tenantID, textChildIDs)
 	}
-	parentImageInfoMap := p.collectParentImageInfo(ctx, tenantID, imageInfoIDs)
 
 	for _, r := range results {
 		if r.ParentChunkID == "" {
@@ -310,10 +321,9 @@ func (p *PluginMerge) resolveParentChunks(
 
 		switch r.ChunkType {
 		case string(types.ChunkTypeText):
-			// text → parent_text resolution (parent-child chunking strategy).
-			// Summary chunks also carry a ParentChunkID that points to their
-			// source chunk, but that is a different semantic — replacing
-			// summary content with its source would degrade quality.
+			// text → parent_text: expand to full parent for surrounding context
+			// (the core parent-child value). Scope ImageInfo to this child only so
+			// image-heavy parents do not inject every sibling page's OCR/Caption.
 			parent, ok := parentMap[r.ParentChunkID]
 			if !ok || parent.Content == "" || parent.ChunkType != types.ChunkTypeParentText {
 				continue
@@ -323,44 +333,64 @@ func (p *PluginMerge) resolveParentChunks(
 				"parent_id":  r.ParentChunkID,
 				"child_len":  runeLen(r.Content),
 				"parent_len": runeLen(parent.Content),
+				"scoped_img": true,
 			})
-			r.Content = parent.Content
-			r.StartAt = parent.StartAt
-			r.EndAt = parent.EndAt
-			if mergedImageInfo, ok := parentImageInfoMap[r.ParentChunkID]; ok && mergedImageInfo != "" {
-				r.ImageInfo = mergedImageInfo
-			}
+			assignScopedImageInfo(r, scopedImageInfo, r.ID)
+			parentContent := searchutil.PruneMarkdownImagesByImageInfo(parent.Content, r.ImageInfo)
+			r.Content = searchutil.JoinChunkContent(parentContent, r.Content, "\n\n")
+			r.ContentRewritten = true
 			if !containsID(r.SubChunkID, r.ID) {
 				r.SubChunkID = append(r.SubChunkID, r.ID)
 			}
 
 		case string(types.ChunkTypeImageOCR), string(types.ChunkTypeImageCaption):
-			// image_ocr/image_caption → text parent → optional parent_text grandparent.
-			// Replace content with parent text for surrounding context.
-			parent, ok := parentMap[r.ParentChunkID]
-			if !ok || parent.Content == "" {
+			textParent, ok := parentMap[r.ParentChunkID]
+			if !ok || textParent.Content == "" || textParent.ChunkType != types.ChunkTypeText {
 				continue
 			}
-			resolvedParent := parent
-			// If parent text uses parent-child chunking, resolve one more level
-			if parent.ChunkType == types.ChunkTypeText && parent.ParentChunkID != "" {
-				if gp, gpOK := parentMap[parent.ParentChunkID]; gpOK && gp.ChunkType == types.ChunkTypeParentText && gp.Content != "" {
-					resolvedParent = gp
+			hitImageInfo := r.ImageInfo
+			// The hit chunk itself carries the recognized text (Content is
+			// the OCR text / caption stored by the multimodal pipeline).
+			// Save it before the parent expansion overwrites the field:
+			// force-scanned PDFs cut the parent markdown from image
+			// placeholders only, so dropping the child body used to empty
+			// the context sent to the model (#3052).
+			childRecognizedContent := r.Content
+			contentSource := textParent
+			if textParent.ParentChunkID != "" {
+				if grandparent, found := parentMap[textParent.ParentChunkID]; found &&
+					grandparent.ChunkType == types.ChunkTypeParentText && grandparent.Content != "" {
+					contentSource = grandparent
 				}
 			}
-			pipelineInfo(ctx, "Merge", "image_parent_resolve", map[string]interface{}{
-				"child_id":    r.ID,
-				"child_type":  r.ChunkType,
-				"resolved_id": resolvedParent.ID,
-				"child_len":   runeLen(r.Content),
-				"parent_len":  runeLen(resolvedParent.Content),
-			})
-			r.Content = resolvedParent.Content
-			r.StartAt = resolvedParent.StartAt
-			r.EndAt = resolvedParent.EndAt
-			if mergedInfo, ok := parentImageInfoMap[resolvedParent.ID]; ok && mergedInfo != "" {
-				r.ImageInfo = mergedInfo
+			r.Content = textParent.Content
+			r.ChunkIndex = textParent.ChunkIndex
+			r.ContentRewritten = true
+			assignScopedImageInfo(r, scopedImageInfo, textParent.ID)
+			if r.ImageInfo == "" && hitImageInfo != "" {
+				r.ImageInfo = searchutil.FilterImageInfoByContentURLs(textParent.Content, hitImageInfo)
 			}
+			textContent := searchutil.PruneMarkdownImagesByImageInfo(textParent.Content, r.ImageInfo)
+			parentContent := searchutil.PruneMarkdownImagesByImageInfo(contentSource.Content, r.ImageInfo)
+			r.Content = searchutil.JoinChunkContent(parentContent, textContent, "\n\n")
+			// Re-attach the recognized text after the parent/grandparent
+			// markdown. JoinChunkContent collapses duplicates, so when the
+			// surrounding text already covers the OCR/caption body nothing
+			// is added.
+			r.Content = searchutil.JoinChunkContent(r.Content, childRecognizedContent, "\n\n")
+			r.ImageInfo = searchutil.ClearImageInfoTextMatchingBody(
+				r.ImageInfo, childRecognizedContent, r.ChunkType,
+			)
+			r.ContentRewritten = true
+			pipelineInfo(ctx, "Merge", "image_parent_resolve", map[string]interface{}{
+				"child_id":   r.ID,
+				"child_type": r.ChunkType,
+				"text_id":    textParent.ID,
+				"parent_id":  contentSource.ID,
+				"match_len":  runeLen(r.Content),
+				"parent_len": runeLen(contentSource.Content),
+				"scoped":     true,
+			})
 			if !containsID(r.SubChunkID, r.ID) {
 				r.SubChunkID = append(r.SubChunkID, r.ID)
 			}
@@ -370,97 +400,50 @@ func (p *PluginMerge) resolveParentChunks(
 	return results
 }
 
-// collectParentImageInfo batch-fetches image info for the given parent_text
-// chunk IDs using a two-level query:
-//
-//	Level 1: parent_text → text children
-//	Level 2: text children → image_ocr / image_caption grandchildren (carry image_info)
-func (p *PluginMerge) collectParentImageInfo(
-	ctx context.Context,
-	tenantID uint64,
-	parentIDs []string,
-) map[string]string {
-	// Level 1: get direct children of parent_text chunks
-	children, err := p.chunkRepo.ListChunksByParentIDs(ctx, tenantID, parentIDs)
-	if err != nil {
-		pipelineWarn(ctx, "Merge", "parent_imageinfo_fetch_failed", map[string]interface{}{
-			"parent_cnt": len(parentIDs),
-			"error":      err.Error(),
-		})
-		return nil
-	}
-
-	type agg struct {
-		infos    []types.ImageInfo
-		seenURLs map[string]bool
-	}
-	aggMap := make(map[string]*agg)
-	addInfo := func(targetID string, chunk *types.Chunk) {
-		if chunk.ImageInfo == "" {
-			return
-		}
-		var infos []types.ImageInfo
-		if err := json.Unmarshal([]byte(chunk.ImageInfo), &infos); err != nil || len(infos) == 0 {
-			return
-		}
-		a, ok := aggMap[targetID]
-		if !ok {
-			a = &agg{seenURLs: make(map[string]bool)}
-			aggMap[targetID] = a
-		}
-		for _, info := range infos {
-			key := info.URL
-			if key == "" {
-				key = info.OriginalURL
-			}
-			if key != "" && !a.seenURLs[key] {
-				a.seenURLs[key] = true
-				a.infos = append(a.infos, info)
-			}
-		}
-	}
-
-	var textChildIDs []string
-	textToParent := make(map[string]string, len(children))
-	for _, child := range children {
-		switch child.ChunkType {
-		case types.ChunkTypeImageOCR, types.ChunkTypeImageCaption:
-			addInfo(child.ParentChunkID, child)
-		case types.ChunkTypeText:
-			textChildIDs = append(textChildIDs, child.ID)
-			textToParent[child.ID] = child.ParentChunkID
-		}
-	}
-
-	// Level 2: text children → image grandchildren
-	if len(textChildIDs) > 0 {
-		grandChildren, err := p.chunkRepo.ListChunksByParentIDs(ctx, tenantID, textChildIDs)
-		if err != nil {
-			pipelineWarn(ctx, "Merge", "parent_imageinfo_l2_fetch_failed", map[string]interface{}{
-				"text_cnt": len(textChildIDs),
-				"error":    err.Error(),
-			})
-		} else {
-			for _, gc := range grandChildren {
-				if gc.ChunkType != types.ChunkTypeImageOCR && gc.ChunkType != types.ChunkTypeImageCaption {
-					continue
-				}
-				if parentTextID, ok := textToParent[gc.ParentChunkID]; ok {
-					addInfo(parentTextID, gc)
-				}
-			}
-		}
-	}
-
-	result := make(map[string]string, len(aggMap))
-	for id, a := range aggMap {
-		if len(a.infos) == 0 {
+// collectScopedTextChildIDs returns text chunk IDs whose image_info should be
+// loaded for parent-child merge scoping.
+func collectScopedTextChildIDs(
+	results []*types.SearchResult,
+	parentMap map[string]*types.Chunk,
+) []string {
+	seen := make(map[string]struct{})
+	var ids []string
+	for _, r := range results {
+		if r.ParentChunkID == "" {
 			continue
 		}
-		data, err := json.Marshal(a.infos)
-		if err == nil {
-			result[id] = string(data)
+		switch r.ChunkType {
+		case string(types.ChunkTypeText):
+			parent := parentMap[r.ParentChunkID]
+			if parent == nil || parent.ChunkType != types.ChunkTypeParentText {
+				continue
+			}
+			if _, ok := seen[r.ID]; ok {
+				continue
+			}
+			seen[r.ID] = struct{}{}
+			ids = append(ids, r.ID)
+		case string(types.ChunkTypeImageOCR), string(types.ChunkTypeImageCaption):
+			if _, ok := seen[r.ParentChunkID]; ok {
+				continue
+			}
+			seen[r.ParentChunkID] = struct{}{}
+			ids = append(ids, r.ParentChunkID)
 		}
 	}
-	return result
+	return ids
+}
+
+// assignScopedImageInfo sets ImageInfo from the per-text-child map, falling
+// back to URLs present in the result content.
+func assignScopedImageInfo(r *types.SearchResult, scoped map[string]string, textChildID string) {
+	if scoped != nil {
+		if info, ok := scoped[textChildID]; ok && info != "" {
+			r.ImageInfo = info
+			return
+		}
+	}
+	if r.ImageInfo != "" {
+		r.ImageInfo = searchutil.FilterImageInfoByContentURLs(r.Content, r.ImageInfo)
+	}
 }

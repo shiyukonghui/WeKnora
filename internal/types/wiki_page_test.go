@@ -12,7 +12,6 @@ func TestWikiPageTypes(t *testing.T) {
 		WikiPageTypeEntity,
 		WikiPageTypeConcept,
 		WikiPageTypeIndex,
-		WikiPageTypeLog,
 		WikiPageTypeSynthesis,
 		WikiPageTypeComparison,
 	}
@@ -25,6 +24,9 @@ func TestWikiPageTypes(t *testing.T) {
 			t.Errorf("Duplicate WikiPageType: %s", pt)
 		}
 		seen[pt] = true
+	}
+	if IsValidWikiPageType("log") {
+		t.Error("removed Wiki log page type must not remain valid")
 	}
 }
 
@@ -177,6 +179,29 @@ func TestWikiPageJSON(t *testing.T) {
 	}
 }
 
+func TestWikiSourceKnowledgeID(t *testing.T) {
+	cases := []struct {
+		in, want string
+	}{
+		{"doc-1|排班手册", "doc-1"},
+		{"doc-1", "doc-1"},
+		{"  doc-1 | title ", "doc-1"},
+		{"", ""},
+	}
+	for _, c := range cases {
+		if got := WikiSourceKnowledgeID(c.in); got != c.want {
+			t.Errorf("WikiSourceKnowledgeID(%q) = %q, want %q", c.in, got, c.want)
+		}
+	}
+	page := &WikiPage{SourceRefs: StringArray{"doc-1|手册", "doc-2"}}
+	if !page.BuiltFrom(map[string]struct{}{"doc-1": {}}) {
+		t.Errorf("page should match doc-1")
+	}
+	if page.BuiltFrom(map[string]struct{}{"doc-9": {}}) {
+		t.Errorf("page should not match an unrelated document")
+	}
+}
+
 func TestWikiGraphDataJSON(t *testing.T) {
 	graph := WikiGraphData{
 		Nodes: []WikiGraphNode{
@@ -282,5 +307,26 @@ func TestWikiConfig_JSONRoundTrip_WithGranularity(t *testing.T) {
 	}
 	if oldCfg.ExtractionGranularity.Normalize() != WikiExtractionStandard {
 		t.Errorf("legacy row should normalize to standard")
+	}
+}
+
+func TestWikiFolderPathSegmentsKeepTypeLikeFolderNames(t *testing.T) {
+	got := WikiFolderPathSegments("概念/ 概念 /Concepts//实体")
+	want := []string{"概念", "概念", "Concepts", "实体"}
+	if len(got) != len(want) {
+		t.Fatalf("segments = %v, want %v", got, want)
+	}
+	for i := range want {
+		if got[i] != want[i] {
+			t.Fatalf("segments[%d] = %q, want %q", i, got[i], want[i])
+		}
+	}
+	if WikiFolderPathSegments("  ") != nil {
+		t.Fatalf("blank path must yield nil")
+	}
+	// The model-label cleaner still drops the same names, which is why folder
+	// paths must not go through it.
+	if cleaned := CleanWikiCategoryPath([]string{"概念"}); len(cleaned) != 0 {
+		t.Fatalf("CleanWikiCategoryPath(概念) = %v, want empty", cleaned)
 	}
 }

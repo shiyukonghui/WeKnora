@@ -6,14 +6,11 @@ import (
 	"fmt"
 	"regexp"
 	"strings"
-	"time"
 
 	"github.com/Tencent/WeKnora/internal/config"
-	"github.com/Tencent/WeKnora/internal/event"
 	"github.com/Tencent/WeKnora/internal/models/chat"
 	"github.com/Tencent/WeKnora/internal/types"
 	"github.com/Tencent/WeKnora/internal/types/interfaces"
-	"github.com/google/uuid"
 )
 
 // PluginQueryUnderstand performs query rewriting and intent classification.
@@ -22,6 +19,7 @@ import (
 type PluginQueryUnderstand struct {
 	modelService   interfaces.ModelService
 	messageService interfaces.MessageService
+	memoryService  interfaces.MemoryService
 	config         *config.Config
 }
 
@@ -37,11 +35,13 @@ type queryUnderstandOutput struct {
 // and registers it with the event manager.
 func NewPluginQueryUnderstand(eventManager *EventManager,
 	modelService interfaces.ModelService, messageService interfaces.MessageService,
+	memoryService interfaces.MemoryService,
 	config *config.Config,
 ) *PluginQueryUnderstand {
 	res := &PluginQueryUnderstand{
 		modelService:   modelService,
 		messageService: messageService,
+		memoryService:  memoryService,
 		config:         config,
 	}
 	eventManager.Register(res)
@@ -103,7 +103,7 @@ func (p *PluginQueryUnderstand) OnEvent(ctx context.Context,
 	}
 
 	// --- Build prompts ---
-	systemContent, userContent := p.buildPrompts(chatManage, historyList)
+	systemContent, userContent := p.buildPrompts(ctx, chatManage, historyList)
 
 	userMsg := chat.Message{Role: "user", Content: userContent}
 	if useImages {
@@ -115,24 +115,10 @@ func (p *PluginQueryUnderstand) OnEvent(ctx context.Context,
 		maxTokens = 500
 	}
 
-	// --- Emit progress event for image analysis ---
-	var toolCallID string
-	if useImages && chatManage.EventBus != nil {
-		toolCallID = uuid.New().String()
-		chatManage.EventBus.Emit(ctx, types.Event{
-			Type:      types.EventType(event.EventAgentToolCall),
-			SessionID: chatManage.SessionID,
-			Data: event.AgentToolCallData{
-				ToolCallID: toolCallID,
-				ToolName:   "image_analysis",
-			},
-		})
-	}
-
 	// --- Call model ---
 	thinking := false
-	vlmStart := time.Now()
-	response, err := rewriteModel.Chat(ctx, []chat.Message{
+	modelCtx := types.WithLLMCallMetadata(ctx, "query_rewrite", "")
+	response, err := rewriteModel.Chat(modelCtx, []chat.Message{
 		{Role: "system", Content: systemContent},
 		userMsg,
 	}, &chat.ChatOptions{
@@ -141,39 +127,11 @@ func (p *PluginQueryUnderstand) OnEvent(ctx context.Context,
 		Thinking:            &thinking,
 	})
 	if err != nil {
-		if toolCallID != "" && chatManage.EventBus != nil {
-			chatManage.EventBus.Emit(ctx, types.Event{
-				Type:      types.EventType(event.EventAgentToolResult),
-				SessionID: chatManage.SessionID,
-				Data: event.AgentToolResultData{
-					ToolCallID: toolCallID,
-					ToolName:   "image_analysis",
-					Output:     "图片分析失败",
-					Success:    false,
-					Duration:   time.Since(vlmStart).Milliseconds(),
-				},
-			})
-		}
 		pipelineError(ctx, "QueryUnderstand", "model_call", map[string]interface{}{
 			"session_id": chatManage.SessionID,
 			"error":      err.Error(),
 		})
 		return next()
-	}
-
-	// --- Emit completion event for image analysis ---
-	if toolCallID != "" && chatManage.EventBus != nil {
-		chatManage.EventBus.Emit(ctx, types.Event{
-			Type:      types.EventType(event.EventAgentToolResult),
-			SessionID: chatManage.SessionID,
-			Data: event.AgentToolResultData{
-				ToolCallID: toolCallID,
-				ToolName:   "image_analysis",
-				Output:     "已分析图片内容",
-				Success:    true,
-				Duration:   time.Since(vlmStart).Milliseconds(),
-			},
-		})
 	}
 
 	// --- Parse structured output ---
@@ -187,8 +145,7 @@ func (p *PluginQueryUnderstand) OnEvent(ctx context.Context,
 
 	// --- Apply intent-specific system prompt override ---
 	if !chatManage.NeedsRetrieval() {
-		if prompt, ok := p.config.Conversation.IntentSystemPrompts[string(chatManage.Intent)]; ok {
-			chatManage.SystemPromptOverride = prompt
+		if applyIntentPromptOverride(chatManage, p.config.Conversation.IntentSystemPrompts) {
 			pipelineInfo(ctx, "QueryUnderstand", "prompt_override", map[string]interface{}{
 				"session_id": chatManage.SessionID,
 				"intent":     chatManage.Intent,
@@ -237,10 +194,15 @@ func (p *PluginQueryUnderstand) updateUserMessageImageCaption(ctx context.Contex
 
 // loadHistory fetches and processes conversation history for rewrite context.
 func (p *PluginQueryUnderstand) loadHistory(ctx context.Context, chatManage *types.ChatManage) []*types.History {
-	maxRounds := p.config.Conversation.MaxRounds
-	if chatManage.MaxRounds > 0 {
-		maxRounds = chatManage.MaxRounds
+	// Honor the multi-turn-disabled signal: chatManage.MaxRounds == 0 is set
+	// explicitly by applyAgentOverridesToChatManage when the custom agent has
+	// MultiTurnEnabled=false. We must not silently fall back to the global
+	// default, otherwise rewrite + image analysis would still pull old turns
+	// into the context and leak through chatManage.History.
+	if chatManage.MaxRounds <= 0 {
+		return nil
 	}
+	maxRounds := chatManage.MaxRounds
 
 	historyList, err := loadAndProcessHistory(ctx, p.messageService, chatManage.SessionID, maxRounds, 20)
 	if err != nil {
@@ -293,11 +255,27 @@ func (p *PluginQueryUnderstand) selectModel(ctx context.Context, chatManage *typ
 		})
 	}
 
-	m, err := p.modelService.GetChatModel(ctx, chatManage.ChatModelID)
+	textModelID := chatManage.ChatModelID
+	if chatManage.QueryUnderstandModelID != "" {
+		textModelID = chatManage.QueryUnderstandModelID
+	}
+	m, err := p.modelService.GetChatModel(ctx, textModelID)
 	if err != nil {
+		// Fall back to ChatModelID when a dedicated query-understand model was
+		// configured but cannot be resolved (e.g. deleted / disabled).
+		if chatManage.QueryUnderstandModelID != "" && textModelID != chatManage.ChatModelID {
+			pipelineWarn(ctx, "QueryUnderstand", "query_understand_model_fallback", map[string]interface{}{
+				"session_id":                chatManage.SessionID,
+				"query_understand_model_id": chatManage.QueryUnderstandModelID,
+				"error":                     err.Error(),
+			})
+			if fallback, fbErr := p.modelService.GetChatModel(ctx, chatManage.ChatModelID); fbErr == nil {
+				return fallback, false
+			}
+		}
 		pipelineError(ctx, "QueryUnderstand", "get_model", map[string]interface{}{
 			"session_id":    chatManage.SessionID,
-			"chat_model_id": chatManage.ChatModelID,
+			"chat_model_id": textModelID,
 			"error":         err.Error(),
 		})
 		return nil, false
@@ -306,7 +284,9 @@ func (p *PluginQueryUnderstand) selectModel(ctx context.Context, chatManage *typ
 }
 
 // buildPrompts constructs system and user prompts with placeholder replacement.
-func (p *PluginQueryUnderstand) buildPrompts(chatManage *types.ChatManage, historyList []*types.History) (string, string) {
+func (p *PluginQueryUnderstand) buildPrompts(
+	ctx context.Context, chatManage *types.ChatManage, historyList []*types.History,
+) (string, string) {
 	userPrompt := p.config.Conversation.RewritePromptUser
 	if chatManage.RewritePromptUser != "" {
 		userPrompt = chatManage.RewritePromptUser
@@ -329,6 +309,7 @@ func (p *PluginQueryUnderstand) buildPrompts(chatManage *types.ChatManage, histo
 	} else {
 		queryContent += "\n<no_document_attached />"
 	}
+	queryContent += p.memoryBackground(ctx, chatManage)
 
 	vals := types.PlaceholderValues{
 		"conversation": conversationText,
@@ -338,6 +319,58 @@ func (p *PluginQueryUnderstand) buildPrompts(chatManage *types.ChatManage, histo
 
 	return types.RenderPromptPlaceholders(systemPrompt, vals),
 		types.RenderPromptPlaceholders(userPrompt, vals)
+}
+
+// memoryBackground gives the rewriter who is asking.
+//
+// This is the point where long-term memory stops being a paragraph appended to
+// the answer prompt and starts changing what gets retrieved. "How do I tune the
+// segmentation" is a different search for someone who works on medical imaging
+// than for someone who works on autonomous driving, and the only place that
+// difference can be applied is before retrieval runs.
+//
+// It is deliberately advisory rather than a filter. Memory narrows nothing and
+// excludes no knowledge base: a stale note about last quarter's project must
+// not be able to make this quarter's documents unreachable.
+func (p *PluginQueryUnderstand) memoryBackground(ctx context.Context, chatManage *types.ChatManage) string {
+	if p.memoryService == nil {
+		return ""
+	}
+	memCtx := p.memoryService.RetrievalContextFor(ctx)
+	if memCtx.Empty() {
+		return ""
+	}
+
+	var b strings.Builder
+	b.WriteString("\n\n<asker_background note=\"背景仅用于消解指代和补全检索词，不要当作问题的一部分\">")
+	if memCtx.Background != "" {
+		b.WriteString("\n" + memCtx.Background)
+	}
+	if len(memCtx.Interests) > 0 {
+		b.WriteString("\n长期关注：" + strings.Join(memCtx.Interests, "、"))
+	}
+	if len(memCtx.Documents) > 0 {
+		b.WriteString("\n常查资料：" + strings.Join(memCtx.Documents, "、"))
+	}
+	b.WriteString("\n</asker_background>")
+
+	// Deliberately does not add to chatManage.UsedMemories. What this reads is
+	// the whole standing background, unfiltered — that is the right input for a
+	// rewriter, but reporting it would claim every turn recalled memories that
+	// have nothing to do with the question. Which memories this turn actually
+	// used is decided in MEMORY_RECALL, by relevance, and the profile entries
+	// here are already reported from there.
+	fields := map[string]interface{}{
+		"session_id": chatManage.SessionID,
+		"interests":  len(memCtx.Interests),
+		"documents":  len(memCtx.Documents),
+		"items":      len(memCtx.Items),
+	}
+	if len(memCtx.Interests) > 0 {
+		fields["interest_previews"] = memCtx.Interests
+	}
+	pipelineInfo(ctx, "QueryUnderstand", "memory_background", fields)
+	return b.String()
 }
 
 // parseOutput extracts the rewritten query, intent classification, and optional
@@ -359,11 +392,7 @@ func (p *PluginQueryUnderstand) parseOutput(chatManage *types.ChatManage, raw st
 		return
 	}
 
-	// If JSON parsing failed entirely, treat the raw text as the rewritten query
-	// and default to IntentKBSearch for safety.
-	if content != "" {
-		chatManage.RewriteQuery = content
-	}
+	// On parse failure, keep the original query and intent.
 }
 
 func parseStructuredQueryOutput(raw string) (queryUnderstandOutput, bool) {
@@ -446,6 +475,24 @@ func mergeImageDescAndOCR(desc, ocr string) (string, bool) {
 		return desc, true
 	}
 	return desc + "\n\n[OCR]\n" + ocr, true
+}
+
+// applyIntentPromptOverride resolves the system-prompt override for the current
+// non-retrieval intent. Agent-level overrides take precedence; otherwise the
+// tenant/global IntentSystemPrompts map is consulted. Whitespace-only agent
+// overrides are treated as unset and fall through to the global default. Returns
+// true when a non-empty override was applied.
+func applyIntentPromptOverride(chatManage *types.ChatManage, globalPrompts map[string]string) bool {
+	intentKey := string(chatManage.Intent)
+	if raw, ok := chatManage.IntentPromptOverrides[intentKey]; ok && strings.TrimSpace(raw) != "" {
+		chatManage.SystemPromptOverride = raw
+	}
+	if chatManage.SystemPromptOverride == "" {
+		if prompt, ok := globalPrompts[intentKey]; ok {
+			chatManage.SystemPromptOverride = prompt
+		}
+	}
+	return chatManage.SystemPromptOverride != ""
 }
 
 // formatConversationHistory formats conversation history for prompt template.

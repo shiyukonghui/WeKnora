@@ -9,6 +9,7 @@ import (
 	"fmt"
 	"io"
 	"net/http"
+	"net/url"
 	"strings"
 )
 
@@ -16,8 +17,10 @@ import (
 type MentionedItem struct {
 	ID     string `json:"id"`
 	Name   string `json:"name"`
-	Type   string `json:"type"`    // "kb" for knowledge base, "file" for file
+	Type   string `json:"type"`    // "kb", "file", "tag", "mcp", or "skill"
 	KBType string `json:"kb_type"` // "document" or "faq" (only for kb type)
+	KBID   string `json:"kb_id"`   // Parent knowledge base for file/tag mentions
+	KBName string `json:"kb_name"` // Display name for parent KB
 }
 
 // AgentQARequest agent Q&A request payload.
@@ -40,13 +43,25 @@ type AgentQARequest struct {
 type AgentResponseType string
 
 const (
-	AgentResponseTypeThinking   AgentResponseType = "thinking"
-	AgentResponseTypeToolCall   AgentResponseType = "tool_call"
+	// AgentResponseTypeThinking is emitted while the agent is reasoning.
+	AgentResponseTypeThinking AgentResponseType = "thinking"
+	// AgentResponseTypeToolCall is emitted when the agent invokes a tool.
+	AgentResponseTypeToolCall AgentResponseType = "tool_call"
+	// AgentResponseTypeToolResult is emitted when a tool returns.
 	AgentResponseTypeToolResult AgentResponseType = "tool_result"
+	// AgentResponseTypeReferences is emitted with knowledge references.
 	AgentResponseTypeReferences AgentResponseType = "references"
-	AgentResponseTypeAnswer     AgentResponseType = "answer"
+	// AgentResponseTypeAnswer is emitted for answer tokens.
+	AgentResponseTypeAnswer AgentResponseType = "answer"
+	// AgentResponseTypeReflection is emitted for agent reflection.
 	AgentResponseTypeReflection AgentResponseType = "reflection"
-	AgentResponseTypeError      AgentResponseType = "error"
+	// AgentResponseTypeError is emitted when the agent fails.
+	AgentResponseTypeError AgentResponseType = "error"
+	// AgentResponseTypeComplete is emitted when the agent run has finished.
+	AgentResponseTypeComplete AgentResponseType = "complete"
+	// AgentResponseTypeArtifactsPending is emitted while skill-generated files
+	// are still being collected after the answer has streamed.
+	AgentResponseTypeArtifactsPending AgentResponseType = "artifacts_pending"
 )
 
 // AgentStreamResponse agent streaming response
@@ -74,8 +89,10 @@ func (c *Client) AgentQAStream(ctx context.Context, sessionID string, query stri
 }
 
 // AgentQAStreamWithRequest performs agent-based Q&A with SSE streaming using the full request payload.
+// Pass ResourceURLOptions to receive public HTTP(S) file URLs in the stream.
 func (c *Client) AgentQAStreamWithRequest(ctx context.Context,
 	sessionID string, request *AgentQARequest, callback AgentEventCallback,
+	opts ...ResourceURLOptions,
 ) error {
 	if request == nil {
 		return fmt.Errorf("agent QA request cannot be nil")
@@ -85,7 +102,11 @@ func (c *Client) AgentQAStreamWithRequest(ctx context.Context,
 	}
 
 	path := fmt.Sprintf("/api/v1/agent-chat/%s", sessionID)
-	resp, err := c.doRequest(ctx, http.MethodPost, path, request, nil)
+	queryParams := url.Values{}
+	if len(opts) > 0 {
+		applyResourceURLQuery(queryParams, &opts[0])
+	}
+	resp, err := c.doRequestStream(ctx, http.MethodPost, path, request, queryParams)
 	if err != nil {
 		return fmt.Errorf("request failed: %w", err)
 	}
@@ -93,7 +114,7 @@ func (c *Client) AgentQAStreamWithRequest(ctx context.Context,
 
 	if resp.StatusCode < 200 || resp.StatusCode >= 300 {
 		body, _ := io.ReadAll(resp.Body)
-		return fmt.Errorf("HTTP error %d: %s", resp.StatusCode, string(body))
+		return newAPIError(resp.StatusCode, body)
 	}
 
 	// Process SSE stream
@@ -103,6 +124,11 @@ func (c *Client) AgentQAStreamWithRequest(ctx context.Context,
 // processAgentSSEStream processes the SSE stream and invokes callback for each event
 func (c *Client) processAgentSSEStream(reader io.Reader, callback AgentEventCallback) error {
 	scanner := bufio.NewScanner(reader)
+	// Default 64KiB per-line cap truncates large SSE data lines (the
+	// references event bundles chunk contents that can reach hundreds of
+	// KiB). Raise the cap so those lines parse instead of erroring with
+	// "bufio.Scanner: token too long".
+	scanner.Buffer(make([]byte, 0, 64*1024), 4*1024*1024)
 	var dataBuffer string
 
 	for scanner.Scan() {
@@ -118,6 +144,13 @@ func (c *Client) processAgentSSEStream(reader io.Reader, callback AgentEventCall
 
 				if err := callback(&streamResponse); err != nil {
 					return err
+				}
+				// A terminal error frame is the stream's final outcome even if a
+				// buggy/proxied server leaves the HTTP connection open and never
+				// follows it with `complete` or EOF. Deliver it to the callback
+				// first, then terminate the SDK call with an error.
+				if streamResponse.ResponseType == AgentResponseTypeError && streamResponse.Done {
+					return NewSSEStreamError(streamResponse.Content)
 				}
 				dataBuffer = ""
 			}

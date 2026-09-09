@@ -6,9 +6,11 @@ package interfaces
 
 import (
 	"context"
+	"time"
 
 	"github.com/Tencent/WeKnora/internal/types"
 	"github.com/hibiken/asynq"
+	"gorm.io/gorm"
 )
 
 // KnowledgeBaseService defines the knowledge base service interface
@@ -114,6 +116,11 @@ type KnowledgeBaseService interface {
 	//   - Possible errors such as not existing, insufficient permissions, etc.
 	CopyKnowledgeBase(ctx context.Context, src string, dst string) (*types.KnowledgeBase, *types.KnowledgeBase, error)
 
+	// DuplicateKnowledgeBase creates a new settings-only knowledge base duplicate.
+	// It does not copy knowledge entries, chunks, FAQ rows, wiki pages, indexes,
+	// data sources, shares, pins, or task state. A new UUID is always generated.
+	DuplicateKnowledgeBase(ctx context.Context, src string) (*types.KnowledgeBase, error)
+
 	// GetRepository gets the knowledge base repository
 	// Parameters:
 	//   - ctx: Context with authentication and request information
@@ -205,6 +212,38 @@ type KnowledgeBaseRepository interface {
 	//   - Possible errors such as record not existing, database errors, etc.
 	DeleteKnowledgeBase(ctx context.Context, id string) error
 
-	// TogglePinKnowledgeBase toggles the pin status of a knowledge base
-	TogglePinKnowledgeBase(ctx context.Context, id string, tenantID uint64) (*types.KnowledgeBase, error)
+	// CountByVectorStoreID counts active KBs bound to the given vector store
+	// within a tenant scope. Accepts a *gorm.DB handle so callers can share a
+	// transaction (e.g., the VectorStore delete guard's row-lock context) or
+	// run standalone (pass nil → uses the repository's default db).
+	//
+	// The soft-delete filter is applied automatically by the gorm.DeletedAt
+	// scope on KnowledgeBase; implementations MUST NOT add an explicit
+	// `deleted_at IS NULL` predicate (avoids divergence with the auto-scope).
+	CountByVectorStoreID(ctx context.Context, db *gorm.DB, tenantID uint64, storeID string) (int64, error)
+
+	// CountByModelID counts active KBs in the tenant that reference the given
+	// model ID in any model-binding field (embedding, summary, VLM, ASR, etc.).
+	CountByModelID(ctx context.Context, tenantID uint64, modelID string) (int64, error)
+	// ListModelUsages returns the minimal active KB projections that reference
+	// the model, with every matching binding merged per object. Implementations
+	// must cap the result at types.ModelUsageListLimit; callers that need the
+	// untruncated size should use CountByModelID.
+	ListModelUsages(ctx context.Context, tenantID uint64, modelID string) ([]types.ModelUsageResource, error)
+	// SetUserKBPin inserts or removes a row in user_kb_pins for the given
+	// (tenant, user, kb) triple. Returns the resulting pinned_at (nil when
+	// pinned=false) and an error. The tenant_id is captured to support
+	// efficient "wipe a tenant" cleanups even though (user_id, kb_id)
+	// alone would be unique in practice.
+	SetUserKBPin(
+		ctx context.Context, tenantID uint64, userID string, kbID string, pinned bool,
+	) (pinnedAt *time.Time, err error)
+
+	// ListUserKBPinIDs returns the kb_id → pinned_at map of every KB the
+	// given user has personally pinned in this tenant. Used by the list
+	// path to stamp KnowledgeBase.IsPinned / PinnedAt without a per-row
+	// roundtrip.
+	ListUserKBPinIDs(
+		ctx context.Context, tenantID uint64, userID string,
+	) (map[string]time.Time, error)
 }

@@ -108,7 +108,7 @@
                             <li><t-icon name="check" class="check-icon" />{{ $t('organization.editor.editorPerm1') }}</li>
                             <li><t-icon name="check" class="check-icon" />{{ $t('organization.editor.editorPerm2') }}</li>
                             <li><t-icon name="check" class="check-icon" />{{ $t('organization.editor.useSharedAgentsPerm') }}</li>
-                            <li><t-icon name="close" class="close-icon" />{{ $t('organization.editor.shareKBPerm') }}</li>
+                            <li><t-icon name="check" class="check-icon" />{{ $t('organization.editor.shareKBPerm') }}</li>
                             <li><t-icon name="close" class="close-icon" />{{ $t('organization.editor.editorPerm3') }}</li>
                           </ul>
                         </div>
@@ -491,7 +491,7 @@ watch(() => props.mode, () => {
 
 .sidebar-title {
   margin: 0;
-  font-family: "PingFang SC";
+  font-family: var(--app-font-family);
   font-size: 18px;
   font-weight: 600;
   color: var(--td-text-color-primary);
@@ -511,16 +511,17 @@ watch(() => props.mode, () => {
   border-radius: 6px;
   cursor: pointer;
   transition: all 0.2s ease;
-  font-family: "PingFang SC";
+  font-family: var(--app-font-family);
   font-size: 14px;
   color: var(--td-text-color-secondary);
 
   &:hover {
-    background: var(--td-bg-color-secondarycontainer);
+    background: var(--td-bg-color-container-hover);
+    color: var(--td-text-color-primary);
   }
 
   &.active {
-    background: var(--td-brand-color-light);
+    background: var(--td-bg-color-secondarycontainer);
     color: var(--td-brand-color);
     font-weight: 500;
   }
@@ -560,7 +561,7 @@ watch(() => props.mode, () => {
 
   .section-title {
     margin: 0 0 8px 0;
-    font-family: "PingFang SC";
+    font-family: var(--app-font-family);
     font-size: 16px;
     font-weight: 600;
     color: var(--td-text-color-primary);
@@ -568,7 +569,7 @@ watch(() => props.mode, () => {
 
   .section-desc {
     margin: 0;
-    font-family: "PingFang SC";
+    font-family: var(--app-font-family);
     font-size: 14px;
     color: var(--td-text-color-placeholder);
     line-height: 22px;
@@ -586,7 +587,7 @@ watch(() => props.mode, () => {
 .form-label {
   display: block;
   margin-bottom: 8px;
-  font-family: "PingFang SC";
+  font-family: var(--app-font-family);
   font-size: 14px;
   font-weight: 500;
   color: var(--td-text-color-primary);

@@ -6,13 +6,11 @@ import (
 	"fmt"
 	"math"
 	"sort"
-	"strconv"
 	"strings"
 	"sync"
 
 	"github.com/Tencent/WeKnora/internal/config"
 	"github.com/Tencent/WeKnora/internal/logger"
-	"github.com/Tencent/WeKnora/internal/models/chat"
 	"github.com/Tencent/WeKnora/internal/models/rerank"
 	"github.com/Tencent/WeKnora/internal/searchutil"
 	"github.com/Tencent/WeKnora/internal/types"
@@ -75,7 +73,7 @@ Avoid:
 
 ## Output
 Returns chunks ranked by semantic similarity, reranked when applicable.  
-Results represent conceptual relevance, not literal keyword overlap.`,
+Each chunk has a short cN source ID and belongs to a dN document ID. Results represent conceptual relevance, not literal keyword overlap. Use dN for document-level follow-up tool calls.`,
 	schema: json.RawMessage(`{
   "type": "object",
   "properties": {
@@ -90,7 +88,7 @@ Results represent conceptual relevance, not literal keyword overlap.`,
     },
     "knowledge_base_ids": {
       "type": "array",
-      "description": "Optional: KB IDs to search",
+      "description": "Optional: bound knowledge-base IDs (the short bN values shown in runtime context)",
       "items": {
         "type": "string"
       },
@@ -128,7 +126,6 @@ type KnowledgeSearchTool struct {
 	chunkService         interfaces.ChunkService
 	searchTargets        types.SearchTargets // Pre-computed unified search targets
 	rerankModel          rerank.Reranker
-	chatModel            chat.Chat      // Optional chat model for LLM-based reranking
 	config               *config.Config // Global config for fallback values
 
 	seenMu     sync.Mutex
@@ -142,7 +139,6 @@ func NewKnowledgeSearchTool(
 	chunkService interfaces.ChunkService,
 	searchTargets types.SearchTargets,
 	rerankModel rerank.Reranker,
-	chatModel chat.Chat,
 	cfg *config.Config,
 ) *KnowledgeSearchTool {
 	return &KnowledgeSearchTool{
@@ -152,7 +148,6 @@ func NewKnowledgeSearchTool(
 		chunkService:         chunkService,
 		searchTargets:        searchTargets,
 		rerankModel:          rerankModel,
-		chatModel:            chatModel,
 		config:               cfg,
 		seenChunks:           make(map[string]bool),
 	}
@@ -180,6 +175,9 @@ func (t *KnowledgeSearchTool) Execute(ctx context.Context, args json.RawMessage)
 	var userSpecifiedKBs []string
 	if len(input.KnowledgeBaseIDs) > 0 {
 		userSpecifiedKBs = input.KnowledgeBaseIDs
+		if err := validateKnowledgeBaseIDsInSearchTargets(t.searchTargets, userSpecifiedKBs); err != nil {
+			return &types.ToolResult{Success: false, Error: err.Error()}, err
+		}
 		logger.Infof(ctx, "[Tool][KnowledgeSearch] User specified %d knowledge bases: %v", len(userSpecifiedKBs), userSpecifiedKBs)
 	}
 
@@ -193,6 +191,9 @@ func (t *KnowledgeSearchTool) Execute(ctx context.Context, args json.RawMessage)
 		}
 		var filteredTargets types.SearchTargets
 		for _, target := range t.searchTargets {
+			if target == nil {
+				continue
+			}
 			if userKBSet[target.KnowledgeBaseID] {
 				filteredTargets = append(filteredTargets, target)
 			}
@@ -226,27 +227,12 @@ func (t *KnowledgeSearchTool) Execute(ctx context.Context, args json.RawMessage)
 
 	logger.Infof(ctx, "[Tool][KnowledgeSearch] Queries: %v", queries)
 
-	// Get search parameters from tenant conversation config, fallback to global config
+	// Search parameters: fall back to global config, then to hardcoded defaults.
+	// We used to read tenant.ConversationConfig here as the first source of
+	// truth, but that field was removed when the chat pipeline moved to
+	// CustomAgent — tenant-level KV settings now live on the agent itself.
 	var topK int
 	var vectorThreshold, keywordThreshold, minScore float64
-
-	// Try to get from tenant conversation config
-	if tenantVal := ctx.Value(types.TenantInfoContextKey); tenantVal != nil {
-		if tenant, ok := tenantVal.(*types.Tenant); ok && tenant != nil && tenant.ConversationConfig != nil {
-			cc := tenant.ConversationConfig
-			if cc.EmbeddingTopK > 0 {
-				topK = cc.EmbeddingTopK
-			}
-			if cc.VectorThreshold > 0 {
-				vectorThreshold = cc.VectorThreshold
-			}
-			if cc.KeywordThreshold > 0 {
-				keywordThreshold = cc.KeywordThreshold
-			}
-			// minScore is not in ConversationConfig, use default or config
-			minScore = 0.3
-		}
-	}
 
 	// Fallback to global config if not set
 	if topK == 0 && t.config != nil {
@@ -298,8 +284,7 @@ func (t *KnowledgeSearchTool) Execute(ctx context.Context, args json.RawMessage)
 	// Deduplicate before reranking to reduce processing overhead
 	deduplicatedBeforeRerank := t.deduplicateResults(allResults)
 
-	// Apply ReRank if model is configured
-	// Prefer chatModel (LLM-based reranking) over rerankModel if both are available
+	// Apply ReRank if model is configured.
 	// Use first query for reranking (or combine all queries if needed)
 	rerankQuery := ""
 	if len(queries) > 0 {
@@ -313,26 +298,9 @@ func (t *KnowledgeSearchTool) Execute(ctx context.Context, args json.RawMessage)
 	// Variable to hold results through reranking and MMR stages
 	var filteredResults []*searchResultWithMeta
 
-	if t.chatModel != nil && len(deduplicatedBeforeRerank) > 0 && rerankQuery != "" {
-		logger.Infof(
-			ctx,
-			"[Tool][KnowledgeSearch] Applying LLM-based rerank with model: %s, input: %d results, queries: %v",
-			t.chatModel.GetModelName(),
-			len(deduplicatedBeforeRerank),
-			queries,
-		)
-		rerankedResults, err := t.rerankResults(ctx, rerankQuery, deduplicatedBeforeRerank)
-		if err != nil {
-			logger.Warnf(ctx, "[Tool][KnowledgeSearch] LLM rerank failed, using original results: %v", err)
-			filteredResults = deduplicatedBeforeRerank
-		} else {
-			filteredResults = rerankedResults
-			logger.Infof(ctx, "[Tool][KnowledgeSearch] LLM rerank completed successfully: %d results",
-				len(filteredResults))
-		}
-	} else if t.rerankModel != nil && len(deduplicatedBeforeRerank) > 0 && rerankQuery != "" {
-		logger.Infof(ctx, "[Tool][KnowledgeSearch] Applying rerank with model: %s, input: %d results, queries: %v",
-			t.rerankModel.GetModelName(), len(deduplicatedBeforeRerank), queries)
+	if t.rerankModel != nil && len(deduplicatedBeforeRerank) > 0 && rerankQuery != "" {
+		logger.Infof(ctx, "[Tool][KnowledgeSearch] Applying rerank, input: %d results, threshold: %.2f, queries: %v",
+			len(deduplicatedBeforeRerank), t.rerankThreshold(), queries)
 		rerankedResults, err := t.rerankResults(ctx, rerankQuery, deduplicatedBeforeRerank)
 		if err != nil {
 			logger.Warnf(ctx, "[Tool][KnowledgeSearch] Rerank failed, using original results: %v", err)
@@ -343,7 +311,7 @@ func (t *KnowledgeSearchTool) Execute(ctx context.Context, args json.RawMessage)
 				len(filteredResults))
 		}
 	} else {
-		// No reranking, use deduplicated results
+		// No reranking model available, use deduplicated results
 		filteredResults = deduplicatedBeforeRerank
 	}
 
@@ -393,12 +361,12 @@ func (t *KnowledgeSearchTool) Execute(ctx context.Context, args json.RawMessage)
 		return deduplicatedResults[i].KnowledgeID < deduplicatedResults[j].KnowledgeID
 	})
 
-	// Log top results
+	// Log all ranked results (including lower ranks for rerank debugging)
 	if len(deduplicatedResults) > 0 {
-		for i := 0; i < len(deduplicatedResults) && i < 5; i++ {
-			r := deduplicatedResults[i]
-			logger.Infof(ctx, "[Tool][KnowledgeSearch][Top %d] score=%.3f, type=%s, kb=%s, chunk_id=%s",
-				i+1, r.Score, r.QueryType, r.KnowledgeID, r.ID)
+		total := len(deduplicatedResults)
+		for i, r := range deduplicatedResults {
+			logger.Infof(ctx, "[Tool][KnowledgeSearch][Rank %d/%d] score=%.3f, type=%s, kb=%s, chunk_id=%s",
+				i+1, total, r.Score, r.QueryType, r.KnowledgeID, r.ID)
 		}
 	}
 
@@ -492,6 +460,9 @@ func (t *KnowledgeSearchTool) concurrentSearchByTargets(
 	}
 	filteredTargets := make(types.SearchTargets, 0, len(searchTargets))
 	for _, st := range searchTargets {
+		if st == nil || st.KnowledgeBaseID == "" {
+			continue
+		}
 		if searchableKBs[st.KnowledgeBaseID] {
 			filteredTargets = append(filteredTargets, st)
 			continue
@@ -514,6 +485,9 @@ func (t *KnowledgeSearchTool) concurrentSearchByTargets(
 
 	groups := make(map[string][]*types.SearchTarget)
 	for _, st := range searchTargets {
+		if st == nil || st.KnowledgeBaseID == "" {
+			continue
+		}
 		key := modelKeyMap[st.KnowledgeBaseID]
 		groups[key] = append(groups[key], st)
 	}
@@ -544,7 +518,7 @@ func (t *KnowledgeSearchTool) concurrentSearchByTargets(
 				var fullKBIDs []string
 				var knowledgeTargets []*types.SearchTarget
 				for _, st := range targets {
-					if st.Type == types.SearchTargetTypeKnowledgeBase {
+					if st.Type == types.SearchTargetTypeKnowledgeBase && len(st.TagIDs) == 0 {
 						fullKBIDs = append(fullKBIDs, st.KnowledgeBaseID)
 					} else {
 						knowledgeTargets = append(knowledgeTargets, st)
@@ -591,13 +565,19 @@ func (t *KnowledgeSearchTool) concurrentSearchByTargets(
 					innerWg.Add(1)
 					go func() {
 						defer innerWg.Done()
+						stVectorThreshold, stKeywordThreshold := st.RecallThresholds(
+							vectorThreshold,
+							keywordThreshold,
+						)
 						searchParams := types.SearchParams{
 							QueryText:        q,
 							QueryEmbedding:   queryEmbedding,
 							MatchCount:       topK,
-							VectorThreshold:  vectorThreshold,
-							KeywordThreshold: keywordThreshold,
+							VectorThreshold:  stVectorThreshold,
+							KeywordThreshold: stKeywordThreshold,
 							KnowledgeIDs:     st.KnowledgeIDs,
+							TagIDs:           st.TagIDs,
+							ScopeTagIDs:      st.ScopeTagIDs,
 						}
 						kbResults, err := t.knowledgeBaseService.HybridSearch(ctx, st.KnowledgeBaseID, searchParams)
 						if err != nil {
@@ -626,90 +606,43 @@ func (t *KnowledgeSearchTool) concurrentSearchByTargets(
 	return allResults
 }
 
-// rerankResults applies reranking to search results using LLM prompt scoring or rerank model
+// rerankResults applies reranking to all search results (including FAQ entries)
+// using the configured rerank model, then filters by threshold and applies
+// composite scoring so MMR/sorting uses a single score scale.
+//
+// A failed rerank call degrades to the raw retrieval order, mirroring the chat
+// pipeline's api_error_fallback. An empty result after threshold filtering is
+// kept empty: filterRerankRankResults already preserves the top candidate down
+// to agentRerankFallbackMinScore, so reaching zero means even the best match is
+// below that floor. There is deliberately no chat-model re-scoring path here —
+// it mixed the reranker's [0,1] scale with raw RRF scores and could resurrect
+// candidates the reranker had already rejected.
 func (t *KnowledgeSearchTool) rerankResults(
 	ctx context.Context,
 	query string,
 	results []*searchResultWithMeta,
 ) ([]*searchResultWithMeta, error) {
-	// Separate FAQ and normal results.
-	// FAQ results keep original scores and bypass reranking model.
-	faqResults := make([]*searchResultWithMeta, 0)
-	rerankCandidates := make([]*searchResultWithMeta, 0, len(results))
-
-	for _, result := range results {
-		// Skip reranking for FAQ results (they are explicitly matched Q&A pairs)
-		if result.KnowledgeBaseType == types.KnowledgeBaseTypeFAQ {
-			faqResults = append(faqResults, result)
-		} else {
-			rerankCandidates = append(rerankCandidates, result)
-		}
-	}
-
-	// If there are no candidates to rerank, return original list (already all FAQ)
-	if len(rerankCandidates) == 0 {
+	if len(results) == 0 || t.rerankModel == nil {
 		return results, nil
 	}
 
-	var (
-		rerankedCandidates []*searchResultWithMeta
-		err                error
-	)
-
-	// Apply reranking only to candidates
-	// Try rerankModel first, fallback to chatModel if rerankModel fails or returns no results
-	if t.rerankModel != nil {
-		rerankedCandidates, err = t.rerankWithModel(ctx, query, rerankCandidates)
-		// If rerankModel fails or returns no results, fallback to chatModel
-		if err != nil || len(rerankedCandidates) == 0 {
-			if err != nil {
-				logger.Warnf(ctx, "[Tool][KnowledgeSearch] Rerank model failed, falling back to chat model: %v", err)
-			} else {
-				logger.Warnf(ctx, "[Tool][KnowledgeSearch] Rerank model returned no results, falling back to chat model")
-			}
-			// Reset error to allow fallback
-			err = nil
-			// Try chatModel if available
-			if t.chatModel != nil {
-				rerankedCandidates, err = t.rerankWithLLM(ctx, query, rerankCandidates)
-			} else {
-				// No fallback available, use original results
-				rerankedCandidates = rerankCandidates
-			}
-		}
-	} else if t.chatModel != nil {
-		// No rerankModel, use chatModel directly
-		rerankedCandidates, err = t.rerankWithLLM(ctx, query, rerankCandidates)
-	} else {
-		// No reranking available, use original results
-		rerankedCandidates = rerankCandidates
-	}
-
+	rankResults, err := t.rerankScores(ctx, query, results)
 	if err != nil {
-		return nil, err
+		logger.Warnf(ctx,
+			"[Tool][KnowledgeSearch] Rerank model failed, using raw retrieval results: %v", err)
+		return results, nil
 	}
 
-	// Apply composite scoring to reranked results
-	logger.Debugf(ctx, "[Tool][KnowledgeSearch] Applying composite scoring")
-
-	// Store base scores before composite scoring
-	for _, result := range rerankedCandidates {
-		baseScore := result.Score
-		// Apply composite score
-		result.Score = t.compositeScore(result, result.Score, baseScore)
-	}
-
-	// Combine FAQ results (with original order) and reranked candidates
-	combined := make([]*searchResultWithMeta, 0, len(results))
-	combined = append(combined, faqResults...)
-	combined = append(combined, rerankedCandidates...)
-
-	// Sort by score (descending) to keep consistent output order
-	sort.Slice(combined, func(i, j int) bool {
-		return combined[i].Score > combined[j].Score
-	})
-
-	return combined, nil
+	threshold := t.rerankThreshold()
+	reranked := t.applyModelRerankScores(
+		results,
+		rankResults,
+		threshold,
+		t.searchTargets.HasRecallThresholdOverride(),
+	)
+	logger.Infof(ctx, "[Tool][KnowledgeSearch] Reranked %d/%d results above threshold %.2f",
+		len(reranked), len(results), threshold)
+	return reranked, nil
 }
 
 func (t *KnowledgeSearchTool) getFAQMetadata(
@@ -744,281 +677,85 @@ func (t *KnowledgeSearchTool) getFAQMetadata(
 	return meta, nil
 }
 
-// rerankWithLLM uses LLM prompt to score and rerank search results
-// Uses batch processing to handle large result sets efficiently
-func (t *KnowledgeSearchTool) rerankWithLLM(
+// rerankScores scores the candidates with the configured rerank model and
+// returns the raw relevance scores, leaving threshold filtering and composite
+// scoring to the caller.
+func (t *KnowledgeSearchTool) rerankScores(
 	ctx context.Context,
 	query string,
 	results []*searchResultWithMeta,
-) ([]*searchResultWithMeta, error) {
-	logger.Infof(ctx, "[Tool][KnowledgeSearch] Using LLM for reranking %d results", len(results))
-
-	if len(results) == 0 {
-		return results, nil
-	}
-
-	// Batch size: process 15 results at a time to balance quality and token usage
-	// This prevents token overflow and improves processing efficiency
-	const batchSize = 15
-	const maxContentLength = 800 // Maximum characters per passage to avoid excessive tokens
-
-	// Process in batches
-	allScores := make([]float64, len(results))
-	allReranked := make([]*searchResultWithMeta, 0, len(results))
-
-	for batchStart := 0; batchStart < len(results); batchStart += batchSize {
-		batchEnd := batchStart + batchSize
-		if batchEnd > len(results) {
-			batchEnd = len(results)
-		}
-
-		batch := results[batchStart:batchEnd]
-		logger.Debugf(ctx, "[Tool][KnowledgeSearch] Processing rerank batch %d-%d of %d results",
-			batchStart+1, batchEnd, len(results))
-
-		// Build prompt with query and batch passages
-		var passagesBuilder strings.Builder
-		for i, result := range batch {
-			// Get enriched passage (content + image info)
-			enrichedContent := t.getEnrichedPassage(ctx, result.SearchResult)
-			// Truncate content if too long to save tokens
-			content := enrichedContent
-			if len([]rune(content)) > maxContentLength {
-				runes := []rune(content)
-				content = string(runes[:maxContentLength]) + "..."
-			}
-			// Use clear separators to distinguish each passage
-			if i > 0 {
-				passagesBuilder.WriteString("\n")
-			}
-			passagesBuilder.WriteString("─────────────────────────────────────────────────────────────\n")
-			passagesBuilder.WriteString(fmt.Sprintf("Passage %d:\n", i+1))
-			passagesBuilder.WriteString("─────────────────────────────────────────────────────────────\n")
-			passagesBuilder.WriteString(content + "\n")
-		}
-
-		// Optimized prompt focused on retrieval matching and reranking
-		prompt := fmt.Sprintf(
-			`You are a search result reranking expert. Your task is to evaluate how well each retrieved passage matches the user's search query and information need.
-
-User Query: %s
-
-Your task: Rerank these search results by evaluating their retrieval relevance - how well each passage answers or relates to the query.
-
-Scoring Criteria (0.0 to 1.0):
-- 1.0 (0.9-1.0): Directly answers the query, contains key information needed, highly relevant
-- 0.8 (0.7-0.8): Strongly related, provides substantial relevant information
-- 0.6 (0.5-0.6): Moderately related, contains some relevant information but may be incomplete
-- 0.4 (0.3-0.4): Weakly related, minimal relevance to the query
-- 0.2 (0.1-0.2): Barely related, mostly irrelevant
-- 0.0 (0.0): Completely irrelevant, no relation to the query
-
-Evaluation Factors:
-1. Query-Answer Match: Does the passage directly address what the user is asking?
-2. Information Completeness: Does it provide sufficient information to answer the query?
-3. Semantic Relevance: Does the content semantically relate to the query intent?
-4. Key Term Coverage: Does it cover important terms/concepts from the query?
-5. Information Accuracy: Is the information accurate and trustworthy?
-
-Retrieved Passages:
-%s
-
-IMPORTANT: Return exactly %d scores, one per line, in this exact format:
-Passage 1: X.XX
-Passage 2: X.XX
-Passage 3: X.XX
-...
-Passage %d: X.XX
-
-Output only the scores, no explanations or additional text.`,
-			query,
-			passagesBuilder.String(),
-			len(batch),
-			len(batch),
-		)
-
-		messages := []chat.Message{
-			{
-				Role:    "system",
-				Content: "You are a professional search result reranking expert specializing in information retrieval. You evaluate how well retrieved passages match user queries in search scenarios. Focus on retrieval relevance: whether the passage answers the query, provides needed information, and matches the user's information need. Always respond with scores only, no explanations.",
-			},
-			{
-				Role:    "user",
-				Content: prompt,
-			},
-		}
-
-		// Calculate appropriate max tokens based on batch size
-		// Each score line is ~15 tokens, add buffer for safety
-		maxTokens := len(batch)*20 + 100
-
-		response, err := t.chatModel.Chat(ctx, messages, &chat.ChatOptions{
-			Temperature: 0.1, // Low temperature for consistent scoring
-			MaxTokens:   maxTokens,
-		})
-		if err != nil {
-			logger.Warnf(ctx, "[Tool][KnowledgeSearch] LLM rerank batch %d-%d failed: %v, using original scores",
-				batchStart+1, batchEnd, err)
-			// Use original scores for this batch on error
-			for i := batchStart; i < batchEnd; i++ {
-				allScores[i] = results[i].Score
-			}
-			continue
-		}
-
-		logger.Infof(ctx, "[Tool][KnowledgeSearch] LLM rerank batch %d-%d response: %s",
-			batchStart+1, batchEnd, response.Content)
-
-		// Parse scores from response
-		batchScores, err := t.parseScoresFromResponse(response.Content, len(batch))
-		if err != nil {
-			logger.Warnf(
-				ctx,
-				"[Tool][KnowledgeSearch] Failed to parse LLM scores for batch %d-%d: %v, using original scores",
-				batchStart+1,
-				batchEnd,
-				err,
-			)
-			// Use original scores for this batch on parsing error
-			for i := batchStart; i < batchEnd; i++ {
-				allScores[i] = results[i].Score
-			}
-			continue
-		}
-
-		// Store scores for this batch
-		for i, score := range batchScores {
-			if batchStart+i < len(allScores) {
-				allScores[batchStart+i] = score
-			}
-		}
-	}
-
-	// Create reranked results with new scores
-	for i, result := range results {
-		newResult := *result
-		if i < len(allScores) {
-			newResult.Score = allScores[i]
-		}
-		allReranked = append(allReranked, &newResult)
-	}
-
-	// Sort by new scores (descending)
-	sort.Slice(allReranked, func(i, j int) bool {
-		return allReranked[i].Score > allReranked[j].Score
-	})
-
-	logger.Infof(ctx, "[Tool][KnowledgeSearch] LLM reranked %d results from %d original results (processed in batches)",
-		len(allReranked), len(results))
-	return allReranked, nil
-}
-
-// parseScoresFromResponse parses scores from LLM response text
-func (t *KnowledgeSearchTool) parseScoresFromResponse(responseText string, expectedCount int) ([]float64, error) {
-	lines := strings.Split(strings.TrimSpace(responseText), "\n")
-	scores := make([]float64, 0, expectedCount)
-
-	for _, line := range lines {
-		line = strings.TrimSpace(line)
-		if line == "" {
-			continue
-		}
-
-		// Try to extract score from various formats:
-		// "Passage 1: 0.85"
-		// "1: 0.85"
-		// "0.85"
-		// etc.
-		parts := strings.Split(line, ":")
-		var scoreStr string
-		if len(parts) >= 2 {
-			scoreStr = strings.TrimSpace(parts[len(parts)-1])
-		} else {
-			scoreStr = strings.TrimSpace(line)
-		}
-
-		// Remove any non-numeric characters except decimal point
-		scoreStr = strings.TrimFunc(scoreStr, func(r rune) bool {
-			return (r < '0' || r > '9') && r != '.'
-		})
-
-		if scoreStr == "" {
-			continue
-		}
-
-		score, err := strconv.ParseFloat(scoreStr, 64)
-		if err != nil {
-			continue // Skip invalid scores
-		}
-
-		// Clamp score to [0.0, 1.0]
-		if score < 0.0 {
-			score = 0.0
-		}
-		if score > 1.0 {
-			score = 1.0
-		}
-
-		scores = append(scores, score)
-	}
-
-	if len(scores) == 0 {
-		return nil, fmt.Errorf("no valid scores found in response")
-	}
-
-	// If we got fewer scores than expected, pad with last score or 0.5
-	for len(scores) < expectedCount {
-		if len(scores) > 0 {
-			scores = append(scores, scores[len(scores)-1])
-		} else {
-			scores = append(scores, 0.5)
-		}
-	}
-
-	// Truncate if we got more scores than expected
-	if len(scores) > expectedCount {
-		scores = scores[:expectedCount]
-	}
-
-	return scores, nil
-}
-
-// rerankWithModel uses the rerank model for reranking (fallback)
-func (t *KnowledgeSearchTool) rerankWithModel(
-	ctx context.Context,
-	query string,
-	results []*searchResultWithMeta,
-) ([]*searchResultWithMeta, error) {
-	// Prepare passages for reranking (with enriched content including image info)
+) ([]rerank.RankResult, error) {
 	passages := make([]string, len(results))
 	for i, result := range results {
 		passages[i] = t.getEnrichedPassage(ctx, result.SearchResult)
 	}
 
-	// Call rerank model
 	rerankResp, err := t.rerankModel.Rerank(ctx, query, passages)
 	if err != nil {
 		return nil, fmt.Errorf("rerank call failed: %w", err)
 	}
+	return rerankResp, nil
+}
 
-	// Map reranked results back with new scores
-	reranked := make([]*searchResultWithMeta, 0, len(rerankResp))
-	for _, rr := range rerankResp {
-		if rr.Index >= 0 && rr.Index < len(results) {
-			// Create new result with reranked score
-			newResult := *results[rr.Index]
-			newResult.Score = rr.RelevanceScore
-			reranked = append(reranked, &newResult)
+func (t *KnowledgeSearchTool) rerankThreshold() float64 {
+	if t.config != nil && t.config.Conversation != nil && t.config.Conversation.RerankThreshold > 0 {
+		return t.config.Conversation.RerankThreshold
+	}
+	return 0.3
+}
+
+const agentRerankFallbackMinScore = 0.15
+
+func filterRerankRankResults(
+	rankResults []rerank.RankResult,
+	threshold float64,
+	preserveTop bool,
+) []rerank.RankResult {
+	if len(rankResults) == 0 {
+		return nil
+	}
+	filtered := make([]rerank.RankResult, 0, len(rankResults))
+	for _, r := range rankResults {
+		if r.RelevanceScore >= threshold {
+			filtered = append(filtered, r)
 		}
 	}
+	if len(filtered) == 0 {
+		top := rankResults[0]
+		for _, r := range rankResults[1:] {
+			if r.RelevanceScore > top.RelevanceScore {
+				top = r
+			}
+		}
+		if preserveTop || top.RelevanceScore >= agentRerankFallbackMinScore {
+			return []rerank.RankResult{top}
+		}
+	}
+	return filtered
+}
 
-	logger.Infof(
-		ctx,
-		"[Tool][KnowledgeSearch] Reranked %d results from %d original results",
-		len(reranked),
-		len(results),
-	)
-	return reranked, nil
+func (t *KnowledgeSearchTool) applyModelRerankScores(
+	originals []*searchResultWithMeta,
+	rankResults []rerank.RankResult,
+	threshold float64,
+	preserveTop bool,
+) []*searchResultWithMeta {
+	filtered := filterRerankRankResults(rankResults, threshold, preserveTop)
+	out := make([]*searchResultWithMeta, 0, len(filtered))
+	for _, rr := range filtered {
+		if rr.Index < 0 || rr.Index >= len(originals) {
+			continue
+		}
+		newResult := *originals[rr.Index]
+		baseScore := newResult.Score
+		modelScore := rr.RelevanceScore
+		newResult.Score = t.compositeScore(&newResult, modelScore, baseScore)
+		out = append(out, &newResult)
+	}
+	sort.Slice(out, func(i, j int) bool {
+		return out[i].Score > out[j].Score
+	})
+	return out
 }
 
 // deduplicateResults removes duplicate chunks, keeping the highest score
@@ -1095,6 +832,39 @@ func (t *KnowledgeSearchTool) buildContentSignature(content string) string {
 	return searchutil.BuildContentSignature(content)
 }
 
+// writeKnowledgeMetadataHeader emits document-scoped metadata once per
+// knowledge item. Chunk entries keep only chunk-specific content so repeated
+// results from the same document do not waste model context.
+func writeKnowledgeMetadataHeader(ob *strings.Builder, results []*searchResultWithMeta) {
+	seen := make(map[string]struct{}, len(results))
+	hasMetadata := false
+	var documents strings.Builder
+	for _, result := range results {
+		if result == nil || result.SearchResult == nil || result.KnowledgeID == "" || result.KnowledgeCustomMetadata == "" {
+			continue
+		}
+		if _, ok := seen[result.KnowledgeID]; ok {
+			continue
+		}
+		seen[result.KnowledgeID] = struct{}{}
+		hasMetadata = true
+		documents.WriteString(fmt.Sprintf(
+			"<document knowledge_id=\"%s\" knowledge_base_id=\"%s\" title=\"%s\">\n",
+			xmlEscape(result.KnowledgeID),
+			xmlEscape(result.KnowledgeBaseID),
+			xmlEscape(result.KnowledgeTitle),
+		))
+		documents.WriteString(fmt.Sprintf("<metadata>%s</metadata>\n", xmlEscape(result.KnowledgeCustomMetadata)))
+		documents.WriteString("</document>\n")
+	}
+	if !hasMetadata {
+		return
+	}
+	ob.WriteString("<documents>\n")
+	ob.WriteString(documents.String())
+	ob.WriteString("</documents>\n")
+}
+
 // formatOutput formats the search results for display
 func (t *KnowledgeSearchTool) formatOutput(
 	ctx context.Context,
@@ -1128,7 +898,7 @@ func (t *KnowledgeSearchTool) formatOutput(
 	// Count results by KB
 	kbCounts := make(map[string]int)
 	for _, r := range results {
-		kbCounts[r.KnowledgeID]++
+		kbCounts[r.KnowledgeBaseID]++
 	}
 
 	// Format individual results as XML. Tag names are kept in sync with
@@ -1140,8 +910,10 @@ func (t *KnowledgeSearchTool) formatOutput(
 	for _, q := range queries {
 		ob.WriteString(fmt.Sprintf("<query>%s</query>\n", xmlEscape(q)))
 	}
+	writeKnowledgeMetadataHeader(&ob, results)
 
 	formattedResults := make([]map[string]interface{}, 0, len(results))
+	enabled := true
 
 	faqMetadataCache := make(map[string]*types.FAQChunkMetadata)
 
@@ -1180,7 +952,8 @@ func (t *KnowledgeSearchTool) formatOutput(
 				_, total, err := t.chunkService.GetRepository().ListPagedChunksByKnowledgeID(ctx,
 					effectiveTenantID, result.KnowledgeID,
 					&types.Pagination{Page: 1, PageSize: 1},
-					[]types.ChunkType{types.ChunkTypeText, types.ChunkTypeFAQ}, "", "", "", "", "",
+					[]types.ChunkType{types.ChunkTypeText, types.ChunkTypeFAQ}, nil, "", "", "", "",
+					&enabled,
 				)
 				if err != nil {
 					logger.Warnf(ctx, "[Tool][KnowledgeSearch] Failed to get total chunks for knowledge %s: %v", result.KnowledgeID, err)
@@ -1196,36 +969,74 @@ func (t *KnowledgeSearchTool) formatOutput(
 		t.seenChunks[result.ID] = true
 		t.seenMu.Unlock()
 
+		isFAQ := faqMeta != nil
 		if seen {
 			// Compact rendering for chunks we already returned in a previous
 			// knowledge_search call during this session. The model has the
 			// content in context already, so re-emitting it only burns tokens.
-			ob.WriteString(fmt.Sprintf(
-				"<chunk rank=\"%d\" chunk_id=\"%s\" chunk_index=\"%d\" knowledge_id=\"%s\" knowledge_base_id=\"%s\" knowledge_title=\"%s\" score=\"%.3f\" source_query=\"%s\" already_seen=\"true\">\n",
-				i+1,
-				xmlEscape(result.ID),
-				result.ChunkIndex,
-				xmlEscape(result.KnowledgeID),
-				xmlEscape(result.KnowledgeBaseID),
-				xmlEscape(result.KnowledgeTitle),
-				result.Score,
-				xmlEscape(result.SourceQuery),
-			))
+			if isFAQ {
+				ob.WriteString(fmt.Sprintf(
+					"<faq rank=\"%d\" faq_id=\"%s\" index=\"%d\" knowledge_base_id=\"%s\" knowledge_title=\"%s\" score=\"%.3f\" source_query=\"%s\" already_seen=\"true\">\n",
+					i+1,
+					xmlEscape(result.ID),
+					result.ChunkIndex,
+					xmlEscape(result.KnowledgeBaseID),
+					xmlEscape(result.KnowledgeTitle),
+					result.Score,
+					xmlEscape(result.SourceQuery),
+				))
+			} else {
+				ob.WriteString(fmt.Sprintf(
+					"<chunk rank=\"%d\" chunk_id=\"%s\" chunk_index=\"%d\" knowledge_id=\"%s\" knowledge_base_id=\"%s\" knowledge_title=\"%s\" score=\"%.3f\" source_query=\"%s\" already_seen=\"true\">\n",
+					i+1,
+					xmlEscape(result.ID),
+					result.ChunkIndex,
+					xmlEscape(result.KnowledgeID),
+					xmlEscape(result.KnowledgeBaseID),
+					xmlEscape(result.KnowledgeTitle),
+					result.Score,
+					xmlEscape(result.SourceQuery),
+				))
+			}
 			ob.WriteString("<note>(content omitted, already returned in a previous knowledge_search call this session)</note>\n")
-			ob.WriteString("</chunk>\n")
+			if isFAQ {
+				ob.WriteString("</faq>\n")
+			} else {
+				ob.WriteString("</chunk>\n")
+			}
 		} else {
-			ob.WriteString(fmt.Sprintf(
-				"<chunk rank=\"%d\" chunk_id=\"%s\" chunk_index=\"%d\" knowledge_id=\"%s\" knowledge_base_id=\"%s\" knowledge_title=\"%s\" score=\"%.3f\" source_query=\"%s\">\n",
-				i+1,
-				xmlEscape(result.ID),
-				result.ChunkIndex,
-				xmlEscape(result.KnowledgeID),
-				xmlEscape(result.KnowledgeBaseID),
-				xmlEscape(result.KnowledgeTitle),
-				result.Score,
-				xmlEscape(result.SourceQuery),
-			))
-			if snippet := extractSnippetForQueries(result.Content, queries); snippet != "" {
+			if isFAQ {
+				ob.WriteString(fmt.Sprintf(
+					"<faq rank=\"%d\" faq_id=\"%s\" index=\"%d\" knowledge_base_id=\"%s\" knowledge_title=\"%s\" score=\"%.3f\" source_query=\"%s\">\n",
+					i+1,
+					xmlEscape(result.ID),
+					result.ChunkIndex,
+					xmlEscape(result.KnowledgeBaseID),
+					xmlEscape(result.KnowledgeTitle),
+					result.Score,
+					xmlEscape(result.SourceQuery),
+				))
+			} else {
+				ob.WriteString(fmt.Sprintf(
+					"<chunk rank=\"%d\" chunk_id=\"%s\" chunk_index=\"%d\" knowledge_id=\"%s\" knowledge_base_id=\"%s\" knowledge_title=\"%s\" score=\"%.3f\" source_query=\"%s\">\n",
+					i+1,
+					xmlEscape(result.ID),
+					result.ChunkIndex,
+					xmlEscape(result.KnowledgeID),
+					xmlEscape(result.KnowledgeBaseID),
+					xmlEscape(result.KnowledgeTitle),
+					result.Score,
+					xmlEscape(result.SourceQuery),
+				))
+			}
+			snippet := ""
+			if faqMeta != nil {
+				snippet = faqMatchSnippetFromQueries(faqMeta, queries)
+			}
+			if snippet == "" {
+				snippet = extractSnippetForQueries(result.Content, queries)
+			}
+			if snippet != "" {
 				ob.WriteString(fmt.Sprintf("<match_snippet>%s</match_snippet>\n", xmlEscape(snippet)))
 			}
 			ob.WriteString(fmt.Sprintf("<content>%s</content>\n", result.Content))
@@ -1234,45 +1045,29 @@ func (t *KnowledgeSearchTool) formatOutput(
 				var imageInfos []types.ImageInfo
 				if err := json.Unmarshal([]byte(result.ImageInfo), &imageInfos); err == nil && len(imageInfos) > 0 {
 					for _, img := range imageInfos {
-						ob.WriteString(fmt.Sprintf("<image url=\"%s\">\n", xmlEscape(img.URL)))
-						if img.Caption != "" {
-							ob.WriteString(fmt.Sprintf("<image_caption>%s</image_caption>\n", xmlEscape(img.Caption)))
+						if imageMarkdown := searchutil.BuildImageInfoMarkdownWithURL(img.URL, &img); imageMarkdown != "" {
+							ob.WriteString(imageMarkdown)
+							ob.WriteString("\n")
 						}
-						if img.OCRText != "" {
-							ob.WriteString(fmt.Sprintf("<image_ocr>%s</image_ocr>\n", xmlEscape(img.OCRText)))
-						}
-						ob.WriteString("</image>\n")
 					}
 				}
 			}
 
-			if faqMeta != nil {
-				ob.WriteString("<faq>\n")
-				if faqMeta.StandardQuestion != "" {
-					ob.WriteString(fmt.Sprintf("<question>%s</question>\n", xmlEscape(faqMeta.StandardQuestion)))
-				}
-				if len(faqMeta.SimilarQuestions) > 0 {
-					for _, sq := range faqMeta.SimilarQuestions {
-						ob.WriteString(fmt.Sprintf("<similar_question>%s</similar_question>\n", xmlEscape(sq)))
-					}
-				}
-				if len(faqMeta.Answers) > 0 {
-					for _, ans := range faqMeta.Answers {
-						ob.WriteString(fmt.Sprintf("<answer>%s</answer>\n", xmlEscape(ans)))
-					}
-				}
+			if isFAQ {
+				writeFAQFieldsXML(&ob, faqMeta)
 				ob.WriteString("</faq>\n")
+			} else {
+				ob.WriteString("</chunk>\n")
 			}
-
-			ob.WriteString("</chunk>\n")
 		}
 
 		formattedResults = append(formattedResults, map[string]interface{}{
 			"result_index":        i + 1,
-			"chunk_id":            result.ID,
 			"content":             result.Content,
 			"knowledge_id":        result.KnowledgeID,
+			"knowledge_base_id":   result.KnowledgeBaseID,
 			"knowledge_title":     result.KnowledgeTitle,
+			"knowledge_metadata":  result.KnowledgeCustomMetadata,
 			"match_type":          result.MatchType,
 			"source_query":        result.SourceQuery,
 			"query_type":          result.QueryType,
@@ -1307,15 +1102,18 @@ func (t *KnowledgeSearchTool) formatOutput(
 		}
 
 		if faqMeta != nil {
+			last["faq_id"] = result.ID
+			last["index"] = result.ChunkIndex
 			if faqMeta.StandardQuestion != "" {
 				last["faq_standard_question"] = faqMeta.StandardQuestion
 			}
-			if len(faqMeta.SimilarQuestions) > 0 {
-				last["faq_similar_questions"] = faqMeta.SimilarQuestions
-			}
+			appendSimilarQuestionsToChunkData(last, faqMeta.SimilarQuestions)
 			if len(faqMeta.Answers) > 0 {
 				last["faq_answers"] = faqMeta.Answers
 			}
+		} else {
+			last["chunk_id"] = result.ID
+			last["chunk_index"] = result.ChunkIndex
 		}
 	}
 
@@ -1471,23 +1269,20 @@ func (t *KnowledgeSearchTool) applyMMR(
 		tokenSets[i] = t.tokenizeSimple(t.getEnrichedPassage(ctx, r.SearchResult))
 	}
 
-	// MMR selection loop
+	// MMR selection loop, incremental form: maxRedundancy[i] caches candidate i's
+	// maximum jaccard against everything selected so far, so each round only needs
+	// one comparison per remaining candidate instead of one per (candidate, selected)
+	// pair. Selection output is identical to the naive form, including tie-breaking,
+	// because the candidate iteration order is unchanged.
+	selectedTokenSets := make([]map[string]struct{}, 0, k)
+	maxRedundancy := make([]float64, len(candidates))
 	for len(selected) < k && len(candidates) > 0 {
 		bestIdx := 0
 		bestScore := -1.0
 
 		for i, r := range candidates {
-			relevance := r.Score
-			redundancy := 0.0
-
-			// Calculate maximum redundancy with already selected results
-			for _, s := range selected {
-				selectedTokens := t.tokenizeSimple(t.getEnrichedPassage(ctx, s.SearchResult))
-				redundancy = math.Max(redundancy, t.jaccard(tokenSets[i], selectedTokens))
-			}
-
 			// MMR score: balance relevance and diversity
-			mmr := lambda*relevance - (1.0-lambda)*redundancy
+			mmr := lambda*r.Score - (1.0-lambda)*maxRedundancy[i]
 			if mmr > bestScore {
 				bestScore = mmr
 				bestIdx = i
@@ -1496,20 +1291,27 @@ func (t *KnowledgeSearchTool) applyMMR(
 
 		// Add best candidate to selected and remove from candidates
 		selected = append(selected, candidates[bestIdx])
+		chosenTokens := tokenSets[bestIdx]
+		selectedTokenSets = append(selectedTokenSets, chosenTokens)
 		candidates = append(candidates[:bestIdx], candidates[bestIdx+1:]...)
-		// Remove corresponding token set
+		// Remove corresponding token set and cached redundancy
 		tokenSets = append(tokenSets[:bestIdx], tokenSets[bestIdx+1:]...)
+		maxRedundancy = append(maxRedundancy[:bestIdx], maxRedundancy[bestIdx+1:]...)
+
+		// Fold the freshly selected result into every remaining candidate's cache
+		for i := range candidates {
+			maxRedundancy[i] = math.Max(maxRedundancy[i], t.jaccard(tokenSets[i], chosenTokens))
+		}
 	}
 
-	// Compute average redundancy among selected results
+	// Compute average redundancy among selected results, reusing the cached token
+	// sets instead of re-tokenizing every pair
 	avgRed := 0.0
-	if len(selected) > 1 {
+	if len(selectedTokenSets) > 1 {
 		pairs := 0
-		for i := 0; i < len(selected); i++ {
-			for j := i + 1; j < len(selected); j++ {
-				si := t.tokenizeSimple(t.getEnrichedPassage(ctx, selected[i].SearchResult))
-				sj := t.tokenizeSimple(t.getEnrichedPassage(ctx, selected[j].SearchResult))
-				avgRed += t.jaccard(si, sj)
+		for i := 0; i < len(selectedTokenSets); i++ {
+			for j := i + 1; j < len(selectedTokenSets); j++ {
+				avgRed += t.jaccard(selectedTokenSets[i], selectedTokenSets[j])
 				pairs++
 			}
 		}
@@ -1541,31 +1343,7 @@ func extractSnippetForQueries(content string, queries []string) string {
 		return ""
 	}
 
-	tokens := make([]string, 0, 8)
-	seen := make(map[string]struct{})
-	for _, q := range queries {
-		for _, tok := range strings.FieldsFunc(q, func(r rune) bool {
-			// Split on whitespace and common punctuation; keep CJK as whole tokens.
-			switch r {
-			case ' ', '\t', '\n', '\r', ',', '.', ';', ':', '?', '!',
-				'(', ')', '[', ']', '{', '}', '"', '\'':
-				return true
-			}
-			return false
-		}) {
-			tok = strings.ToLower(strings.TrimSpace(tok))
-			// Skip trivially-short stopwords. Three rune floor covers most
-			// English function words without chopping CJK bigrams.
-			if len([]rune(tok)) < 2 {
-				continue
-			}
-			if _, ok := seen[tok]; ok {
-				continue
-			}
-			seen[tok] = struct{}{}
-			tokens = append(tokens, tok)
-		}
-	}
+	tokens := searchQueryTokens(queries)
 
 	lowered := strings.ToLower(content)
 	earliest := -1
@@ -1582,11 +1360,10 @@ func extractSnippetForQueries(content string, queries []string) string {
 		}
 	}
 
-	const contextRunes = 60
 	if earliest < 0 {
 		runes := []rune(content)
-		if len(runes) > contextRunes*2 {
-			return strings.TrimSpace(string(runes[:contextRunes*2])) + " ..."
+		if len(runes) > snippetContextRunes*2 {
+			return strings.TrimSpace(string(runes[:snippetContextRunes*2])) + " ..."
 		}
 		return content
 	}
@@ -1596,12 +1373,12 @@ func extractSnippetForQueries(content string, queries []string) string {
 	after := content[earliestEnd:]
 
 	beforeRunes := []rune(before)
-	if len(beforeRunes) > contextRunes {
-		beforeRunes = beforeRunes[len(beforeRunes)-contextRunes:]
+	if len(beforeRunes) > snippetContextRunes {
+		beforeRunes = beforeRunes[len(beforeRunes)-snippetContextRunes:]
 	}
 	afterRunes := []rune(after)
-	if len(afterRunes) > contextRunes {
-		afterRunes = afterRunes[:contextRunes]
+	if len(afterRunes) > snippetContextRunes {
+		afterRunes = afterRunes[:snippetContextRunes]
 	}
 
 	snippet := string(beforeRunes) + matchStr + string(afterRunes)

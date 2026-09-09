@@ -17,9 +17,35 @@ export interface DataSource {
   last_sync_at: string | null
   last_sync_result: any
   error_message: string
+  // Single-field "credentials" map from the main response — DataSource
+  // credentials are a per-connector atomic set.
+  credentials?: { credentials: { configured: boolean } }
   created_at: string
   updated_at: string
   latest_sync_log?: SyncLog
+}
+
+/**
+ * One user-facing failure sample. The backend sends a stable i18n `code`
+ * (+ interpolation `params`) so the UI localises it to the viewer's language;
+ * `message` is a fallback when no i18n key exists (old logs decode into it).
+ */
+export interface SyncItemError {
+  title?: string
+  code?: string
+  params?: Record<string, string>
+  message?: string
+}
+
+export interface SyncResultDetail {
+  total?: number
+  created?: number
+  updated?: number
+  deleted?: number
+  skipped?: number
+  failed?: number
+  /** Per-item failure samples (capped); localised in the sync-log drawer. */
+  errors?: SyncItemError[]
 }
 
 export interface SyncLog {
@@ -35,6 +61,7 @@ export interface SyncLog {
   items_skipped: number
   items_failed: number
   error_message: string
+  result?: SyncResultDetail
 }
 
 export interface ConnectorMeta {
@@ -92,8 +119,19 @@ export function validateCredentials(type: string, credentials: Record<string, an
   return post('/api/v1/datasource/validate-credentials', { type, credentials })
 }
 
-export function listResources(id: string) {
-  return get(`/api/v1/datasource/${id}/resources`)
+// listResources lists selectable resources for a data source. Pass parentId to
+// lazily load the direct children of a resource (e.g. expanding a Feishu wiki
+// space/node), which avoids traversing the whole tree up front.
+export function listResources(id: string, parentId?: string) {
+  const query = parentId ? `?parent_id=${encodeURIComponent(parentId)}` : ''
+  return get(`/api/v1/datasource/${id}/resources${query}`, { timeout: 120000 })
+}
+
+// resolveResourceAncestors returns the ExternalIDs of every parent that must be
+// expanded to reveal the given (possibly deeply nested) selections in a lazily
+// loaded picker. Used when editing a data source to restore an existing selection.
+export function resolveResourceAncestors(id: string, resourceIds: string[]) {
+  return post(`/api/v1/datasource/${id}/resource-ancestors`, { resource_ids: resourceIds }, { timeout: 120000 })
 }
 
 export function triggerSync(id: string) {
@@ -110,4 +148,28 @@ export function resumeDataSource(id: string) {
 
 export function getSyncLogs(id: string, limit = 20, offset = 0) {
   return get(`/api/v1/datasource/${id}/logs?limit=${limit}&offset=${offset}`)
+}
+
+// ----------------------------------------------------------------------------
+// Data source credential subresource. Unlike the other three resources,
+// DataSource exposes a single logical field "credentials" because connector
+// auth is a per-connector atomic map. See internal/handler/dto/datasource.go.
+// ----------------------------------------------------------------------------
+
+export interface DataSourceCredentialsResponse {
+  fields: {
+    credentials: { configured: boolean }
+  }
+}
+
+export async function putDataSourceCredentials(
+  id: string,
+  credentials: Record<string, unknown>,
+): Promise<DataSourceCredentialsResponse> {
+  const response: any = await put(`/api/v1/datasource/${id}/credentials`, { credentials })
+  return (response.data ?? response) as DataSourceCredentialsResponse
+}
+
+export async function deleteDataSourceCredentials(id: string): Promise<void> {
+  await del(`/api/v1/datasource/${id}/credentials/credentials`)
 }

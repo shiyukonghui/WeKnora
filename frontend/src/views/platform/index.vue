@@ -1,30 +1,43 @@
 <template>
     <div class="main" ref="dropzone">
         <Menu></Menu>
-        <RouterView v-if="isRouterAlive" />
+        <div v-if="isRouterAlive" class="platform-route-outlet">
+            <RouterView />
+        </div>
         <div class="upload-mask" v-show="ismask">
-            <input type="file" style="display: none" ref="uploadInput" accept=".pdf,.docx,.doc,.pptx,.ppt,.txt,.md,.jpg,.jpeg,.png,.csv,.xls,.xlsx" />
             <UploadMask></UploadMask>
         </div>
         <!-- 全局设置模态框，供所有 platform 子路由使用 -->
         <Settings />
+        <!-- 全局命令面板 (⌘K)，随 platform 路由存活 -->
+        <GlobalCommandPalette />
+        <!-- 全局右上角"待处理邀请"铃铛。固定定位，z-index 低于抽屉，业务页面
+             右侧抽屉弹出时会自然覆盖；仅在有待处理邀请时渲染。 -->
+        <GlobalInvitationBell />
+        <!-- 带遮罩层的新手引导：首次进入自动开启，可从用户菜单顶部昵称旁帮助按钮重新打开 -->
+        <NewUserGuide />
     </div>
 </template>
 <script setup lang="ts">
 import Menu from '@/components/menu.vue'
-import { ref, onMounted, onUnmounted, nextTick, provide } from 'vue';
-import { useRoute } from 'vue-router'
-import useKnowledgeBase from '@/hooks/useKnowledgeBase'
+import { ref, onMounted, onUnmounted, nextTick, provide, watch } from 'vue';
+import { useRoute, useRouter } from 'vue-router'
 import UploadMask from '@/components/upload-mask.vue'
 import Settings from '@/views/settings/Settings.vue'
+import GlobalCommandPalette from '@/components/GlobalCommandPalette.vue'
+import GlobalInvitationBell from '@/components/GlobalInvitationBell.vue'
+import NewUserGuide from '@/components/NewUserGuide.vue'
+import { useCommandPaletteStore } from '@/stores/commandPalette'
+import { useChatResourcesStore } from '@/stores/chatResources'
 import { getKnowledgeBaseById } from '@/api/knowledge-base/index'
 import { MessagePlugin } from 'tdesign-vue-next'
 import { useI18n } from 'vue-i18n'
+import { collectDroppedFiles } from './collectDroppedFiles'
 
-let { requestMethod } = useKnowledgeBase()
 const route = useRoute();
+const router = useRouter();
+const commandPaletteStore = useCommandPaletteStore();
 let ismask = ref(false)
-let uploadInput = ref();
 const { t } = useI18n();
 
 const isRouterAlive = ref(true)
@@ -59,6 +72,12 @@ const getCurrentKbId = (): string | null => {
     return (route.params as any)?.kbId as string || null
 }
 
+const CHAT_DROP_ROUTE_NAMES = new Set(['chat', 'globalCreatChat', 'kbCreatChat']);
+
+const isChatDropRoute = () => {
+    return CHAT_DROP_ROUTE_NAMES.has(String(route.name || ''));
+}
+
 // 检查知识库初始化状态
 const checkKnowledgeBaseInitialization = async (): Promise<boolean> => {
     const currentKbId = getCurrentKbId();
@@ -90,8 +109,19 @@ const checkKnowledgeBaseInitialization = async (): Promise<boolean> => {
 }
 
 
+// isFileDrag distinguishes an OS file drag (the only thing the global upload
+// drop zone cares about) from an in-app element drag such as the wiki
+// folder/page drag-and-drop. Element drags carry only "text/*" types, never
+// "Files", so we bail out and let the originating component handle the drop.
+const isFileDrag = (event: DragEvent): boolean => {
+    const types = event.dataTransfer?.types
+    if (!types) return false
+    return Array.from(types).includes('Files')
+}
+
 // 全局拖拽事件处理
 const handleGlobalDragEnter = (event: DragEvent) => {
+    if (!isFileDrag(event)) return;
     event.preventDefault();
     dragCounter++;
     if (event.dataTransfer) {
@@ -101,6 +131,7 @@ const handleGlobalDragEnter = (event: DragEvent) => {
 }
 
 const handleGlobalDragOver = (event: DragEvent) => {
+    if (!isFileDrag(event)) return;
     event.preventDefault();
     if (event.dataTransfer) {
         event.dataTransfer.dropEffect = 'copy';
@@ -108,6 +139,7 @@ const handleGlobalDragOver = (event: DragEvent) => {
 }
 
 const handleGlobalDragLeave = (event: DragEvent) => {
+    if (!isFileDrag(event)) return;
     event.preventDefault();
     dragCounter--;
     if (dragCounter === 0) {
@@ -116,30 +148,33 @@ const handleGlobalDragLeave = (event: DragEvent) => {
 }
 
 const handleGlobalDrop = async (event: DragEvent) => {
+    if (!isFileDrag(event)) return;
     event.preventDefault();
     dragCounter = 0;
     ismask.value = false;
-    
-    const DataTransferFiles = event.dataTransfer?.files ? Array.from(event.dataTransfer.files) : [];
-    const DataTransferItemList = event.dataTransfer?.items ? Array.from(event.dataTransfer.items) : [];
+
+    const droppedFiles = await collectDroppedFiles(event);
+    if (droppedFiles.length === 0) {
+        MessagePlugin.warning(t('knowledgeBase.dragFileNotText'));
+        return;
+    }
+
+    if (isChatDropRoute()) {
+        event.stopPropagation();
+        window.dispatchEvent(new CustomEvent('weknora:chat-file-drop', {
+            detail: { files: droppedFiles }
+        }));
+        return;
+    }
     
     const isInitialized = await checkKnowledgeBaseInitialization();
     if (!isInitialized) {
         return;
     }
-    
-    if (DataTransferFiles.length > 0) {
-        DataTransferFiles.forEach(file => requestMethod(file, uploadInput));
-    } else if (DataTransferItemList.length > 0) {
-        DataTransferItemList.forEach(dataTransferItem => {
-            const fileEntry = dataTransferItem.webkitGetAsEntry() as FileSystemFileEntry | null;
-            if (fileEntry) {
-                fileEntry.file((file: File) => requestMethod(file, uploadInput));
-            }
-        });
-    } else {
-        MessagePlugin.warning(t('knowledgeBase.dragFileNotText'));
-    }
+
+    window.dispatchEvent(new CustomEvent('weknora:knowledge-file-drop', {
+        detail: { kbId: getCurrentKbId(), files: droppedFiles }
+    }));
 }
 
 // 组件挂载时添加全局事件监听器
@@ -155,7 +190,27 @@ onMounted(() => {
             reloadApp()
         })
     }
+    // 支持通过 URL 查询参数打开全局命令面板，例如旧路径
+    // /platform/knowledge-search?q=foo 重定向后携带 ?cmdk=foo
+    maybeOpenCmdkFromRoute()
+    // 后台预取对话输入栏资源，进入 creatChat / chat 时复用缓存
+    void useChatResourcesStore().prefetchChatInput()
 });
+
+// 监听路由变化，兼容 SPA 内部跳转时的 ?cmdk= 参数
+watch(() => route.query.cmdk, () => {
+    maybeOpenCmdkFromRoute()
+})
+
+function maybeOpenCmdkFromRoute() {
+    if (!('cmdk' in route.query)) return
+    const q = String(route.query.cmdk ?? '')
+    commandPaletteStore.openPalette(q)
+    // 清除 query，避免回退/刷新时反复触发
+    const newQuery = { ...route.query }
+    delete (newQuery as any).cmdk
+    router.replace({ path: route.path, query: newQuery, hash: route.hash })
+}
 
 // 组件卸载时移除全局事件监听器
 onUnmounted(() => {
@@ -177,11 +232,23 @@ onUnmounted(() => {
 <style lang="less">
 .main {
     display: flex;
+    align-items: stretch;
     width: 100%;
     height: 100%;
     min-width: 600px;
+    min-height: 0;
     /* 统一整页背景，让左侧菜单与右侧内容区视觉连贯 */
     background: var(--td-bg-color-container);
+}
+
+/* 右侧路由区：占满剩余宽度与整列高度，并把 min-height:0 传给子页面以便内部 flex 滚动 */
+.platform-route-outlet {
+    flex: 1;
+    min-width: 0;
+    min-height: 0;
+    display: flex;
+    flex-direction: column;
+    overflow: hidden;
 }
 
 .upload-mask {

@@ -61,14 +61,29 @@ type RecentDocInfo struct {
 	FAQAnswers          []string
 }
 
-// SelectedDocumentInfo contains summary information about a user-selected document (via @ mention)
-// Only metadata is included; content will be fetched via tools when needed
+// SelectedDocumentInfo contains summary information about a user-selected document (via @ mention).
+// Injected into the user message runtime_context (pinned_documents); content is fetched via tools.
 type SelectedDocumentInfo struct {
 	KnowledgeID     string // Knowledge ID
 	KnowledgeBaseID string // Knowledge base ID
 	Title           string // Document title
 	FileName        string // Original file name
 	FileType        string // File type (pdf, docx, etc.)
+}
+
+// PinnedMCPServiceInfo describes an MCP service explicitly @mentioned for this turn.
+type PinnedMCPServiceInfo struct {
+	Discoverable bool // Available through the scoped MCP directory.
+	ID           string
+	Name         string
+	Description  string
+	ToolNames    []string // Registered tool.function names for this service (mcp_{service}_{tool})
+}
+
+// PinnedSkillInfo describes a skill explicitly @mentioned for this turn.
+type PinnedSkillInfo struct {
+	Name        string
+	Description string
 }
 
 // KnowledgeBaseInfo contains essential information about a knowledge base for agent prompt
@@ -159,7 +174,7 @@ func formatKnowledgeBaseList(kbInfos []*KnowledgeBaseInfo) string {
 			} else {
 				b.WriteString("<recent_documents>\n")
 				for j, doc := range kb.RecentDocs {
-					if j >= 10 {
+					if j >= 2 {
 						break
 					}
 					docName := doc.Title
@@ -194,6 +209,9 @@ func formatKnowledgeBaseList(kbInfos []*KnowledgeBaseInfo) string {
 //     placeholder is expanded to a short pointer so legacy / custom
 //     templates that still reference `{{knowledge_bases}}` degrade
 //     gracefully instead of dumping the detail twice.
+//   - `<must_use>` is NOT a placeholder — when the user @mentions MCP/Skill,
+//     observe.buildMustUseBlock injects it as a sibling block in the user
+//     message; system prompts document it by convention (see agent_system_prompt.yaml).
 func renderPromptPlaceholders(template string, knowledgeBases []*KnowledgeBaseInfo) string {
 	result := template
 
@@ -212,68 +230,80 @@ func renderPromptPlaceholders(template string, knowledgeBases []*KnowledgeBaseIn
 
 // formatSkillsMetadata formats skills metadata for the system prompt (Level 1 - Progressive Disclosure)
 // This is a lightweight representation that only includes skill name and description
-func formatSkillsMetadata(skillsMetadata []*skills.SkillMetadata) string {
+func formatSkillsMetadata(skillsMetadata []*skills.SkillMetadata, shellExecEnabled bool) string {
 	if len(skillsMetadata) == 0 {
 		return ""
 	}
-
-	var builder strings.Builder
-	builder.WriteString("\n### Available Skills (IMPORTANT - READ CAREFULLY)\n\n")
-	builder.WriteString("**You MUST actively consider using these skills for EVERY user request.**\n\n")
-
-	builder.WriteString("#### Skill Matching Protocol (MANDATORY)\n\n")
-	builder.WriteString("Before responding to ANY user query, follow this checklist:\n\n")
-	builder.WriteString("1. **SCAN**: Read each skill's description and trigger conditions below\n")
-	builder.WriteString("2. **MATCH**: Check if the user's intent matches ANY skill's triggers (keywords, scenarios, or task types)\n")
-	builder.WriteString("3. **LOAD**: If a match is found, call `read_skill(skill_name=\"...\")` BEFORE generating your response\n")
-	builder.WriteString("4. **APPLY**: Follow the skill's instructions to provide a higher-quality, structured response\n\n")
-
-	builder.WriteString("**⚠️ CRITICAL**: Skill usage is MANDATORY when applicable. Do NOT skip skills to save time or tokens.\n\n")
-
-	builder.WriteString("#### Available Skills\n\n")
-	for i, skill := range skillsMetadata {
-		builder.WriteString(fmt.Sprintf("%d. **%s**\n", i+1, skill.Name))
-		builder.WriteString(fmt.Sprintf("   %s\n\n", skill.Description))
+	var b strings.Builder
+	b.WriteString("\n\nAvailable skills: read a relevant skill's listed SKILL.md resource with read_file before applying it. Load additional files only as needed; the returned file list already identifies bundled scripts.\n")
+	for _, skill := range skillsMetadata {
+		if skill != nil {
+			fmt.Fprintf(&b, "- %s: %s (read_file path=%q)\n", skill.Name, skill.Description, "skill://"+skill.Name+"/SKILL.md")
+		}
 	}
-
-	builder.WriteString("#### Tool Reference\n\n")
-	builder.WriteString("- `read_skill(skill_name)`: Load full skill instructions (MUST call before using a skill)\n")
-	builder.WriteString("- `execute_skill_script(skill_name, script_path, args, input)`: Run utility scripts bundled with a skill\n")
-	builder.WriteString("  - `input`: Pass data directly via stdin (use this when you have data in memory, e.g. JSON string)\n")
-	builder.WriteString("  - `args`: Command-line arguments (only use `--file` if you have an actual file path in the skill directory)\n")
-
-	return builder.String()
+	return b.String()
 }
 
-// formatSelectedDocuments formats selected documents for the prompt (summary only, no content)
-func formatSelectedDocuments(docs []*SelectedDocumentInfo) string {
-	if len(docs) == 0 {
+// formatToolGuidance uses the actual registry, so disabled capabilities never
+// leak into the runtime instructions. Mechanics and limits live in tool schemas.
+func formatToolGuidance(names []string) string {
+	if len(names) == 0 {
 		return ""
 	}
-
-	var builder strings.Builder
-	builder.WriteString("\n### User Selected Documents (via @ mention)\n")
-	builder.WriteString("The user has explicitly selected the following documents. ")
-	builder.WriteString("**You should prioritize searching and retrieving information from these documents when answering.**\n")
-	builder.WriteString("Use `list_knowledge_chunks` with the provided Knowledge IDs to fetch their content.\n\n")
-
-	builder.WriteString("| # | Document Name | Type | Knowledge ID |\n")
-	builder.WriteString("|---|---------------|------|---------------|\n")
-
-	for i, doc := range docs {
-		title := doc.Title
-		if title == "" {
-			title = doc.FileName
+	has := func(name string) bool {
+		for _, n := range names {
+			if n == name {
+				return true
+			}
 		}
-		fileType := doc.FileType
-		if fileType == "" {
-			fileType = "-"
-		}
-		builder.WriteString(fmt.Sprintf("| %d | %s | %s | `%s` |\n",
-			i+1, title, fileType, doc.KnowledgeID))
+		return false
 	}
-	builder.WriteString("\n")
+	var b strings.Builder
+	b.WriteString("\n\nTool execution: use only the tools provided for this turn. Plan internally; use a planning tool only when it helps. Read known paths directly. Batch independent reads; keep dependent operations in order. Inspect results before claiming completion.\n")
+	b.WriteString("For long-running operations, prefer a documented asynchronous mode when available. Use the returned task ID to wait or poll at the recommended interval and retrieve the completed result; after a timeout, check the existing task before resubmitting.\n")
+	b.WriteString("On failure, use the reported cause to correct the input or environment. Retry only after something relevant changes. Permission, policy, or missing-configuration failures are not fixed by switching tools; report the concrete blocker if it cannot be corrected within this session.\n")
+	if has("read_file") {
+		b.WriteString("Use read_file for workspace files, saved web:// pages and listed skill:// resources. " +
+			"In older instructions, translate read_skill(skill_name, file_path) to " +
+			"read_file(path=skill://<name>/<file_path or SKILL.md>) and read_sandbox_file to read_file.\n")
+	}
+	if has("shell_exec") || has("write_sandbox_file") {
+		b.WriteString("Session workspace: /workspace. Preserve uploaded originals in /workspace/input. " +
+			"/workspace/output is the only directory collected for download, " +
+			"so it takes finished deliverables only; " +
+			"keep drafts and intermediate files in another directory under /workspace. " +
+			"Commands start from their specified working directory on every call. " +
+			"Files and installed packages persist within the session.\n")
+		b.WriteString(sandboxArtifactReferenceGuidance())
+	}
+	if has("shell_exec") && has("read_file") {
+		b.WriteString("For listed skills, run bundled scripts and your own scripts with " +
+			"shell_exec(skill_name=..., command=...). This selects an installed skill's runtime " +
+			"or stages host skill resources, and applies scoped credentials; " +
+			"use $WEKNORA_SKILL_DIR for bundled files.\n")
+		b.WriteString("In older instructions, translate execute_skill_script(skill_name, script_path, ...) to shell_exec(skill_name=..., command=...).\n")
+	}
 
+	return b.String()
+}
+
+// sandboxArtifactReferenceGuidance tells the model how to point at a file it
+// generated in the sandbox from its final answer.
+//
+// Without this, models improvise a Markdown image with the bare file name
+// (`![评分](市场画像评分.html)`), which the browser cannot resolve — the answer
+// renders a broken image icon. The `sandbox:` prefix makes the intent explicit
+// so the server can bind the name to the artifact index it hands the client.
+func sandboxArtifactReferenceGuidance() string {
+	var builder strings.Builder
+	builder.WriteString("  - Include key generated deliverables in your final answer as ")
+	builder.WriteString("`![description](sandbox:<file name>)` using the exact file name and no directory path\n")
+	builder.WriteString("    - Images render inline; charts, tables, and documents ")
+	builder.WriteString("render as a card the user clicks to preview\n")
+	builder.WriteString("    - Never reference a sandbox path (`/workspace/output/...`) ")
+	builder.WriteString("or a bare file name directly — neither resolves in the browser\n")
+	builder.WriteString("    - Prefer output file names without spaces or parentheses; ")
+	builder.WriteString("they keep the reference unambiguous\n")
 	return builder.String()
 }
 
@@ -310,9 +340,11 @@ func renderPromptPlaceholdersWithStatus(
 
 // BuildSystemPromptOptions contains optional parameters for BuildSystemPrompt
 type BuildSystemPromptOptions struct {
-	SkillsMetadata []*skills.SkillMetadata
-	Language       string         // User language name for {{language}} placeholder (e.g. "Chinese (Simplified)")
-	Config         *config.Config // Config for reading prompt templates; nil falls back to hardcoded defaults
+	SelectedTools    []string
+	SkillsMetadata   []*skills.SkillMetadata
+	ShellExecEnabled bool
+	Language         string         // User language name for {{language}} placeholder (e.g. "Chinese (Simplified)")
+	Config           *config.Config // Config for reading prompt templates; nil falls back to hardcoded defaults
 }
 
 // BuildSystemPrompt builds the progressive RAG system prompt
@@ -320,17 +352,15 @@ type BuildSystemPromptOptions struct {
 func BuildSystemPrompt(
 	knowledgeBases []*KnowledgeBaseInfo,
 	webSearchEnabled bool,
-	selectedDocs []*SelectedDocumentInfo,
 	systemPromptTemplate ...string,
 ) string {
-	return BuildSystemPromptWithOptions(knowledgeBases, webSearchEnabled, selectedDocs, nil, systemPromptTemplate...)
+	return BuildSystemPromptWithOptions(knowledgeBases, webSearchEnabled, nil, systemPromptTemplate...)
 }
 
 // BuildSystemPromptWithOptions builds the system prompt with additional options like skills
 func BuildSystemPromptWithOptions(
 	knowledgeBases []*KnowledgeBaseInfo,
 	webSearchEnabled bool,
-	selectedDocs []*SelectedDocumentInfo,
 	options *BuildSystemPromptOptions,
 	systemPromptTemplate ...string,
 ) string {
@@ -354,21 +384,23 @@ func BuildSystemPromptWithOptions(
 		template = GetProgressiveRAGSystemPrompt(cfg)
 	}
 
-	currentTime := time.Now().Format(time.RFC3339)
+	currentTime := time.Now().Format("2006-01-02")
 	language := ""
 	if options != nil {
 		language = options.Language
 	}
 	basePrompt = renderPromptPlaceholdersWithStatus(template, knowledgeBases, webSearchEnabled, currentTime, language)
 
-	// Append selected documents section if any
-	if len(selectedDocs) > 0 {
-		basePrompt += formatSelectedDocuments(selectedDocs)
+	if options != nil {
+		basePrompt += formatGroundingGuidance(options.SelectedTools)
+		basePrompt += formatToolGuidance(options.SelectedTools)
+	} else {
+		basePrompt += formatGroundingGuidance(nil)
 	}
 
 	// Append skills metadata if available (Level 1 - Progressive Disclosure)
 	if options != nil && len(options.SkillsMetadata) > 0 {
-		basePrompt += formatSkillsMetadata(options.SkillsMetadata)
+		basePrompt += formatSkillsMetadata(options.SkillsMetadata, options.ShellExecEnabled)
 	}
 
 	return basePrompt

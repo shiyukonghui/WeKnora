@@ -2,6 +2,723 @@
 
 All notable changes to this project will be documented in this file.
 
+## [0.8.0] - 2026-09-03
+
+### New Features
+
+- **NEW**: **Skill Sandbox Runtime (Docker / E2B / Cube)** — the headline of this release. Agent skills now run in a **session-persistent sandbox**: one sandbox per chat session, with `shell_exec`, file read/write/edit, attachment staging, and generated-file collection all landing in the same workspace. Three backends share one `RemoteSandboxClient` protocol: **Docker** (single-host / self-hosted, talking to the Engine API rather than `docker run --rm`), **E2B** (cloud or any E2B-compatible control plane, including self-hosted), and **CubeSandbox**. Per-workspace configs cover image, CPU/memory, TTL, DNS, templates and snapshots (migrations `000082_tenant_sandbox_config`, `000083_session_sandbox_config`). Admins can set a **network policy** per config (default-deny egress, allow/deny lists, Cube L7 rules, E2B host rules) (#2995). The old **Local host-process backend is removed**. The Docker backend is **opt-in** (`WEKNORA_SANDBOX_DOCKER_ENABLED` or System Settings → Network Security) because a mounted `docker.sock` is host root (#2936). See [`docs/sandbox-docker-backend.md`](./docs/sandbox-docker-backend.md) and [`docs/sandbox-protocol.md`](./docs/sandbox-protocol.md).
+- **NEW**: **Tenant Skill Catalog** — skills are first-class workspace resources, not files dropped next to the process (migrations `000086_tenant_skills`, `000087_skill_install_transcript`, `000088_skill_snapshot_planned_name`, `000090_skill_catalog`). Install from **ClawHub**, **SkillHub / skills.sh**, **GitHub/GitLab URLs**, or a zip upload; each install is a snapshot on the chosen sandbox config, with live circular progress, install transcripts, stop/reinstall, and uninstall that keeps catalog archives. Browse and edit installed skill files from Settings; agents get `write_skill_file` / `edit_skill_file` plus `shell_exec` that no longer requires a skill to be installed. Personal and workspace **skill env vars** inject at execution without ever being read back (migration `000089_env_vars`). `@mention` no longer silently shrinks the skill whitelist.
+- **NEW**: **Cross-Session Long-Term Memory** — a new memory product (migration `000084_memory`), independent of the Neo4j conversation-memory that 0.7.1 removed. Workspaces opt in; each user can further turn it off. Memories are typed (`profile` / `preference` / `fact` / `task` / `interest`), written either explicitly or by a background extractor, and **inferred items stay pending until the user confirms**. Resident profile/preference blocks ride in every turn; situational facts are recalled lexically and (optionally) semantically; `search_memory` looks up on demand. Document affinity conditions retrieval toward sources the user keeps citing. Settings, items, topics, document affinity, confirm/reject, export and forced consolidation are exposed as `/api/v1/memory/*` (full-access API keys only; the subject is always the caller).
+- **NEW**: **In-Process anydoc Parser** — Office documents (doc/docx/ppt/pptx and the types anydoc converts) can be parsed **inside the Go app** via `third_party/anydoc-go`, without a round-trip to docreader. When the binding is linked, anydoc is preferred for every type it converts; PPT/PPTX still default to MarkItDown when no engine rule is set. The app image links anydoc by default.
+- **NEW**: **DeepSeek Harness Plugin** — official npm package [`@wxg-prc-cpg/dsh-weknora`](https://www.npmjs.com/package/@wxg-prc-cpg/dsh-weknora) exposes four read-only tools (`weknora_search`, `weknora_read_document`, `weknora_ask`, `weknora_list_knowledge_bases`) so a DeepSeek Harness coding agent can retrieve from a WeKnora deployment (#2759).
+- **NEW**: **GitLab & Tencent IMA Data Sources** — GitLab projects sync as a knowledge source (#2656); Tencent IMA notes sync through the note OpenAPI, with retries on transient failures.
+- **NEW**: **LiteLLM Model Provider** — LiteLLM is a first-class chat/embedding/rerank provider, so one gateway URL can front many upstream models (#2923).
+- **NEW**: **Exa & Metaso Web Search** — two new web-search providers join the existing set (#2617).
+- **NEW**: **XMind Outline Parsing** — `.xmind` files are parsed into an outline and indexed like other documents (#2713).
+- **NEW**: **Chat Artifacts, Question Outline & Timestamps** — sandbox-generated files collect into a per-message artifacts drawer (migration `000081_message_artifacts`) with download and a pulse on the folder when new files arrive; long overflowing sessions get a Codex-style question outline / minimap (#2839); messages show timestamps as conversation-flow dividers.
+- **NEW**: **Document Auto-Tagging** — after parse, a chat model may pick matching tags from the knowledge base's existing tag set and attach them incrementally, without creating tags or overwriting manual ones (migration `000080_knowledge_base_auto_tag_config`).
+- **NEW**: **Context Compaction & Prompt-Cache Markers** — long sandbox turns compact tool history instead of truncating or rewriting files; stable prompt prefixes plus provider cache markers improve cache hit rate on Anthropic/OpenAI-compatible backends. Per-turn LLM token usage is attributed and stored (migration `000085_message_usage`).
+- **NEW**: **OIDC JWKS Verification & `/auth/oidc/start`** — ID tokens are signature-verified via JWKS (#2799); a direct 302 start endpoint supports login without a pre-rendered SPA handshake.
+- **NEW**: **Optional Complex Passwords** — registration, self-service change-password and admin reset can require mixed-case, digits and special characters (`WEKNORA_AUTH_COMPLEX_PASSWORD_ENABLED` / system setting) (#2929).
+- **NEW**: **System-Admin User Creation** — platform admins can create users from the console without an invite link (#2722).
+- **NEW**: **Invitation Auto-Accept & Invite-Only Join** — inviting an already-registered user can auto-accept; in invite-only mode, share links send the visitor through login before joining the workspace.
+
+### Improvements
+
+- **IMPROVED**: **Sandbox security** — all Docker execs (scripts, `shell_exec`, file ops, artifact bootstrap) run as the sandbox user (uid 1000), not root; symlink-following `chown`/file ops that could escape the workspace are closed; zombie processes from cancelled execs are reaped; in-use snapshot deletes retry as conflicts; idle sandboxes detach and sweep; skill image pointers stay out of config PUT.
+- **IMPROVED**: **Skill install UX** — catalog cards, avatar shortcut, live circular progress that keeps the drawer open, batch install verification, stop-in-flight, ClawHub `@owner/slug` and skills.sh catalog pages, GitHub subtree counting, and sandbox uninstall moved into the manage-drawer header.
+- **IMPROVED**: **Chat / Agent UX** — `shell_exec` renders as a command + stream card; sandbox file lists and skill names show on tool cards; generated-files drawer restyled to match settings lists; Mermaid diagrams stay rendered while streaming; message timestamps align with persisted `created_at`.
+- **IMPROVED**: **Knowledge search** — MMR selection is incremental; hybrid-search honors `resource_urls=public`; MatchCount=0 no longer truncates every result; parent-child embeddings survive chunking; deleted images in a chunk are no longer retrieved.
+- **IMPROVED**: **Docreader / anydoc** — DOCX vertical merges and table text preserved; PDF embedded-image SMask applied (no more all-black figures); MHTML header objects stripped correctly; URL scrapes fail closed instead of indexing error pages; PPT/PPTX attachments get a parser engine.
+- **IMPROVED**: **IM** — Feishu websocket long-connection reverse-proxy support (#2550); Feishu streaming cards finalize and show progress in full-output mode; WeCom 32-byte PKCS7 padding; DingTalk rich-text follow-ups; Yunzhijia thread sessions; IM file attachments in QA.
+- **IMPROVED**: **Auth / tenancy** — `SwitchTenant` records last-active-tenant preference; self-service change password in the profile; folder drag-and-drop upload preserves directory structure; document download action; editable document summaries; paginated document chunks; FAQ batch actions restored.
+- **IMPROVED**: **Observability** — sandbox operations emit product-level Langfuse spans; follow-up completions nest under the parent chat trace; prompt-cache markers stay stable across turns.
+- **IMPROVED**: **Deployment capabilities** — menus and settings hide modules the binary did not register (`GET /system/capabilities`), so Lite / trimmed builds stop advertising missing features (#2674).
+- **IMPROVED**: **CI** — golangci-lint workflow gates new PR code; path-filtered checks avoid triggering anydoc/unrelated lints; git pre-commit / pre-push hooks; Playwright WebKit for docreader URL tests; dsh-weknora e2e cache.
+
+### Bug Fixes
+
+- **FIXED**: OIDC ID-token signature is verified through JWKS, including explicit-endpoint configs; JWKS response bodies are closed (#2799).
+- **FIXED**: High-risk system settings and agent skill pickers read the latest stored value instead of a stale form snapshot.
+- **FIXED**: Sandbox tools are scoped to the workspace they actually serve; agents are told which workspace they are in; file tools can read staged attachments without hanging empty skill tools; skill-script stdout is kept on failure.
+- **FIXED**: Tool-call JSON with a stray trailing fragment is recovered; stringified JSON arrays in skill args parse; `@mention` no longer narrows the skill whitelist.
+- **FIXED**: Feishu streaming cards no longer stick in an in-progress state; full-output mode shows the progress card (#2911, #2909).
+- **FIXED**: Model deletion blocked by usage now shows the usage details (#2975).
+- **FIXED**: `nginx-api-proxy.conf` is included in the UI image build, restoring API proxying in the frontend container.
+- **FIXED**: Postgres `docker-compose` image no longer fails the default security check (#2704); S3-compatible endpoints disable optional checksums; MinerU results resolve by upload filename stem and preserve the extension.
+- **FIXED**: Wiki housekeeping no longer force-fails documents that still have a durable Wiki backlog; concurrent duplicate wiki page identities are prevented; wiki generate-with-template calls set `MaxTokens`.
+- **FIXED**: Shared knowledge bases no longer report `doc_count=0` in agent `runtime_context`; data-source deletion sync is scoped per connector and actually persisted.
+- **FIXED**: Chunk merge no longer drops content when contiguous chunks repeat text; context headers are sanitized before persistence; markdown table regex catastrophic backtracking is stopped (#2770).
+- **FIXED**: Built-in agent names/descriptions follow the UI locale (#2828); default locale can be set at runtime via `DEFAULT_LOCALE`.
+- **FIXED**: Direct invites are reconciled after a share-link join; stale home tenant is cleared after member removal.
+
+### Breaking Changes
+
+- **BREAKING**: The **Local host-process sandbox backend is removed**. Existing Local configs must be recreated against Docker (opt-in), E2B, or Cube.
+- **BREAKING**: The Docker sandbox backend is **off by default**. Enable it in System Settings → Network Security, or set `WEKNORA_SANDBOX_DOCKER_ENABLED=true`.
+- **BREAKING**: Complex-password mode, when enabled, rejects registration / password-change payloads that do not mix upper, lower, digit and special characters.
+
+### Infrastructure & Build
+
+- **BUILD**: Migrations `000080`–`000090` (auto-tag, message artifacts, tenant/session sandbox config, memory, message usage, tenant skills, install transcript, snapshot planned name, env vars, skill catalog); matching SQLite migrations `000003`–`000012`.
+- **BUILD**: New `internal/sandbox` remote-client stack (Docker Engine API, E2B, Cube), `internal/agent/compaction`, `internal/application/service/memory`, `internal/ipclass` (shared SSRF + sandbox URL classification), `third_party/anydoc-go`.
+- **BUILD**: Go client: sandbox skill install/stop/files, personal env-var APIs, long-term memory APIs.
+- **BUILD**: `wechatopenai/weknora-sandbox` image; Docker backend requires `appuser` in the `docker.sock` group inside the app container.
+- **BUILD**: golangci-lint, anydoc, and dsh-plugin GitHub Actions workflows.
+
+### Documentation
+
+- **DOC**: Sandbox protocol / Docker backend / cluster guides under `docs/sandbox-*.md`; skill env-var surface documented in `docs/api/skill.md`; long-term memory in `docs/api/memory.md`.
+- **DOC**: `docs/QA.md` extended for Docker opt-in, Local-backend removal, skill catalog, long-term memory, anydoc, and OIDC JWKS.
+- **DOC**: Architecture diagram updated for sandbox backends, skill catalog, long-term memory, anydoc, GitLab/IMA, LiteLLM, and the DeepSeek Harness plugin.
+
+## [0.7.2] - 2026-08-07
+
+### New Features
+
+- **NEW**: **Official Documentation Site** — the headline of this release. A complete VitePress product documentation site now lives in `website-docs/`, organized into six sections (Getting Started → Architecture → Features → API → Clients → Development) across ~50 pages: 21 feature guides, 13 API reference pages covering ~360 endpoints with permissions/parameters/curl examples, 7 client guides (frontend, CLI, Go SDK, mini program, desktop, Chrome extension, Claw Skill), a configuration reference for ~150 environment variables, and a database/migration guide covering 40+ tables. Ships a custom landing page, a `<Screenshot>` component with placeholder fallback, Mermaid zooming, and link/diagram validation scripts (`scripts/check-links.mjs`, `scripts/check-mermaid.mjs`). The site reads the repository-root `VERSION` file at build time so version labels never drift. Deployment is self-contained: `website-docs/Dockerfile` + `nginx.conf` (listening on 8081) + `docker-entrypoint.sh`. Quickstart sample data (4 Markdown documents + an FAQ import JSON) and a runnable local MCP demo (`examples/mcp-demo/`) are included so a first knowledge base can be built end to end without hunting for test files.
+- **NEW**: **Knowledge Base Folder Tree** — folder uploads no longer smuggle their relative directory into `file_name`. The path now lives in a dedicated `folder_path` column with a backfill for existing rows (migration `000079_knowledge_folder_path`), so the document list renders a real sidebar folder tree that can be browsed like a file manager, folders can be renamed in place, and documents can be re-filed into another folder. Individually uploaded documents get a visible home at the tree root instead of disappearing. Adds `GET /knowledge-bases/{id}/knowledge/folders` and `PUT /knowledge-bases/{id}/knowledge/folders`, plus a folder picker popup on each row.
+- **NEW**: **Editable Chunks, Revision History & Custom Metadata** — retrieval chunks are now editable directly from the UI, with every superseded version snapshotted for diff and one-click revert, and the index rebuilt automatically after an edit (migration `000078_chunk_editing_and_custom_metadata` adds `chunks.source_content` / `content_revision` / `index_status` / `last_editor_id` / `context_header`, the `chunk_revisions` table, and `knowledges.custom_metadata`). Generated questions can be added, edited, deleted, and regenerated per chunk, and survive content edits. Adds `PUT /chunks/{knowledge_id}/{id}`, `GET /chunks/{knowledge_id}/{id}/revisions`, `POST /chunks/{knowledge_id}/{id}/revert`, and the generated-question endpoints. Chunk details moved into header popups for a tighter layout.
+- **NEW**: **Wiki Page Revision History, Diff & Manual Editing** — every wiki page version is preserved before being overwritten (migration `000075_wiki_page_revisions`, plus `wiki_pages.last_edit_source` / `last_editor_id` recording whether the current version came from the pipeline, an agent, a user, or a revert). A revision drawer lists the full history with line-level diffs and one-click rollback, and pages can be edited by hand in the browser. The Wiki reader layout, source-document reference handling, and sidebar UX were reworked to match the session-list experience.
+- **NEW**: **Directly Loadable File URLs (`resource_urls=public`)** — chat answers, references, knowledge search, and embed responses can return ready-to-load http(s) URLs for files and images instead of internal `resource://` handles, so third-party apps no longer need a second authenticated call to the `/files` proxy. Opt in per request with `?resource_urls=public` or per deployment with `RESOURCE_URL_MODE=public`. A new `internal/storageurl` package centralizes the rewriting, reusing a live access grant per resource to keep read endpoints from writing on every request. Anonymous embed channels and KB-restricted API keys always stay on `handle`. See [`docs/api/README.md`](./docs/api/README.md).
+- **NEW**: **Feishu Drive Data Source** — a new Feishu Cloud Drive connector joins the existing Feishu wiki connector (#2466). New-format Feishu cloud documents (docx) are now synchronized through the blocks API with per-block-type drill-down (#2087), configurable via the new `E9` docx parsing-mode section in `.env.example`.
+- **NEW**: **Batch Document Tagging** — select documents in the knowledge base list and apply tags in bulk through a dedicated dialog that pre-selects the tags already common to the selection.
+- **NEW**: **MCP Server 1.1.x** — the WeKnora MCP server migrated from the removed low-level `Server` decorator API to the high-level `MCPServer` API (mcp 2.x), restoring HTTP (`stateless_http`) and SSE (`/sse/messages/`) transport compatibility, and now publishes as the official PyPI package **`tencent-weknora-mcp`** via Trusted Publishing. Two new tools bring the total to 29: `create_knowledge_from_text` (create a knowledge entry from Markdown text) and `list_shared_knowledge_bases` (shared KBs are also folded into name resolution and tool hints).
+- **NEW**: **AWS S3 Default Credential Chain** — leaving `S3_ACCESS_KEY` and `S3_SECRET_KEY` both empty now falls back to the AWS SDK default credential chain, supporting EC2/ECS/EKS IAM roles, IRSA / Web Identity, environment variables, and shared config files (#2008).
+- **NEW**: **Local HTML Upload Parsing** — docreader gained a dedicated HTML parser, so `.html` files can be uploaded directly instead of only imported by URL. The supported-extension set is now the single gate for both direct upload and URL import (#2447).
+- **NEW**: **QQBot Markdown Replies** — QQBot channels reply with markdown formatting like the other IM integrations.
+- **NEW**: **PR CI Workflows** — dedicated GitHub Actions checks for the Go app, frontend, docreader, and MCP server, plus a `scripts/verify_frontend_pr.sh` helper for local pre-PR verification.
+
+### Improvements
+
+- **IMPROVED**: **Router and auth middleware split by domain** — the 2390-line `internal/router/router.go` was split into `routes_agent.go`, `routes_auth_tenant.go`, `routes_chat.go`, `routes_infra.go`, `routes_knowledge.go`, `files.go`, and `static.go`, with the duplicated file proxies deduplicated. The Auth middleware was likewise split and session-context attachment unified in one place.
+- **IMPROVED**: **`modelcontext` package consolidation** — `llmreference` and `llmresource` were folded into `modelcontext` as source and resource codecs, every handle space was rebuilt on one generic table, source-key gating moved behind a single dispatch table, and stream decoding now goes through one suffix-hold primitive. Handle terminology is consistent across the merged package, and several handle-codec bugs were fixed along the way.
+- **IMPROVED**: **Unified Wiki operation history** — the redundant Wiki Browser operation log was removed and its storage/API retired (migration `000077_remove_wiki_log`); wiki mutations are recorded only in the knowledge-base Activity view.
+- **IMPROVED**: **Rerank quality and throughput** — reranker passage cleaning now preserves code and math passages, NVIDIA logit-style scores are normalized before fusion, and Tencent LKEAP requests are batched to stay within API limits.
+- **IMPROVED**: **Chinese query expansion** — expanded queries are segmented with jieba so Chinese rewrites actually match the sparse index.
+- **IMPROVED**: **Chunking consistency** — line endings are normalized before splitting, overlap boundaries preserve semantic sentence ends (English `?`/`!` require a following space), the chunking preview matches parent-child splitting, and XLS header-override behavior is aligned with XLSX.
+- **IMPROVED**: **Document summaries** — table chunks keep every row in the summary, failed summary generation retries before falling back, and stale summaries are re-enqueued for refresh with the tenant context restored for background refresh tasks.
+- **IMPROVED**: **Frontend i18n hygiene** — locale files were pruned against `zh-CN`, with an audit harness (`localeKeyAudit`, audit-action registry, regeneration script) that keeps the other locales aligned and catches missing keys in CI.
+- **IMPROVED**: **UI polish** — redesigned upload confirmation dialog (tags can be configured at upload time), refined user settings menu, unified organization settings modal scrolling, clearer document processing timeline statuses, and a persistent live region that announces RAG wait status for screen readers.
+- **IMPROVED**: **Deployment docs** — `docker compose pull` guidance completed across all deployment steps so upgrades stop reusing stale cached images.
+
+### Bug Fixes
+
+- **FIXED**: Registration passwords are no longer sanitized before hashing, which corrupted passwords containing special characters.
+- **FIXED**: WeCom long-connection deadlock between `closeConn` and `heartbeatLoop`; connection close is now scoped to its own generation, and disabled channels are handled in the IM callback.
+- **FIXED**: SQLite — `DataSource` deletion failed, a zero vector threshold was treated as a filter instead of "no filter", and vector candidates are now filtered before top-k.
+- **FIXED**: Evaluation retrieval metrics were always zero; chunks are mapped back to passage IDs and passage indexing is synchronous.
+- **FIXED**: Empty or mismatched embedding results could panic an ants worker and deadlock a mutex.
+- **FIXED**: Retrieval merge output ordering is deterministic, and trusted overlaps are trimmed by exact position rather than text search (including after pipeline rewrites, #2558).
+- **FIXED**: Archived wiki pages are excluded from stats queries and the lint cursor; wiki prompt language is always resolved; wiki state is reconciled when documents move across knowledge bases; batched `wiki_read_page` results stay within the output budget.
+- **FIXED**: Retried FAQ creation no longer produces duplicate entries, and disabled FAQ entries are excluded from agent retrieval.
+- **FIXED**: Knowledge base deletion cleans up bound vector stores in batch delete and retries when engine resolution is deferred; a missing vector store engine is rebuilt on demand.
+- **FIXED**: MinerU automatic PDF parsing preserved; skipped stages are counted in parsing progress; stale `error_message` values are cleared on every reprocess and finalize path; batch reparse failures are surfaced.
+- **FIXED**: The embed runtime can read its own session again, fixing follow-up-suggestion 500s and lost conversations on refresh.
+- **FIXED**: Answer-generation status is shown after retrieval instead of a silent gap; duplicate terminal answer events are suppressed; retrieval fallback errors are preserved and web partial success / wiki-only embed fallback are covered.
+- **FIXED**: Agent web evidence is preserved when page fetches fail, with a safe rendered `web_fetch` fallback.
+- **FIXED**: Frontend — attachment upload status stays reactive, protected embed images route through the channel file proxy, and audit / KB-activity strings were restored after the locale prune.
+- **FIXED**: Shared agent source selector validation and shared agent source permissions hardened; API-runtime admin-console bypass scoped to owned sessions; external users included in the API session group.
+- **FIXED**: Remote images referenced by HTML `img` tags resolve during parsing (#2355); PaddleOCR-VL Cloud HTML tables are normalized; MCP server diagnostics route to stderr to fix a stdio protocol crash (#2371); non-UUID agent IDs resolve in MCP.
+- **FIXED**: Duplicate detection distinguishes files by type and is scoped correctly; custom metadata defaults on create; image uploads can fall back to the file service; wiki folder path is preserved after creation.
+
+### Infrastructure & Build
+
+- **BUILD**: Migrations `000075_wiki_page_revisions`, `000076_knowledge_metadata_external_id_index`, `000077_remove_wiki_log`, `000078_chunk_editing_and_custom_metadata`, `000079_knowledge_folder_path`; SQLite migrations `000001_remove_wiki_log`, `000002_knowledge_folder_path`.
+- **BUILD**: New `internal/storageurl` package for storage reference URL rewriting; Go client extended with `resource_urls` support.
+- **BUILD**: GitHub Actions workflows added for app / frontend / docreader / mcp-server; gofmt check scoped to PR commits; App workflow Go dependency caching sped up.
+- **BUILD**: Swagger / API docs regenerated for chunk revisions, knowledge folders, wiki revisions, and `resource_urls`.
+
+### Documentation
+
+- **DOC**: `website-docs/` official documentation site added (six sections, ~50 pages, ~360 documented endpoints), with quickstart sample data and a local MCP demo under `examples/mcp-demo/`.
+- **DOC**: `docs/api/README.md` and `docs/api/chat.md` document `resource_urls` and `RESOURCE_URL_MODE`; Feishu Drive data source guide added under `docs/wiki/集成扩展/`.
+- **DOC**: `docs/QA.md` extended for the documentation site, folder tree, chunk editing, wiki revisions, and public resource URLs.
+- **DOC**: Architecture diagram updated for the folder tree, chunk editing, wiki revision history, and public file URLs.
+
+## [0.7.1] - 2026-07-24
+
+### New Features
+
+- **NEW**: **Yunzhijia (云之家) IM Integration** — a new instant-messaging platform integration for Yunzhijia, including WebSocket message handling, request signing, image-message ingestion with SSRF-checked downloads, and markdown-formatted replies by default. Add the channel under **Settings → IM Integration** and fill in the credentials.
+- **NEW**: **Volcengine Rerank Provider** — Volcengine is now a first-class rerank provider, with request batching that transparently splits payloads exceeding the API's per-request document limit. vLLM rerankers no longer send `truncate_prompt_tokens` by default for broader compatibility.
+- **NEW**: **Zhipu AI Web Search Provider** — Zhipu AI added as a configurable web search provider alongside the existing options.
+- **NEW**: **Platform-Scoped API Keys** — control-plane automation now has dedicated platform API keys with capability-based access to tenant management, system settings, runtime queues, and audit logs, plus an admin UI for key lifecycle and system-wide audit-log viewing (migration `000071_platform_api_keys`).
+- **NEW**: **Knowledge Base Activity Audit Trail** — a scoped, per-KB activity audit trail records knowledge operations (including FAQ imports) with a dedicated activity settings view and localized audit-log detail drawer (migration `000073_kb_activity_scope`).
+- **NEW**: **FAQ Management Enhancements** — richer FAQ workflows: entry filtering and tagging, export support, and import result tracking with clearer UI feedback and activity logging.
+- **NEW**: **Langfuse OTLP/OTel Tracing** — Langfuse tracing migrated from the legacy ingestion batch API to the OpenTelemetry Go SDK emitting OTLP/HTTP (`/api/public/otel/v1/traces`), the Langfuse v3+ standard. Adds W3C `traceparent` cross-service propagation so upstream trace IDs are inherited, and merges finish metadata with auto-exported root spans.
+- **NEW**: **Chat Header Actions & Markdown Export** — a new chat header with docked state and references-panel support, session header actions, and one-click Markdown export of a conversation. Wiki tool results now surface in the references drawer, and model reasoning renders inline in the agent timeline.
+- **NEW**: **Prompt-Cache Observability** — prompt-cache hit/usage observability with cache-friendly wiki prompts to improve LLM cost and latency.
+- **NEW**: **Session Channel Governance** — IM / embed / API-key channel sessions are gated behind admin scope, with a dedicated admin API session bucket, strict owner scoping for API-key sessions, and a stabilized sidebar source filter. Archived queue tasks can now be bulk-purged.
+
+### Improvements
+
+- **IMPROVED**: **Unified Wiki activity history** — removed the duplicate Wiki Browser log feed and its dedicated storage/API. Wiki mutations continue to appear in the knowledge-base Activity view, which is now the single operation-history surface (migration `000077_remove_wiki_log`).
+- **IMPROVED**: **Removed Neo4j conversation memory** — the Neo4j-based episodic memory pipeline, its API fields, settings UI, and embed toggles were dropped, so chat no longer depends on Neo4j graph storage. This simplifies deployment and reduces the required infrastructure footprint.
+- **IMPROVED**: **Shared SSRF-safe HTTP transport** — model clients, embedders, the Doris Stream Load client, and datasource connectors now reuse a single SSRF-safe HTTP transport, consolidating outbound-request protection.
+- **IMPROVED**: **Resilient Feishu large-wiki sync** — Feishu wiki synchronization now retries, resumes streaming, and surfaces failure reasons for large spaces.
+- **IMPROVED**: **Organization & shared-space UI** — polished organization space UI, share-to-space panels, shared-space settings, and join-preview UI, with disambiguated shared-space terminology and tightened invite search.
+- **IMPROVED**: **Compose & config alignment** — docker-compose env vars aligned with code defaults (including a Helm GraphRAG fix, #2164), PDF render parallelism follows the CPU-aware code default, and BSD `netcat` compatibility in the dev script (#2205).
+- **IMPROVED**: **Chat layout** — conversation content area widened from 800px to 960px.
+
+### Bug Fixes
+
+- **FIXED**: Wiki summary slugs are preserved during citation compaction, and slug integrity is hardened across ingest and agent write paths (with sqlite alias support).
+- **FIXED**: IM Q&A could not read its session (#session lookup); DingTalk/IM session reads now resolve correctly.
+- **FIXED**: API keys can no longer be assigned the owner role; scoped keys can access file-serve and ingest-batch routes as intended.
+- **FIXED**: MCP OAuth token refresh and authorization polling are now coordinated to avoid races (migration `000074_mcp_oauth_refresh_lease`).
+- **FIXED**: API-key expiry timestamps normalized to UTC (#2137, migration `000072_auth_timestamp_tz`).
+- **FIXED**: Async knowledge deletion no longer leaves visible/zombie rows (#2192); KB deletion queue cleanup is detached from the request context and dequeues work for deleted knowledge bases.
+- **FIXED**: Source file download restricted to Editor role and above; shared knowledge base document preview path corrected.
+- **FIXED**: Hybrid search query text is validated; top-k retrieval ordering stabilized.
+- **FIXED**: Embedded chunk images copied into the exports namespace; parent/clone chunk image URLs rewritten via a global pass.
+- **FIXED**: Optimistic organization state corrected after review and detail loads; state synchronized after writes and pending join-request counts refreshed after review.
+- **FIXED**: Suggested-questions limit parameter honored; model debug upload limit aligned with the global `MAX_FILE_SIZE`.
+- **FIXED**: Frontend robustness — custom theme tokens kept in production builds, complete TDesign styles loaded, TDesign textarea autosize crash prevented in the org settings popup, and `crypto.randomUUID` fallback for older browsers / HTTP mode.
+- **FIXED**: nginx base image pinned by digest for old-host compatibility; graph and multimodal processing traces corrected; task-inspector lazy-queue "not found" errors handled.
+
+### Infrastructure & Build
+
+- **BUILD**: Migrations `000071_platform_api_keys`, `000072_auth_timestamp_tz`, `000073_kb_activity_scope`, `000074_mcp_oauth_refresh_lease`, `000077_remove_wiki_log`.
+- **BUILD**: `tenant_api_keys` table structure updated and legacy migration files removed; Langfuse tracing client replaced by an OTel exporter.
+- **BUILD**: Swagger / API docs regenerated for platform API keys, activity audit trail, web-search providers, and the removed memory feature.
+
+## [0.7.0] - 2026-07-17
+
+### New Features
+
+- **NEW**: **Scoped Tenant API Keys & Principal Model** — the headline of this release. WeKnora now issues fine-grained, capability-scoped API keys that are first-class principals separate from human users (migrations `000064_principal_model`, `000065_tenant_api_keys`). Each key carries an explicit role plus capability grants (`manage_kbs` covering the full KB lifecycle, `manage_storage_backends`, member/space capabilities, etc.), can be restricted to specific knowledge bases, and updates its `last_used_at` under a throttle. Route-level guards (`DenyAPIKeyPrincipal`, `api_key_gate`) close IDOR/scope gaps, and a new **API Integration Playground** in the web UI lets owners mint, scope, and test keys interactively. MCP OAuth and embed sessions are now scoped per principal so external integrations stay isolated.
+- **NEW**: **Runtime Task Queue Observability & Worker-Pool Governance** — a system-admin **Runtime Queues** dashboard exposes live queue depth, per-model concurrency stats, failed-task inspection, manual retry, and cursor-paginated task listings. The ingestion pipeline moves from a single aggregate worker pool to guaranteed per-stage pools (core / post-process / enrichment / maintenance) plus a shared elastic pool, with per-model background concurrency governors (`model.max_concurrency`) wrapping chat, embedding, rerank, and VLM calls. Wiki generation runs in its own independently governed pool. See [`docs/worker-pool-governance.md`](./docs/worker-pool-governance.md).
+- **NEW**: **Multi-Instance Storage Backends** — each workspace can register multiple object/file storage instances (`local` / `minio` / `cos` / `tos` / `s3` / `oss` / `ks3` / `obs`) and bind different knowledge bases to different instances, with a workspace-level default (migration `000068_storage_backends`). Ships a full CRUD + connectivity-test API and settings UI, credential masking on read, and hardened image-source protection for storage backends. See [`docs/api/storage-backend.md`](./docs/api/storage-backend.md).
+- **NEW**: **Session-Scoped Temporary Attachments** — attach images and documents to a chat session for one-off Q&A with asynchronous parsing (migration `000070_temporary_documents`). Enforces a combined image + attachment limit, normalizes temporary attachment IDs, persists attachment content across turns, and adds a chat attachment preview drawer.
+- **NEW**: **Question & Follow-up Suggestions** — knowledge-grounded suggested questions plus after-answer follow-ups (migration `000067_question_suggestions`), with tag-scope aware generation, KB-scope preservation on click, and a dedicated follow-up rendering component.
+- **NEW**: **Stable Resource Registry & LLM-Context Alias Compaction** — a request-local resource registry (migration `000069_resource_registry`) assigns stable `res://` aliases to retrieved sources so LLM context stays compact and citations remain consistent; includes orphan-alias detection/logging and Markdown-based image context normalization.
+- **NEW**: **@Skill / @MCP Mentions with Scoped Agent Runtime** — mention skills and MCP services inline in chat to scope the agent runtime for a single turn, with hardened `@mention` scope resolution and consolidated per-turn scoping across knowledge tools.
+- **NEW**: **Mid-Conversation MCP OAuth** — MCP services can prompt for and resume OAuth authorization mid-chat, driven by `AuthType` with auto-detection on test, an OAuth skip endpoint, and in-chat OAuth interaction cards aligned with the agent tool timeline.
+- **NEW**: **QQBot & Lark (Feishu International) IM Integration** — new QQBot instant-messaging platform integration and support for Feishu's international edition (Lark), including region-aware routing and reply-in-thread via the Feishu reply-message API.
+- **NEW**: **`weknora` CLI v0.10** (BREAKING) — an agent-first CLI refresh: new `model`, `message`, `config`, and `skills` command groups; `doc reparse` / `doc update`; `kb config` / `kb config set`; `session resume` (renamed from `continue`) and `session tool-approval`; agent-first chat and `session ask` output modes; typed SDK errors/enums and KB model config; hardened SSE reliability; schema and exit-code contracts.
+- **NEW**: **Redis TLS Support** — TLS connections to Redis with config surfaced at startup and hardened TLS tests (#1930).
+- **NEW**: **New Providers** — Requesty added as an OpenAI-compatible model provider; Keenable added as a configurable web search provider.
+- **NEW**: **Tenantless Provisioning & Gated Self-Service Workspaces** — OIDC/login provisioning can create users without a tenant, with gated self-service workspace creation and a workspace onboarding flow, unified under a shared `default_tenant_mode` policy.
+- **NEW**: **Admin Password Reset & System Settings Tabs** — system admins can reset user passwords with session revocation and edit builtin model configs; system settings reorganized into tabbed sections. Password fields are sanitized in logs.
+- **NEW**: **Knowledge Base Duplicate Flow** — clone a knowledge base (config + structure) via a dedicated API and UI; custom instruction fields added to KB configuration with length validation.
+- **NEW**: **Per-Agent Citation Output Toggle** — agents can enable/disable citation output; retrieval references are still emitted to the references drawer even when in-answer citations are disabled.
+- **NEW**: **Chat References Drawer & UX Polish** — a dedicated references drawer with web/KB source distinction, inline session-title rename in the sidebar, chat reference links opening in new tabs, and native streaming loading placeholders.
+
+### Improvements
+
+- **IMPROVED**: **Security hardening (broad triage)** — closed numerous open GHSA findings and security-triage gaps: SSRF protection across web_fetch, datasource connectors, knowledge URL import (including redirect chains), MinerU, embedders, and model clients; secret redaction in login, tenant KV, integration-list, and initialization/parser-check responses; SQL-validator bypass closed in agent database tools; refresh-token validation hardened (blocked as bearer); MCP upload sandbox enforced across transports; wiki/IDOR KB-access enforcement; nginx iframe `X-Frame-Options`.
+- **IMPROVED**: **Wiki ingestion** — dedicated worker pool with concurrent claim-based batching; recovers stranded claims, prevents finalize double-run and cross-batch document races, and strips internal chunk aliases from page content.
+- **IMPROVED**: **Knowledge processing** — safe task recovery after server restart, chunking strategy propagated to parent-child splitter configs, richer error handling in knowledge spans, rune-aware span-name fitting with expanded name column, and processing-timeline status aligned with the knowledge row.
+- **IMPROVED**: **Terminology** — user-facing "tenant" labels renamed to "workspace" across the UI and i18n.
+- **IMPROVED**: **Chat streaming** — unified streaming wait indicators across chat and embed, follow-up suggestion loading and answer-toolbar timing polished, references drawer closed on session switch, and enforced retrieved-image output in answers.
+- **IMPROVED**: **Frontend resilience** — hardened settings `localStorage` load to prevent white-screen from corrupted state; shared document action menu and card-view components extracted; Wiki badge on KB cards; responsive doc filter bar.
+- **IMPROVED**: **Infrastructure config** — infrastructure host/port configurable via env vars in docker-compose; remote infrastructure supported via `.env.local`; `WEKNORA_MODEL_MAX_CONCURRENCY` defaulted to 32.
+- **IMPROVED**: **docreader** — SSRF utility and safe HTTP client added; legacy doc-payload detection; parser routing tests.
+
+### Bug Fixes
+
+- **FIXED**: Chat now emits retrieval references even when citation output is disabled.
+- **FIXED**: `/api/v1/tenants/kv/storage-engine-config` returned no Huawei OBS config, causing the KB-creation dialog to omit the OBS unavailable marker.
+- **FIXED**: Empty tenant `default_provider` fell back to `local` even when `local` was not in `STORAGE_ALLOW_LIST`, breaking KB creation.
+- **FIXED**: DingTalk file/image messages now ingest into the knowledge base with SSRF-checked downloads and `pictureDownloadCode` fallback (#1771).
+- **FIXED**: Feishu WebSocket long connection now actually closes when the channel is stopped; replies land in the original thread.
+- **FIXED**: Tag filters correctly applied to knowledge search; tag-scope resolution hardened (#1907).
+- **FIXED**: Scoped API keys can poll FAQ import progress; KB-scoped file proxy restricted to `exports/` paths while still serving shared KB images.
+- **FIXED**: Web-search controls gated by provider readiness; agent selector capability status chips polished.
+- **FIXED**: Manual knowledge editor publish flow; doc list reloads after tag rename in the manage drawer.
+- **FIXED**: Division-by-zero guard in FAQ import timing logs; VLM temperature made configurable.
+
+### Infrastructure & Build
+
+- **BUILD**: Migrations `000064_principal_model`, `000065_tenant_api_keys`, `000066_expand_knowledge_span_name`, `000067_question_suggestions`, `000068_storage_backends`, `000069_resource_registry`, `000070_temporary_documents`.
+- **BUILD**: Per-pool task-queue governance (core / post-process / enrichment / maintenance / shared / wiki); model concurrency limiter/governor package.
+- **BUILD**: Go client extended for scoped API keys, storage backends, message suggestions, KB duplicate, and streaming error types; resolved open Dependabot alerts across Go, npm, and pip.
+- **BUILD**: Swagger / API docs regenerated; `docs/api/storage-backend.md` added.
+
+### Documentation
+
+- **DOC**: `docs/worker-pool-governance.md` added; `docs/api/storage-backend.md` added.
+- **DOC**: `docs/QA.md`, wiki docs, and per-feature guides extended for scoped API keys, storage backends, runtime queues, temporary attachments, and MCP OAuth.
+- **DOC**: Architecture diagram updated for scoped API keys, multi-instance storage, and worker-pool governance.
+
+## [0.6.3] - 2026-06-26
+
+### New Features
+
+- **NEW**: **Website Embed Widget & Channels** — the headline of this release. Publish custom agents to external websites via embed channels with domain allowlists, per-minute / per-day rate limiting, and secure-mode token exchange (`em_…` publish token → short-lived `ems_…` session token). Ships `weknora-widget.js`, a standalone embed chat UI, visitor session management, and a unified **Integrations Center** for IM + embed channel editors with agent rebind and live preview. See [`docs/embed-secure-mode.md`](./docs/embed-secure-mode.md) and [`docs/embed-subdomain.md`](./docs/embed-subdomain.md).
+- **NEW**: **Chat Experience Overhaul** — unified markdown rendering pipeline with citation popovers, chunk caching, shared resource chips, and `@` mention browsing of recent files; RAG pipeline progress events surfaced in a dedicated timeline component; agent stream display refactor with tool-result rendering, thinking blocks, shimmer streaming tail, and typewriter effect; large tool outputs trimmed via agent-side persistence.
+- **NEW**: **Document Multi-Tag** — documents can carry multiple tags (`knowledge_tag_ids` many-to-many via migration `000063_knowledge_multi_tags`); tag manage drawer, redesigned tag chips / edit dialog, and unified document tag filter in the KB list.
+- **NEW**: **Batch Document Reparse** — `POST /knowledge/batch-reparse` re-queues parsing for multiple documents with optional `process_config`; async task UI refreshes after enqueue.
+- **NEW**: **Wiki Folder & Hierarchy** — folder CRUD, page move, category hierarchy metadata, taxonomy planning APIs, and category navigation in the Wiki browser (migration `000061_wiki_page_hierarchy`).
+- **NEW**: **RSS Data Source Connector** — subscribe to RSS / Atom feeds for full-text ingestion with incremental sync and partial-failure surfacing.
+- **NEW**: **MCP OAuth2 Authorization** — OAuth2 flow for remote MCP services (migration `000062_mcp_oauth`); plus custom HTTP headers and JSON code-import for MCP service configuration.
+- **NEW**: **EPUB & MHTML Document Support** — new docreader parsers with image-resolution and Markdown-structure preservation for MHTML.
+- **NEW**: **PDF Scanned-Page OCR Override** — force OCR parsing on scanned PDF pages via `process_config`; upload overview reflects scanned-PDF detection.
+- **NEW**: **Model Test Debugger** — interactive drawer to probe saved chat / embedding / rerank / VLM model configs before binding them to KBs or agents.
+- **NEW**: **Agent Model Readiness** — agent selector enforces model readiness (missing / misconfigured models blocked with actionable hints); shared-agent readiness UX polished.
+- **NEW**: **Session Source Filter** — sidebar filter and grouping for sessions by source (Web / IM / Embed / etc.).
+- **NEW**: **Tenant Workspace Deletion UI** — self-service workspace deletion with membership purge on tenant delete.
+- **NEW**: **Embedding Dimension Override** — per-model `dimensions` override propagated to all embedding providers; fixes missing `dimensions` in API requests (#1654).
+- **NEW**: **RAG Pipeline Progress Events** — backend emits stage-level progress during retrieval / rerank / merge; Langfuse retrieve & rerank tracing enriched; agent reranks all knowledge-search hits with threshold filtering.
+
+### Improvements
+
+- **IMPROVED**: **IM agent stream display** aligned with web UI — thinking sections, tool progress, stream finalize hardening; DingTalk long-connection stale reconnect; custom-agent deletion cascades to IM bindings.
+- **IMPROVED**: **Settings UI** — service / store / MCP cards refactored with unified empty states; MCP config section in settings; modal navigation styles harmonized; small-screen overflow fixes.
+- **IMPROVED**: **Sidebar UX** — search + collapse toggles, session grouping, source switcher, and typography polish.
+- **IMPROVED**: **Knowledge** — parent-child chunk merge carries deep sub-heading context; imageinfo matching hardened; delete failures surfaced after retry exhaustion; KB deletion removes bound data sources.
+- **IMPROVED**: **Datasource editors** — lazy-load Feishu wiki resources; reveal pre-existing selections in deferred picker; edit flow clarifies that saving config does not trigger sync.
+- **IMPROVED**: **Model management** — deletion blocked when model is referenced by KB or agent; optional embedding-model descriptions in i18n.
+- **IMPROVED**: **Tencent VectorDB** — replica count configurable via env; collection compatibility hardened.
+- **IMPROVED**: **Performance** — compile-once regexps in SQL validation, LLM-JSON fence parsing, and sandbox command substitution.
+- **IMPROVED**: **Frontend build** — streamlined Docker frontend build via `scripts/build_frontend_dist.sh`; embed entry (`embed.html`) separated from main SPA.
+- **IMPROVED**: **Auth** — session resource caches cleared on logout to prevent cross-user leakage.
+
+### Bug Fixes
+
+- **FIXED**: Viewer role could not chat due to an unused `RunnableByViewer` gate.
+- **FIXED**: Agent thinking toggle and RAG-timeline reasoning display wired correctly.
+- **FIXED**: Auto-scroll for capped thinking blocks during streaming.
+- **FIXED**: Excel parser no longer emits image `DISPIMG` function strings as text.
+- **FIXED**: PaddleOCR-VL HTML table normalization (#1725).
+- **FIXED**: MHTML image resolution and Markdown structure preservation (#1743).
+- **FIXED**: EPUB / MHTML parser registration restored after refactor.
+- **FIXED**: Question-chunk ID mapping when copying to vector DB.
+- **FIXED**: RSS incremental sync partial failures now reported; Feishu wiki listing timeout via lazy load (#1672).
+- **FIXED**: SearXNG test-connection error messages clarified.
+- **FIXED**: Organization fetch cache invalidated after org creation.
+- **FIXED**: Stale tenant memberships purged on delete; switcher rows filtered.
+- **FIXED**: Writable shared KBs listed in manual knowledge editor.
+- **FIXED**: Wiki protected-provider images use placeholder `src` to avoid broken initial loads; citation chunks cleared on page deletion; LLM image URL masking prevents UUID corruption.
+- **FIXED**: `hybrid-search` accepts POST while keeping GET compatibility (#1727).
+- **FIXED**: Integrations redirect tab and lazy-loaded panel loading.
+- **FIXED**: Upload confirm dialog z-index below Settings modal.
+- **FIXED**: Knowledge timeline parser display.
+- **FIXED**: IM stream wait unblocked when QA fails before complete event.
+
+### Infrastructure & Build
+
+- **BUILD**: Migrations `000060_embed_channels`, `000061_wiki_page_hierarchy`, `000062_mcp_oauth`, `000063_knowledge_multi_tags`.
+- **BUILD**: Go client updated for embed channels, multi-tag knowledge, batch reparse, and wiki folder APIs.
+- **BUILD**: Swagger / API docs regenerated; `docs/api/` hand-written pages extended.
+
+### Documentation
+
+- **DOC**: `docs/embed-secure-mode.md`, `docs/embed-subdomain.md` added.
+- **DOC**: `docs/QA.md` extended for embed channels, multi-tag, batch reparse, MCP OAuth2, and RSS connector.
+- **DOC**: Architecture diagram updated for embed widget and input channels; simplified to architecture-level components.
+
+## [0.6.2] - 2026-06-10
+
+### New Features
+
+- **NEW**: **Per-Upload Process Configuration & Upload Confirm Dialog** — the headline of this release. Every file / URL / folder upload can now carry a `process_config` (`KnowledgeProcessOverrides`) that overrides KB defaults for that batch only: parser engine rules, chunking, multimodal (VLM / ASR), question generation, graph extraction, and related flags. The Web UI adds an upload-confirm step so operators can review and tweak settings before enqueueing; the Go client and `weknora doc upload` accept the same JSON payload.
+- **NEW**: **Document Reparse with Process Config** — `POST /knowledge/:id/reparse` accepts an optional `process_config` body to re-run parsing with new settings while preserving the knowledge record; overrides are persisted on the knowledge metadata and merged with KB defaults via `ResolveProcessConfig`.
+- **NEW**: **`weknora` CLI v0.9** (BREAKING) — auth/profile model harmonization, resource-command cleanup, and bundled Agent Skills:
+  - **Bundled skills**: `weknora-rag-search` and `weknora-shared` skills ship in-tree with drift-guard parity tests.
+  - **`session stop`**: abort an in-flight agent run from the terminal.
+  - **`--kb` resolver**: accepts KB name or id on `doc delete --all` and `search chunks` / `search docs` (required; no silent project-link fallback).
+  - **Auth/profile**: `auth login` authenticates the active profile (use `profile add --use` first); `auth logout` / `auth refresh` drop `--name` — target another profile with global `--profile`.
+  - **MCP rename**: `agent_invoke` → `session_ask`; `agent create --kb` → `--attach-kb`.
+- **NEW**: **Knowledge-base marquee selection** — drag-to-select multiple documents in the KB list for batch operations.
+- **NEW**: **HNSW index for 1024-dim embeddings** — migration `000059_embeddings_hnsw_1024` adds an HNSW index tuned for `bge-m3`-class 1024-dimensional vectors on PostgreSQL pgvector.
+- **NEW**: **Frontend build commit ID** — Vite injects the git commit hash into the UI for version tracking (Settings → System Info).
+
+### Improvements
+
+- **IMPROVED**: **Chat resources store** — centralized Pinia store for KB / agent selection across chat, editor, and command palette; hardened cache invalidation and deduplication when switching tenants or reloading lists.
+- **IMPROVED**: **Dark-mode code preview** — syntax highlighting in document / manual-knowledge code blocks respects the active theme.
+- **IMPROVED**: **Agent `get_document_info` tool** — schema and input parameters refined for clearer LLM tool calls.
+- **IMPROVED**: **Chat provider** — provider-native tool-call metadata preserved end-to-end in streaming responses.
+- **IMPROVED**: **Process config model** — removed standalone `enable_multimodal` KB flag in favor of unified `process_config`; parent-child chunking settings aligned; `graph_enabled` correctly gated on extract config.
+- **IMPROVED**: **Tracing** — Jaeger integration removed; Langfuse remains the sole observability backend (simpler startup, fewer env knobs).
+- **IMPROVED**: **Model sanitization** — chat model name and path validation hardened against malformed provider configs.
+
+### Bug Fixes
+
+- **FIXED**: Langfuse initialization failure on certain startup orderings.
+- **FIXED**: Share-link endpoints allow anonymous read access again (#1617).
+- **FIXED**: Wiki document status not refreshing after polling completes.
+- **FIXED**: KB list deduplication — multiple knowledge bases no longer render as an empty list.
+- **FIXED**: Custom jieba user-dictionary directory respected when configured.
+- **FIXED**: DuckDB spatial extension no longer attempts network install during startup.
+- **FIXED**: Document scroll container layout during loading state.
+- **FIXED**: `graph_enabled` logic in process configuration merge path.
+
+### Infrastructure & Build
+
+- **BUILD**: Migration `000059_embeddings_hnsw_1024`.
+- **BUILD**: Frontend `chatResources` / `uploadConfirm` / `editorResources` stores; `useMarqueeSelect` composable.
+- **BUILD**: CLI v0.9 contract tests, skill parity guards, and `session stop` command.
+
+### Documentation
+
+- **DOC**: `docs/api/knowledge.md` documents `process_config` on upload and reparse.
+- **DOC**: `docs/QA.md` extended for upload process config and CLI v0.9 breaking changes.
+- **DOC**: Architecture diagram updated for per-upload config, bundled CLI skills, and HNSW.
+
+## [0.6.1] - 2026-06-05
+
+### New Features
+
+- **NEW**: **Document Parsing Trace Timeline** — the headline of this release. Every document now records a Langfuse-style span tree (`knowledge_processing_spans`) so you can watch parsing progress stage-by-stage in real time. Highlights:
+  - **Waterfall timeline UI** redesigned as a Langfuse-style side drawer with attempt tabs, resizable width persisted to local storage, and a header "Trace" pill; reachable directly from the card menu.
+  - **Per-stage instrumentation**: a new `/stages` API tracks each parsing stage; postprocess subspans, per-image multimodal subspans, and synthesized-stage status (inferred from `parse_status`) are surfaced; root span closes on terminal state with enriched stage metadata.
+  - **Stop-parse control**: cancel an in-flight parse from the timeline panel; cancellation moves the document into a "finalizing" post-process state with a reliable finalizing-subtask counter (drains on all terminal exits) and async question fan-out.
+  - **Reliability**: documents no longer get stuck in "processing"; housekeeping is protected from false-killing long-running stages; polling switched to `setInterval` + watchdog with attempt tracking and surfaced silent failures.
+- **NEW**: **OpenSearch vector store driver** — a full new retrieval backend, landed across three PRs (interface skeleton → read/write paths → activated k-NN driver), with bulk update, by-query delete, copy, health-check, SSRF-aware transport, and an integration-test guide (`docs/dev/opensearch-integration-test.md`).
+- **NEW**: **Declarative built-in models via YAML** — `config/builtin_models.yaml` drives the platform's built-in model catalog with `${ENV}` interpolation, a `managed_by` column, lifecycle reconciliation, and a drift sweep that keeps the DB in sync with the YAML. Entries are schema-validated and ID lengths aligned with the DB. See `config/builtin_models.yaml.example`.
+- **NEW**: **System Admin & Platform Settings** — system-admin bootstrap/promotion with revocation safeguards, a consolidated single Settings panel merging system admin and settings, a platform audit log with polished audit drawers, and server-side system settings management.
+- **NEW**: **New-User Onboarding Guide** — an interactive spotlight/tour (`NewUserGuide`) with contextual guides for agent and knowledge-base creation, tenant-model-readiness hints, login hints for new users, and an improved backdrop/hole calculation, integrated into the user menu.
+- **NEW**: **Settings UI redesign** — model cards with type badges, redesigned vector-store / parser / storage-engine cards, redesigned web-search / MCP provider cards, brand logos replacing monogram badges, regrouped sidebar nav with a header pinned on scroll, and vector-store test moved into the card menu with a toast result.
+- **NEW**: **`weknora` CLI v0.7 / v0.8** (BREAKING) — agent-first wire contract and command-surface cleanup:
+  - **Command-surface rename**: `session ask`, `session continue-stream`, `doc fetch`, `doc create`, `doc delete --all`; `context` CRUD replaced by a `profile` cascade (`context` → `profile`); `agent invoke` / `kb empty` removed.
+  - **`--format json` is now the default** with an NDJSON event stream (one JSON event per line) and symmetric envelope infrastructure.
+  - **Agent safety nets**: `--dry-run` with risk metadata and validation parity across 19 mutations; `MCP Tool.Annotations` added to 10 tools (spec 2025-06-18).
+- **NEW**: **Parser engine expansion** — OpenDataLoader and PaddleOCR-VL (cloud + local) engines join the doc-reader; scanned-PDF parsing sped up with streamed image results and isolated heavy async queues; dedicated Excel/PPT converters, PPTX media extraction, and Markdown-table normalization; a hybrid OpenDataLoader Docker image (`docker/Dockerfile.odl-hybrid`); reorganized Markdown parser with enhanced gRPC document reading.
+- **NEW**: **MCP server multi-transport** — the Python MCP server now supports stdio / SSE / HTTP transports and exposes read-only wiki tools; the MCP service is optional via the `full` Docker profile.
+- **NEW**: **Thinking-mode configuration in the model editor** — per-model thinking-mode controls (`thinkingControl`) plus improved `<think>` tag handling in chat messages and an agent `think_stream` tool; the chat provider was modularized (request / stream / transport / usage / thinking split out).
+- **NEW**: **More models & providers** — Milvus database selection for vector stores; Tencent Cloud LKEAP Rerank; native Gemini embeddings; MiniMax-M3 in the provider model list; a local image resolver for multimodal chat.
+- **NEW**: **Cached prompt tokens** surfaced from upstream usage, with clarified cached-token semantics for explicit-cache providers.
+- **NEW**: **KB experience** — a `KBSwitcherDropdown` for fast KB selection, a consolidated `KBInfoPopover` (reused on FAQ KBs with correct document/FAQ counts), multi-KB search retrieval parameters, and KB ↔ vector-store binding surfaced in the list, editor, and detail UI (with a `VectorStoreBadge`).
+- **NEW**: **Multi-use share-link invitations** for `invite_only` mode (RBAC), with register-by-invite and a tenant invite-link flow.
+- **NEW**: **FAQ enhancements** — improved FAQ handling/localization plus a `faq_snippet` agent tool.
+- **NEW**: **"View in Graph"** entry on wiki pages.
+- **NEW**: **Server startup time & uptime tracking** exposed via a new runtime server module.
+- **NEW**: **Chat request-info / debug button** — inspect the debug payload for stream requests from the chat toolbar.
+- **NEW**: **`LOG_FORMAT` template** support with hardened level coloring.
+- **NEW**: **Windows build support for the sandbox** — Linux remains the default implementation; Windows now compiles via a dedicated stub.
+- **NEW**: **`display_name` column on models** and an expanded `knowledge.source` column length.
+
+### Improvements
+
+- **IMPROVED**: Retrieval — Elasticsearch search responses exclude the embedding field to reduce payload size; rerank pipeline falls back to raw retrieval results when the rerank API fails; OpenSearch type prep added ahead of the driver.
+- **IMPROVED**: Qdrant — optimized batch save, map iteration, and error wrapping.
+- **IMPROVED**: Knowledge — chunks stitched by text overlap instead of position; image caption/OCR text preserved in document summaries; single-item delete routed through the async pipeline with list polling after delete; stale knowledge records avoided on upload failure.
+- **IMPROVED**: Chat — model-selection handling refined; in-progress messages stay reactive so continue-stream renders; user multi-line query formatting preserved; user message container supports pre-wrapped text.
+- **IMPROVED**: Agent — event routing for reasoning vs. answers in streaming; content filtering in streaming events; intent-prompt customization in the agent editor (whitespace preserved); deterministic ordering of function definitions; `final_answer` tool references removed.
+- **IMPROVED**: Configuration — asynq concurrency settings tuned; env-file array form used for `builtin_models` compatibility.
+- **IMPROVED**: Frontend — floating-UI / agent-selector positioning corrected under root `zoom`; settings cards' interactions and accessibility polished; `X-Tenant-ID` override preserved when switching back to home.
+- **IMPROVED**: Multimodal — embedding input image-payload safety hardened; image payload sanitization in the hybrid indexer.
+
+### Bug Fixes
+
+- **FIXED**: Schema — expanded knowledge-source length to avoid truncation.
+- **FIXED**: Knowledge — reject `reuse_vectors` knowledge moves across stores; deep-copy stored files and images when cloning a KB; guard the knowledge list against stale updates.
+- **FIXED**: Handler — `/knowledge/search` accepts `?query=` and rejects empty keywords; multiple Swagger endpoints that returned 404 fixed and docs regenerated.
+- **FIXED**: Datasource — sync fails when all fetched items fail; Feishu wiki node parents preserved and Feishu connector capabilities aligned; slower datasource resource listing allowed; credential validation skipped when editing a data source; Yuque team token supported.
+- **FIXED**: Session — user-requested stop events handled gracefully in QA execution; stop watcher gains a timeout; agent system prompt preserved for greetings (reverted, then refined).
+- **FIXED**: IM — synthetic identity injected so IM channels can use shared KBs; recover from deleted session when `GetSession` returns the app sentinel; presigned-URL flow made diagnosable end-to-end.
+- **FIXED**: Security — throttling for protected file-fetch retries; vector-store connection addresses validated against SSRF policy; tenant validation for file access; tenant default storage-provider handling on KB creation.
+- **FIXED**: Repository — `tenant_id` qualified with the table name to resolve an ambiguous-column error; built-in models query syntax corrected.
+- **FIXED**: Multi-turn — `multi-turn-disabled` flag respected in the KnowledgeQA pipeline.
+- **FIXED**: Doris — `LIMIT`/`OFFSET` inlined as literals with parameter interpolation enabled.
+- **FIXED**: Doc parsing — DOC→DOCX conversion reliability improved; MinerU markdown and relative images preserved.
+- **FIXED**: Frontend — `{size}` param passed to the `fileSizeExceeded` i18n message on Nginx 413; wrong toast when selecting built-in agents other than quick-answer / smart-reasoning; default context template applied when switching to quick-answer mode; card popover closed before opening the delete-confirm dialog.
+- **FIXED**: Embedding — native Gemini embeddings supported.
+- **FIXED**: Events — panic recovery added to async goroutines.
+- **FIXED**: Milvus — skip empty enabled-status groups.
+- **FIXED**: Agent — tool-parameter parsing hardened against LLM type mismatches.
+- **FIXED**: Container — `resetPendingTasks` startup SQL corrected.
+
+### Refactoring
+
+- **REFACTOR**: Chat provider modularized into request / stream / transport / usage / thinking / stream-emit files; legacy `chat_provider_spec` removed.
+- **REFACTOR**: Logger — `LOG_FORMAT` template support with hardened level coloring.
+- **REFACTOR**: Migrations — deprecated user-system-admin migration files removed; system-settings migration introduced.
+- **REFACTOR**: Knowledge — flat stage table replaced with a Langfuse-style span tree; cancel-parse flow and user-confirmation dialogs streamlined; terminology clarified across parsing docs and UI.
+- **REFACTOR**: CLI — symmetric envelope infrastructure; envelope sweep (Emit shape, batch ops, MCP `StructuredContent`); context→profile cascade with post-review hardening.
+- **REFACTOR**: Settings — system-settings management and UI consolidated; provider/vector-store card chrome tightened.
+- **REFACTOR**: Chunk — removed the unused `VideoInfo` field from the `Chunk` struct.
+
+### Infrastructure & Build
+
+- **BUILD**: New migrations `000052`–`000058` — `models.managed_by`, system admin & settings, invitation tokens, `knowledge_processing_spans`, knowledge pending subtasks, `models.display_name`, and expanded knowledge source.
+- **BUILD**: `opensearch-go` v4.6.0 added; `github.com/mattn/go-runewidth` bumped.
+- **BUILD**: Dedicated `mcp-server/Dockerfile`; MCP service gated behind the `full` Docker profile.
+
+### Documentation
+
+- **DOC**: New `docs/日志配置.md` (logging configuration guide).
+- **DOC**: OpenSearch integration-test guide (`docs/dev/opensearch-integration-test.md`).
+- **DOC**: CLI — `AGENTS.md`, `README.md`, and `CHANGELOG.md` brought in sync with the v0.7 / v0.8 surface.
+- **DOC**: Clarified cached-token semantics for explicit-cache providers in chat docs.
+
+## [0.6.0] - 2026-05-21
+
+### New Features
+
+- **NEW**: **Tenant RBAC (Role-Based Access Control)** — the headline of this release (#1303). WeKnora now enforces a per-tenant role matrix on every mutating route, with per-KB resource ownership. Highlights:
+  - **4-tier role matrix**: `Owner` (one per tenant; can additionally delete the tenant) ⊃ `Admin` ⊃ `Contributor` (full owner of own resources, read-only on others) ⊃ `Viewer` (read-only). Two exceptions: cross-tenant superuser (`User.CanAccessAllTenants=true`) is implicit Admin in any tenant they switch into; API-Key-synthesized virtual users are pinned Admin in their owning tenant.
+  - **Per-KB resource ownership**: `chunk → knowledge → kb → creator_id`; same chain applies to FAQ entries, generated questions, KB tags and wiki pages. `custom_agents.creator_id` + `custom_agents.runnable_by_viewer` (default true) control agent ownership and viewer-callability.
+  - **Two guard families**: role guards (`Viewer()` / `Contributor()` / `Admin()` / `Owner()`) for tenant-level infra (models, vector stores, IM channels, …) and ownership guards (`OwnedKBOrAdmin()`, `OwnedAgentOrAdmin()`, `OwnedChunkKBOrAdmin()`, …) for resource writes. KB-access guard wired at the route layer for chunk / knowledge / knowledgebase routes (no per-handler helpers).
+  - **Tenant members**: invite / remove / role-change endpoints; new `/leave` endpoint; per-tenant audit log with daily retention sweep (default 90 days, `audit_logs.created_at` indexed); `tenant_members` table now drives membership (lifted from per-user to per-tenant in Plan 3); cross-tenant share managed by source-tenant Admin+.
+  - **Configurable**: `tenant.enable_rbac` (default `true`); `false` enters an "audit-only" grace window. New env knobs `WEKNORA_TENANT_ENABLE_RBAC`, `WEKNORA_TENANT_MAX_PER_USER`. RBAC state logged at startup. See [`docs/RBAC说明.md`](./docs/RBAC说明.md).
+- **NEW**: **Tenant Member Management & Multi-Workspace UX** — invite-only gate, member listing UI with role chips, tenant identity surfaces reworked; tenant switcher in the user menu; tenant switch always redirects to KB list and clears tenant-scoped client state; last-active workspace persisted across logins; pending invitations dialog with polling + global invitation bell; rich workspace-aware notifications on login / tenant switch (raw-message handling, styled chips, survives page reload); QuickNav entry for members; "leave workspace" surfaced in i18n.
+- **NEW**: **Self-Service Workspaces** — any user can create their own tenant (capped per user via env knob); creation dialog with i18n; tenant name + description editable inline; cross-tenant superuser mirrored as Admin role chip in the UI.
+- **NEW**: **`weknora` CLI v0.3 / v0.4 (GA)** — graduates from preview to GA with comprehensive verb-noun subtree coverage:
+  - `agent` subtree: list / view / invoke / check / status / edit / delete / create (full agent CRUD with config rendering).
+  - `chunk` subtree: list / view / delete (with curation rationale).
+  - `session` subtree: list / view / delete.
+  - `search` subtree: chunks / kb / docs / sessions (replaces flat `search`).
+  - `kb`: new `edit`, `pin`, `empty`, `check`, `status` verbs; `delete` and other commands harmonized.
+  - `doc`: new `download`, `view`, `wait` (multi-target wait-all), `unlink`, `upload --recursive`; `upload` flag expansion; `delete` accepts multiple IDs.
+  - `auth`: new `refresh` and `token` verbs; transparent 401 retry transport.
+  - `context` CRUD: add / list / remove / use.
+  - `link` / `unlink` for project-level KB binding.
+  - `mcp serve` — curated stdio MCP server so AI clients (Claude Code, Cursor, …) can drive WeKnora directly; includes MCP `chunk_list` tool.
+  - **Globals**: `--format`, `--json` field-select, `--jq`, `--paginate`, `--all-pages` (canonical catch-up), `--input`, `--log-level`, `--from-url`, NDJSON output, bare-JSON output path, signal-aware contexts.
+  - **Removed**: envelope infrastructure (errors → stderr); `--dry-run`; `internal/agent` aiclient package; v0.0 scaffolding.
+- **NEW**: **KB Retrieval Fan-out Across Vector Stores** — a single KB can now bind to multiple vector stores; retrieval engine fans out queries across all bound stores and merges results. KB editor validates bindings on create / copy / delete. Retriever resolution introduces a factory pattern for KB-scoped engine selection.
+- **NEW**: **AES-256-GCM At-Rest Encryption** for MCP and Data Source credentials with graceful key-rotation handling. Sensitive fields redacted in API responses; new `/credentials` subresource pattern prevents credential loss on edit.
+- **NEW**: **Docreader gRPC TLS + Token Auth** (#1359) — app → docreader connection can be hardened with TLS + bearer-token authentication; docreader gRPC port is no longer published to the host by default; `grpcio` floor bumped to 1.78.0 to match generated proto.
+- **NEW**: **Zhipu AI Embedder** — first-class Zhipu embedding provider.
+- **NEW**: **Huawei Cloud OBS** object storage joins Local / MinIO / AWS S3 / Volcengine TOS / Alibaba Cloud OSS / Kingsoft Cloud KS3 / Huawei OBS.
+- **NEW**: **vLLM URL configuration for MinerU** doc parser.
+- **NEW**: **Apache Doris compatibility modes** — configurable Doris compat modes with mode-switch guards.
+- **NEW**: **Docreader image URL whitelist** — trusted URLs can be served as-is without re-uploading into WeKnora storage.
+- **NEW**: **Server-Side User Preferences** — per-user font / theme / memory-feature toggle persisted on the server; per-user KB pinning replaces tenant-wide pin model; "Shared by me" label across surfaces.
+- **NEW**: **User favorites & recents** under the user menu.
+- **NEW**: **`creator_name` on agents and knowledge bases** for visibility across surfaces.
+- **NEW**: **Per-session last-request state persistence** for UI restoration after reload.
+- **NEW**: **Knowledge document tag selector redesign**.
+- **NEW**: `vue-i18n` notification templates support raw message handling with styled chips.
+- **NEW**: Custom agent service supports KB sharing.
+
+### Improvements
+
+- **IMPROVED**: Frontend offline + legacy browser support hardened.
+- **IMPROVED**: Chat history rendering stability — pagination preserves message order; menu no longer refreshes the session list when opening an existing chat; session titles no longer truncate when extra horizontal space is available; session list density tightened in sidebar.
+- **IMPROVED**: Session — wiki fixer now scoped to shared KB tenant; session access scoped by user (security hardening); `agent-chat` rejects requests early when `agent_id` is missing.
+- **IMPROVED**: KB — indexed documents complete immediately instead of waiting for an extra sweep; vector store bindings validated on create / copy / delete; `ErrKnowledgeBaseNotFound` mapped to HTTP 404 across all handlers; `ErrSessionNotFound` mapped to HTTP 404 across all handlers.
+- **IMPROVED**: `audit_log.Stop()` no longer deadlocks when `Start()` is never called.
+- **IMPROVED**: Organization searchable join no longer bypasses invite code expiry.
+- **IMPROVED**: Chunker no longer merges top-level heading chunks.
+- **IMPROVED**: Moonshot models — `moonshot-v1-*` / `kimi-k2.5` / `k2.6` now pin `temperature=1` automatically (they return HTTP 400 for any other value); `kimi-k2` / `k2-turbo` / `k2-thinking` left untouched.
+- **IMPROVED**: MinerU markdown image syntax unescape — `\!\[\]\(\)` is restored to `![]()` so downstream image extraction works.
+- **IMPROVED**: Test-connection — surfaces upstream and SSRF errors verbatim; falls back to stored apiKey when test-connecting an existing model.
+- **IMPROVED**: Test infrastructure — vector store tests now use a fake Elasticsearch server; knowledge base repository gains user pinning methods.
+- **IMPROVED**: Embedding pipeline — Zhipu AI embedder lands; broken comment in Zhipu embedder repaired.
+- **IMPROVED**: Sqlite test DDL augmented with `wiki_config` + `indexing_strategy`.
+- **IMPROVED**: `agent` exclude processing docs from prompt.
+- **IMPROVED**: LLM response — guard against empty `choices` and `message=None`.
+- **IMPROVED**: Configurable API proxy target for frontend dev environment.
+- **IMPROVED**: `DISABLE_REGISTRATION` now drives `registration_mode` too; removed redundant `WEKNORA_AUTH_REGISTRATION_MODE` env override.
+- **IMPROVED**: Tenant RBAC + per-user tenant cap exposed as env knobs.
+- **IMPROVED**: Auth — JWT `tenant_id` claim honored in middleware; tenant-scoped client state cleared on tenant change.
+- **IMPROVED**: gin per-route logs silenced; env config banner emitted at startup.
+- **IMPROVED**: Frontend — hide UI mutation surfaces for Viewer / non-creator; tenant switcher mirrors cross-tenant superuser Admin role in UI gates; role-aware UI gates no longer leak write affordances after tenant switch; agent editor `rerank` model now optional; Ollama tip hidden for remote models.
+- **IMPROVED**: System Info page surfaces UI build version, DB migration errors with troubleshooting links.
+- **IMPROVED**: Logger — `logger.CloneContext` propagates `TenantRole`.
+- **IMPROVED**: SSE / fetch paths — dropped insecure `X-Tenant-ID` short-circuit.
+- **IMPROVED**: Settings sidebar nav items grouped into labeled sections.
+
+### Bug Fixes
+
+- **FIXED**: API — `agent-chat` early reject when `agent_id` missing; deprecated tenant `ConversationConfig` field and KV write path removed.
+- **FIXED**: RBAC — chunk-id ownership chain for generated-question delete; sharing routes gated, tenant-disable shared agent → Admin+; ungated mutating routes plugged; FAQ + tag mutating routes aligned with KB ownership matrix; org-tenant gate gaps from Plan 3 closed; cross-tenant superuser organization owner pinned in DB instead of derived at runtime; remaining organization mutating routes gated with Admin+; dedup pending join/upgrade requests per (org, tenant, type); allow source-tenant Admin+ to manage cross-tenant shares; rbac-ui org owner row identified by `tenant_id` (not `user_id`).
+- **FIXED**: Client — `UpdateAgent` request types aligned with internal API.
+- **FIXED**: Frontend — input field agent selection logic improved for shared agents; permissions enhanced across KB and agent views; security — command-palette recent searches namespaced per (user, tenant); tenant switch away from tenant-scoped routes; tenant-members inline editing input attributes; `chat`/`enableMemoryOverride` simplified.
+- **FIXED**: i18n — `@` escaped in invite email placeholder; "Shared by me" label added; chat titles and "leave workspace" updates across multiple languages; RBAC messages for tenant admin requirements.
+- **FIXED**: Docparser — MinerU markdown image syntax unescaped.
+- **FIXED**: Migrations — `pg_trgm` created before trigram index in 000041.
+- **FIXED**: Compose — docreader gRPC port no longer published to the host.
+- **FIXED**: Credentials — redact sensitive fields and prevent credential loss on edit.
+- **FIXED**: Auth — connection to docreader supports auth; gRPC TLS/Token rollout from #1359 hardened.
+
+### Refactoring
+
+- **REFACTOR**: `knowledgebase` — removed `TogglePinKnowledgeBase` from `KnowledgeBaseRepository` interface (replaced by per-user pinning).
+- **REFACTOR**: Tenant switch navigation unified to always redirect to KB list.
+- **REFACTOR**: Tenant member — tenant ID resolution simplified in handlers; tenant-access guards centralized in middleware.
+- **REFACTOR**: Custom-agent — KB sharing support split out.
+- **REFACTOR**: Organization — tenant-based access control; tenant-level membership transitions.
+- **REFACTOR**: Retriever — factory pattern for KB-scoped engine resolution.
+- **REFACTOR**: Agent — `grep_chunks` tool simplified to a single regex query.
+- **REFACTOR**: Frontend — `GlobalCommandPalette`, `InputField`, sidebar, menu, `UserMenu` templates streamlined for readability.
+- **REFACTOR**: CLI — comprehensive v0.3 / v0.4 cleanup: dropped `--dry-run`, dropped envelope infrastructure (errors to stderr), introduced bare-JSON output path, dropped `internal/agent` aiclient package (Go 1.26), `--limit` / `--all-pages` canonical pagination, auth security audit (gh CLI parity hardening), pre-PR audit fixes.
+- **REFACTOR**: Credentials — `/credentials` subresource pattern introduced.
+
+### Infrastructure & Build
+
+- **BUILD**: Go bumped to **1.26.0** in `go.mod`.
+- **BUILD**: `grpcio` floor bumped to 1.78.0 to match generated proto.
+- **BUILD**: Migrations — `audit_logs.created_at` index added; daily retention sweep job.
+- **BUILD**: Frontend — skill registration directory updated.
+
+### Documentation
+
+- **DOC**: New `docs/RBAC说明.md` (Chinese RBAC guide) and `docs/wiki/安全认证/RBAC说明.md`, linked with shared space docs.
+- **DOC**: `docs/RBAC` documents Contributor vs `OwnedXxxOrAdmin` selection rule.
+- **DOC**: Issue templates require concrete app/UI versions (not "latest").
+- **DOC**: CLI — `cli/README.md`, `cli/AGENTS.md` + `cli/CHANGELOG.md` brought in sync with v0.3 / v0.4 surface; stale e2e refs cleared; CI parity test added.
+
+## [0.5.2] - 2026-05-13
+
+### 🚀 New Features
+- **NEW**: `weknora` CLI v0.2 — the official command-line client lives under `cli/`. Mirrors the `gh` CLI `<noun> <verb>` convention with 10 top-level commands (`api`, `auth`, `chat`, `context`, `doc`, `doctor`, `kb`, `link`, `search`, `version`). Highlights:
+  - Hybrid search and streaming RAG chat against any knowledge base.
+  - Project-level binding via `weknora link` writing `.weknora/project.yaml` (vercel/netlify pattern); subcommands auto-resolve `--kb` from the link.
+  - Stable JSON envelope (`{ok, data, error, _meta, dry_run, risk}`) on every `--json` invocation; closed error-code registry enforced by an AST scanner test.
+  - Agent affordance: `--dry-run` for write commands, exit-code 10 + `input.confirmation_required` for non-interactive destructive writes, per-command "AI agents:" guidance auto-shown when CLAUDECODE / CURSOR_AGENT is set. Operational contract in `cli/AGENTS.md`.
+  - Multi-context auth (`login` / `logout` / `list` / `status`), OS keyring + 0600 file fallback for credentials, both API-key and password (JWT) modes.
+  - Health check via `weknora doctor` (4 statuses: ok / warn / fail / skip).
+  - See `cli/README.md` for install + 5-minute quickstart.
+- **NEW**: Adaptive 3-tier chunking — documents are now profiled before splitting and routed to one of three strategies: heading-aware (Markdown structure), heuristic (form-feeds, multilingual chapter markers DE/EN/ZH, all-caps titles, visual separators), or recursive (the modernized legacy splitter as a fallback). Auto-strategy is the new default for fresh KBs; existing KBs keep their previous behavior until the user opts in. See `docs/CHUNKING.md`.
+- **NEW**: Human-in-the-loop approval for MCP tool calls (#1173) — when an MCP tool is marked sensitive, the agent now pauses and surfaces a `ToolApprovalCard` in the chat UI. Approval state is persisted (so refreshing the page does not lose context), enforced per user, and hardened for concurrent multi-instance deployments. See `docs/zh/mcp-approval.md`.
+- **NEW**: Anthropic chat provider — first-class support for Claude models, including streaming through the Anthropic gateway and `reasoning_content` round-tripping for thinking-mode providers.
+- **NEW**: Apache Doris 4.1 retriever backend — Doris joins pgvector / Elasticsearch / Milvus / Weaviate / Qdrant / Tencent VectorDB as a supported vector store, with native stream-load ingest and hybrid query.
+- **NEW**: Tencent VectorDB retriever — full-text / keyword retrieval against Tencent Cloud VectorDB.
+- **NEW**: KS3 (Kingsoft Cloud) object storage — joins Local / MinIO / AWS S3 / Volcengine TOS / Alibaba Cloud OSS as a supported storage backend.
+- **NEW**: SearXNG web search provider (#1166) — self-hosted, federated metasearch as a first-class web search option, with zero-config defaults and hardened secret handling.
+- **NEW**: Global Command Palette — replaces the standalone search page with a global ⌘K palette that fuzzy-searches knowledge bases / chats / commands and can directly start a new chat from a result.
+- **NEW**: Cloud-image packaging scripts — `scripts/cloud-image/` ships `prepare.sh`, `firstboot.sh`, `cleanup.sh`, and systemd units for producing reproducible self-hosted images (validated on Tencent Lighthouse; cloud-agnostic). Includes apt-based Docker install for restricted-egress hosts and idempotent firstboot with pinned image versions. See `docs/cloud-image/`.
+- **NEW**: KB editor — chunking settings panel surfaces the new strategy selector (Automatic / Markdown-optimized / Smart structure detection / Classic) plus advanced options for token limit per chunk and language hints. Sharper inline help text on every setting explains when defaults apply and when to tune.
+- **NEW**: Chunking debug panel — embedded "Test with sample text" panel under the chunking settings. Paste a snippet, hit Run preview, see selected tier, rejected tiers + reasons, document profile, size distribution stats over the full chunk set, and per-chunk cards with breadcrumb + content preview. Read-only, no DB or embedding side effects, 5-second server-side timeout.
+- **NEW**: `POST /api/v1/chunker/preview` endpoint backing the debug panel. Returns `selected_tier`, `tier_chain`, `rejected[]`, `profile`, `chunks[]`, and `stats`. Capped at 64k input runes / 500 chunks per response.
+- **NEW**: Per-tenant RRF (Reciprocal Rank Fusion) tuning — `RRFK`, `RRFVectorWeight`, `RRFKeywordWeight` are now configurable on the tenant `RetrievalConfig`. Defaults preserve the previous hardcoded behavior (k=60, weights 0.7/0.3).
+- **NEW**: Dedicated query-understanding model — agents can now route the query-rewrite / understanding step to a cheaper, faster model than the main reasoning model.
+- **NEW**: Document-level KB list filters with explicit batch-management UX (multi-select, batch delete, pinned-group section).
+- **NEW**: Frontend font picker + per-user UI preferences (font family, font size, theme) with a migration latch so legacy settings carry over safely.
+- **NEW**: OpenMaiC Classroom skill — generate micro-classroom content from knowledge-graph concepts, with an updated requirement-builder template.
+
+### ⚡ Improvements
+- **IMPROVED**: Agent multi-turn history is now rebuilt from the database on every turn — the dedicated `llmcontext` storage layer (in-memory / Redis) has been removed entirely. Eliminates cache invalidation bugs, avoids attachments being dropped between turns (`fix: propagate user attachments to agent query in AgentQA`), and simplifies deployment (no extra Redis namespace required).
+- **IMPROVED**: Wiki ingest scaled to 40k-document KBs — operations move through a generic task queue with dead-letter handling, conflict retries are bounded, requeue counts are capped, and the wiki ingest log is moved off the request path to a dedicated `wiki_log_entries` table with an on-demand API.
+- **IMPROVED**: Wiki page-link graph performance — new subgraph API + interactive exploration UI so large graphs no longer hang the browser; documentation clarifies the distinction between the wiki page-link graph and the entity-relation knowledge graph.
+- **IMPROVED**: Wiki sidebar lazy-loads page list with virtual-scroll tabs; image / graph overview now shows operation help entry and refined legend visuals.
+- **IMPROVED**: Langfuse observability — spans expanded across the chat pipeline (retrieval, rerank, agent step), end-to-end TTFB is logged on both ends of the chat stream, and natural-stop candidates are recorded when the model returns no tool call.
+- **IMPROVED**: LLM call timeout hardening — non-stream / stream LLM calls now have a defensive fallback timeout (300s chat / 600s stream by default, configurable up to 3600s on the agent editor), only applied when no upstream deadline is present. Prevents worker pools from being permanently blocked by hung provider requests, and stops `cancel` leaks on the raw-HTTP streaming path.
+- **IMPROVED**: GPT-5 / o-series compatibility — `MaxTokens` is now mapped to `MaxCompletionTokens` for models that require the new field.
+- **IMPROVED**: Chunker recursive priority — `splitBySeparators` now genuinely walks separators by priority and recursively re-splits oversize sub-pieces with the next-priority separator. Mirrors the Python reference. Without this fix, a "one paragraph break followed by a long run of newline-separated lines" pattern could emit ~1900-rune chunks at chunkSize=300.
+- **IMPROVED**: ChunkOverlap default consolidated to 80 (~15% of ChunkSize). Previously the Go DefaultConfig used 64, the knowledge service used 50, the Python docreader used 100, and the frontend form initialised to 100. All paths now align.
+- **IMPROVED**: ContextHeader (Markdown breadcrumb) lives on `Chunk.ContextHeader`, separate from `Chunk.Content`. Restores the `End-Start == len(Content)` invariant that the document-reconstruction path in `knowledge.go` relies on for summary generation and UI highlighting. Eliminates a duplicate-heading regression where the section heading appeared twice in a chunk's body.
+- **IMPROVED**: Embedding pipeline — exponential backoff (200/400/800/1600/3200 ms) replaces the previous fixed 100ms × 5 retry loop, with context-cancellation between attempts. `sanitizeForEmbedding` caps single embedding inputs at 20k runes with a warning log on overflow.
+- **IMPROVED**: SplitParentChild forces children onto the recursive tier, skipping per-parent profile passes (previously paid N extra O(N) document scans).
+- **IMPROVED**: Heuristic splitter snaps overlap start to the nearest semantic boundary or newline instead of slicing mid-line / mid-word.
+- **IMPROVED**: Validator flow — when every tier is rejected, the chain returns the legacy tier's output directly instead of running SplitText a second time.
+- **IMPROVED**: Token limit per chunk — when set, ChunkSize is auto-clamped to a per-language character budget (with a 10% safety factor). Prevents overshooting embedding model token caps on CJK content where 1 char ≈ 0.6 tokens.
+- **IMPROVED**: KB-config API — `strategy`, `tokenLimit`, `languages` use pointer DTOs server-side so a payload omitting a field means "no change" while an explicit empty / 0 / [] resets to default. Previously these were write-once fields.
+- **IMPROVED**: Wiki prompts enforce strict citation tracing and ontology reuse, with dedicated handling for contradictions and per-rule conflict policy.
+- **IMPROVED**: Chunker recognises CN chapter titles and multi-level numeric headings; surrounding whitespace is trimmed before embedding; protected spans are honoured during heuristic splitting; tiny adjacent chunks are coalesced in the heading splitter.
+- **IMPROVED**: Frontend nginx serves static resources with gzip + correct `Cache-Control` headers.
+- **IMPROVED**: Feishu connector tolerates partial wiki-node listing failures instead of aborting the whole sync.
+- **IMPROVED**: KB list — pinned KBs are now grouped under a dedicated section; the type column is replaced with a richer source + description subtitle.
+- **IMPROVED**: Frontend — SPA respects `BASE_URL` and now works correctly behind a path-prefix reverse proxy.
+- **IMPROVED**: GitHub issue / PR templates translated to English and rewritten; Dependabot grouping + monthly cadence applied across all ecosystems.
+
+### 🐛 Bug Fixes
+- **FIXED**: Mimo / DeepSeek-class providers — `reasoning_content` is now passed back to providers that require it for multi-turn thinking, and historical agent steps in the frontend correctly re-render `reasoning_content` instead of dropping it.
+- **FIXED**: Embedding pipeline — `OpenAIEmbedder.doRequestWithRetry` no longer shadows `err` and returns `(nil, nil)` on connection failure, which previously caused callers to SIGSEGV.
+- **FIXED**: Agent — quick-answer (RAG) mode excludes wiki-only KBs; rerank model requirement relaxed for custom agents; `data_analysis` toggle moved to the retrieval section and the stage is now opt-in per agent (#1244); attachments replayed correctly across multi-turn history; trailing thinking events that duplicate the final answer are suppressed; whitespace-only thinking events dropped; unified rendering when the model skips the `final_answer` tool; stream answer no longer mixes `think` and `answer` content; conversation end marker now reliably shown.
+- **FIXED**: Wiki ingest — concurrent lock conflict no longer exhausts retry budget; summary links and feed log reconciled when reduce LLM fails; JSON recovered from malformed / truncated fences in `extract_entity`; cap on `requeueFailedOps` retry count prevents queue pile-up.
+- **FIXED**: Storage — `tos` / `s3` / `oss` / `ks3` tenant configs are merged in `buildStorageConfig` (#1117); fall back to the global file service when tenant storage config is unavailable; sanitized document HTML now forbids `<style>` blocks.
+- **FIXED**: Data-analysis tool captures `LOCAL_STORAGE_BASE_DIR` at init time (#1040); shared knowledge included in knowledge search; graph config reporting corrected; multimodal pipeline unblocks when a `provider://` image read fails.
+- **FIXED**: FAQ — PostgreSQL cast precedence in FAQ search; ingest no longer hallucinates summaries from filenames on empty PDFs; OCR text preserved on ingest QA follow-up; insufficient-content gate covered by tests.
+- **FIXED**: Middleware — camelCase secret fields are masked in request logs.
+- **FIXED**: Chat — model fallback now includes history; pipeline data-analysis stage no longer runs for agents that did not opt in.
+- **FIXED**: Memory — episode write deduped on duplicate streaming Done.
+- **FIXED**: IM — `wecom` reconnect backoff clamped to avoid int64 overflow → busy loop; OIDC auth login fixed.
+- **FIXED**: Frontend — markdown tables render in chat wiki drawer; radio button theme + disabled selection unified; external doc-link style and outline add-button styling unified; model-settings UI polished (disabled brand color); pnpm v11 build approvals configured for Docker build; `npm` used in production build to match the committed lockfile; LaTeX formula loading restored in the rare-case markdown path; KB-editor i18n: `chunkOverlap` initial value aligned with backend default (80, not 100); description texts updated.
+- **FIXED**: Chunker — `Chunk.Start` / `End` rune-offset invariant restored; heuristic `applyOverlap` aligned to boundaries; preview endpoint stats computed over the FULL chunk set; empty / whitespace-only sample returns friendly 400; recursive split fixed by QA audit (pointer DTOs, profile reuse, stats correctness).
+- **FIXED**: Docreader — heavy parser concurrency now throttled.
+- **FIXED**: Frontend i18n — duplicate `liveIndicator` key removed from `ko-KR`; preference fallback no longer infectious.
+- **FIXED**: Client SDK — `GetChunkByIDOnly` endpoint corrected; SDK stdout logging silenced via opt-in `slog`.
+
+### 🔧 Refactoring
+- **REFACTOR**: `internal/application/service/knowledge.go` (9.8k lines) split by responsibility into focused files (`knowledge_create.go`, `knowledge_delete.go`, `knowledge_clone_move.go`, `knowledge_faq.go`, `knowledge_faq_import.go`, `knowledge_post_process.go`, `knowledge_process.go`, `knowledge_util.go`).
+- **REFACTOR**: Agent — dedicated `internal/agent/approval/` package for the MCP human-in-the-loop gate; tools gain a shared `exec_context.go`.
+- **REFACTOR**: Web-search — dropped dead `api_key` path in the SearXNG provider; SSRF whitelist tests reformatted.
+- **REFACTOR**: CLI — command surface aligned with mainstream `gh`-style conventions across releases; unused v0.0 scaffolding removed.
+
+### 🧱 Infrastructure & Build
+- **BUILD**: Go bumped to 1.26; docreader Python dependencies slimmed (removed legacy `ocr/` package, retired `storage.py`, retired `download_deps.py`).
+- **BUILD**: Major dependency bumps across server-deps and frontend-deps groups (Dependabot grouped, monthly cadence): `gorm`, `pgx/v5`, `aws-sdk-go-v2`, `weaviate`, `volcengine-tos`, `alibabacloud-oss`, `milvus`, `ollama`, `chromedp`, `duckdb-go/v2`, `minio-go/v7`, `sashabaranov/go-openai`, `volcengine-tos`, `aliyun-oss`, `vue 3.5.34`, `dompurify`, `papaparse`, `less`/`less-loader`, plus GitHub Actions (`checkout@6`, `upload-artifact@7`, `setup-go@6`, `setup-node@6`, `docker/*`).
+- **BUILD**: Migrations — `000040_wiki_log_entries`, `000041_task_queue_and_wiki_indexes`, `000042_mcp_tool_approval`; SQLite init migration updated to match.
+
+### 📚 Documentation
+- **DOC**: New `docs/CHUNKING.md` — strategy explanations, settings reference with use-case presets, token-limit guide per embedding model, debugging workflow, and known trade-offs.
+- **DOC**: New `docs/zh/mcp-approval.md` describing the MCP human-in-the-loop approval flow.
+- **DOC**: New `docs/cloud-image/README.md` and `docs/cloud-image/tencent-lighthouse.md` covering cloud-image packaging.
+- **DOC**: API documentation — Swagger annotations restored across handlers, Swagger regenerated via `make docs`, and the hand-written `docs/api/*.md` rewritten to match current routes. Includes a new `docs/api/auth.md`.
+- **DOC**: New `cli/README.md`, `cli/AGENTS.md`, top-level CLI mention added to main README, plus a CHANGELOG and ADR section under `cli/`.
+
+## [0.5.1] - 2026-04-30
+
+### 🚀 New Features
+- **NEW**: WeChat Mini Program — added a lightweight mobile client (`miniprogram/`) for configuring WeKnora API access, selecting knowledge bases, importing URLs, and chatting from inside WeChat, extending WeKnora from desktop to mobile.
+- **NEW**: Knowledge Base — document list view with multi-select, floating batch action bar, and batch delete to streamline managing large knowledge bases.
+- **NEW**: IM — tenant-wide IM Channels Overview entry under the user menu so administrators can inspect every IM channel of the tenant from a single page.
+- **NEW**: Sessions — keyword search across the conversation list, user-scoped pinning of important sessions, and clear IM-source visibility for chats originating from IM channels.
+- **NEW**: Frontend — unified Model / Web Search / MCP settings pages onto a shared card + drawer pattern with consistent layouts and reusable confirm-delete behavior.
+- **NEW**: IM channel form — switched from dialog to drawer UX, channel list moved from vertical layout to responsive grid cards with dropdown action menu, platform radio replaced with a select dropdown.
+- **NEW**: Tenant — exposed API Key reset from the API Info page; create/reset returns plaintext key once.
+- **NEW**: Storage — `STORAGE_ALLOW_LIST` env var to whitelist external storage hosts during URL rewriting / serving.
+- **NEW**: Agent — configurable per-agent LLM call timeout from the agent editor frontend.
+- **NEW**: Desktop client — added tenant switching support.
+- **NEW**: Frontend — markdown test page under dev tools for previewing rendering behavior.
+
+### ⚡ Improvements
+- **IMPROVED**: Agent — `data_analysis` tool gained SQL validation and stricter type processing.
+- **IMPROVED**: Agent — broad queries fall back to a knowledge-base document listing for better coverage (#959).
+- **IMPROVED**: Wiki ingest — failed operations are now requeued, and sync task retry behavior is aligned across regular and Lite modes.
+- **IMPROVED**: Wiki ingest (Lite) — added ingest lock to prevent concurrent execution issues.
+- **IMPROVED**: Search — `RetrieverEngines.Scan` enhanced to support both legacy and current data formats.
+- **IMPROVED**: i18n — aligned `en-US`, `ko-KR`, `ru-RU` locales with `zh-CN` as the source of truth.
+- **IMPROVED**: Helm — preserve `SYSTEM_AES_KEY` / `TENANT_AES_KEY` across upgrades to avoid breaking existing encrypted data.
+- **IMPROVED**: IM — secure private storage URL handling with HTTP rewriting in IM replies, presigned URL TTL shortening, and tenant ID preference from context.
+- **IMPROVED**: Docs — README tracing references updated from Jaeger to Langfuse across all language variants; Agent Mode and Observability sections were polished.
+
+### 🐛 Bug Fixes
+- **FIXED**: Frontend — LaTeX formulas flashing and disappearing during streaming responses (#1056).
+- **FIXED**: Docreader — removed default 100-page DOCX parsing limit.
+- **FIXED**: IM — removed pipeline-level timeout that killed multi-round agent reasoning.
+- **FIXED**: IM — sessions now isolated per agent and recover gracefully from deleted sessions.
+- **FIXED**: Search — aligned rerank priority between `Execute` and `rerankResults`.
+- **FIXED**: Container — aggregated registration errors in connector registry initialization for clearer startup diagnostics.
+- **FIXED**: Crypto — fail loudly when encrypted DB fields cannot be decrypted instead of returning empty data.
+- **FIXED**: Web search — normalized default tenant web search config at runtime.
+- **FIXED**: Wiki ingest — silent data loss caused by malformed JSON in the Redis queue.
+- **FIXED**: Tenant — return plaintext API key after create/reset for safe distribution.
+- **FIXED**: Frontend — chat drag-and-drop uploads routed correctly to the right pipeline.
+- **FIXED**: Frontend — hidden card checkbox when not in selection mode.
+- **FIXED**: Frontend — knowledge list sticky header and floating batch bar polish.
+- **FIXED**: Frontend — knowledge document list layout, batch bar, and selection behavior.
+- **FIXED**: Frontend — restored hover feedback on selected list rows.
+- **FIXED**: Frontend — keep chat input visible when conversation overflows the viewport.
+- **FIXED**: Mini program — improved knowledge base selection flow.
+- **FIXED**: Document parser — preserve standalone image uploads from the icon filter.
+- **FIXED**: Knowledge — fixed attachment document failure handling.
+
+### 🔧 Refactoring
+- **REFACTOR**: IM — moved adapter factories into per-platform subpackages (`feishu/`, `wechat/`, `wecom/`, `slack/`, `telegram/`, `dingtalk/`, `mattermost/`) for cleaner package boundaries.
+
+## [0.5.0] - 2026-04-27
+
+### 🚀 New Features
+- **NEW**: Wiki Mode — a brand-new agent-driven Wiki knowledge system that automatically distills raw documents into interlinked markdown pages. It ships with a dedicated WikiBrowser, an interactive knowledge graph visualizing references and relationships between pages, and specialized agent tools, empowering teams to grow a structured, continuously evolving knowledge base from their own materials.
+- **NEW**: Observability — integrated Langfuse for agent ReAct loop, LLM token tracking, tool calls, and asynq pipeline tracing, providing deep visibility into agent reasoning, tool execution, and system performance.
+- **NEW**: Customizable Indexing Strategy — users can now independently toggle Vector Search, Keyword Search, Wiki, and Knowledge Graph indexing on a per-knowledge-base level.
+- **NEW**: Vector Store UI & Per-KB Binding — full frontend management interface for Vector Stores, allowing users to configure connections, test connectivity, and assign specific vector stores to different knowledge bases.
+- **NEW**: Yuque Connector — Yuque data source integration with API client, full and incremental fetch, and resource mapping, enabling seamless synchronization of Yuque documents into the knowledge base.
+- **NEW**: Built-in Agent Skills — added a preloaded `OpenMAIC Classroom` agent skill.
+- **NEW**: Agent Tools — added `json_repair` tool for agents to automatically fix and parse malformed JSON outputs.
+- **NEW**: Frontend — added copy action for model cards in settings.
+- **NEW**: Agent — added support to load all sheets from Excel files for DuckDB data analysis.
+
+### ⚡ Improvements
+- **IMPROVED**: Agent — improved tenant context handling and error reporting.
+- **IMPROVED**: Agent — updated synthesis and issue flagging instructions in system prompt.
+- **IMPROVED**: Debugging — enhanced LLM request logging and debug output (`llm_debug`) across all model providers.
+
+### 🐛 Bug Fixes
+- **FIXED**: Agent — materialized knowledge files to temp path for DuckDB to fix access issues
+- **FIXED**: Agent — removed rerank model requirement for wiki-only agents
+- **FIXED**: Docreader — whitelisted offline protoc zip packages in dockerignore
+- **FIXED**: System — changed hardcoded version to `*` comparison for new Linux version compatibility
+- **FIXED**: Setup — added output if offline protoc install package already exists
+
 ## [0.4.0] - 2026-04-14
 
 ### 🚀 New Features
@@ -897,6 +1614,8 @@ All notable changes to this project will be documented in this file.
 - Docker Compose for quick startup and service orchestration.
 - MCP server support for integrating with MCP-compatible clients.
 
+[0.5.0]: https://github.com/Tencent/WeKnora/tree/v0.5.0
+[0.4.0]: https://github.com/Tencent/WeKnora/tree/v0.4.0
 [0.3.6]: https://github.com/Tencent/WeKnora/tree/v0.3.6
 [0.3.5]: https://github.com/Tencent/WeKnora/tree/v0.3.5
 [0.3.4]: https://github.com/Tencent/WeKnora/tree/v0.3.4

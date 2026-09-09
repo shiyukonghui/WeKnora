@@ -3,29 +3,64 @@ package mcp
 import (
 	"context"
 	"fmt"
+	"strings"
 	"sync"
 	"time"
 
 	"github.com/Tencent/WeKnora/internal/logger"
 	"github.com/Tencent/WeKnora/internal/types"
+	"github.com/Tencent/WeKnora/internal/types/interfaces"
 )
 
 // MCPManager manages MCP client connections
 type MCPManager struct {
-	clients   map[string]MCPClient // serviceID -> client
-	clientsMu sync.RWMutex
-	ctx       context.Context
-	cancel    context.CancelFunc
+	clients    map[string]MCPClient // cacheKey -> client
+	clientsMu  sync.RWMutex
+	connecting map[string]*pendingMCPConnection
+	oauthRepo  interfaces.MCPOAuthRepository
+	ctx        context.Context
+	cancel     context.CancelFunc
 }
 
-// NewMCPManager creates a new MCP manager
-func NewMCPManager() *MCPManager {
+// Connections to unrelated servers must not hold the manager lock during I/O.
+// Waiting callers may cancel independently; the connection belongs to the manager.
+type pendingMCPConnection struct {
+	done    chan struct{}
+	cancel  context.CancelFunc
+	client  MCPClient
+	err     error
+	version time.Time
+}
+
+type managedMCPClient struct {
+	MCPClient
+	cancel  context.CancelFunc
+	version time.Time
+}
+
+func (c *managedMCPClient) Disconnect() error {
+	c.cancel()
+	return c.MCPClient.Disconnect()
+}
+
+func (c *managedMCPClient) ServerInstructions() string {
+	if provider, ok := c.MCPClient.(interface{ ServerInstructions() string }); ok {
+		return provider.ServerInstructions()
+	}
+	return ""
+}
+
+// NewMCPManager creates a new MCP manager. oauthRepo is used to wire per-user
+// OAuth token stores for OAuth-enabled MCP services.
+func NewMCPManager(oauthRepo interfaces.MCPOAuthRepository) *MCPManager {
 	ctx, cancel := context.WithCancel(context.Background())
 
 	manager := &MCPManager{
-		clients: make(map[string]MCPClient),
-		ctx:     ctx,
-		cancel:  cancel,
+		clients:    make(map[string]MCPClient),
+		connecting: make(map[string]*pendingMCPConnection),
+		oauthRepo:  oauthRepo,
+		ctx:        ctx,
+		cancel:     cancel,
 	}
 
 	// Start cleanup goroutine
@@ -34,10 +69,26 @@ func NewMCPManager() *MCPManager {
 	return manager
 }
 
+// cacheKey computes the connection-cache key for a service. OAuth services are
+// keyed per principal (each identity connects with its own token); all other
+// services share a single connection per service ID.
+func cacheKey(service *types.MCPService, principal types.Principal) string {
+	if service.AuthConfig.IsOAuth() {
+		return service.ID + "\x00" + principal.Normalize().StorageID()
+	}
+	return service.ID
+}
+
 // GetOrCreateClient gets an existing client or creates a new one
 // Caches and reuses existing connections for SSE/HTTP Streamable
 // Note: Stdio transport is disabled for security reasons
-func (m *MCPManager) GetOrCreateClient(service *types.MCPService) (MCPClient, error) {
+//
+// For OAuth-enabled services the connection is keyed per principal (derived from
+// ctx) so each identity connects with its own token.
+func (m *MCPManager) GetOrCreateClient(ctx context.Context, service *types.MCPService) (MCPClient, error) {
+	if err := ctx.Err(); err != nil {
+		return nil, err
+	}
 	// Check if service is enabled
 	if !service.Enabled {
 		return nil, fmt.Errorf("MCP service %s is not enabled", service.Name)
@@ -48,55 +99,93 @@ func (m *MCPManager) GetOrCreateClient(service *types.MCPService) (MCPClient, er
 		return nil, fmt.Errorf("stdio transport is disabled for security reasons; please use SSE or HTTP Streamable transport instead")
 	}
 
-	// For SSE/HTTP Streamable, check if client already exists and reuse
-	m.clientsMu.RLock()
-	client, exists := m.clients[service.ID]
-	m.clientsMu.RUnlock()
-
-	if exists && client.IsConnected() {
-		return client, nil
+	var tenantID uint64
+	var principal types.Principal
+	if service.AuthConfig.IsOAuth() {
+		tenantID, _ = types.TenantIDFromContext(ctx)
+		principal, _ = types.PrincipalFromContext(ctx)
+		principal = types.MCPOAuthPrincipalFromContext(ctx)
+		if !principal.Valid() {
+			return nil, fmt.Errorf("principal context is required to connect to OAuth MCP service %s", service.Name)
+		}
 	}
+	key := cacheKey(service, principal)
 
-	// Create new client
 	m.clientsMu.Lock()
-	defer m.clientsMu.Unlock()
-
-	// Double check after acquiring write lock
-	client, exists = m.clients[service.ID]
-	if exists && client.IsConnected() {
-		return client, nil
-	}
-
-	// Create new client
-	config := &ClientConfig{
-		Service: service,
-	}
-
-	client, err := NewMCPClient(config)
-	if err != nil {
-		return nil, fmt.Errorf("failed to create MCP client: %w", err)
-	}
-
-	// For SSE connections, Connect() starts a persistent connection that needs a long-lived context
-	// Use manager's context (m.ctx) which persists for the lifetime of the manager
-	// The HTTP client's timeout will handle connection timeouts, not context cancellation
-	if err := client.Connect(m.ctx); err != nil {
-		return nil, fmt.Errorf("failed to connect to MCP service: %w", err)
-	}
-
-	if err := m.initializeClient(service, client, "failed to initialize MCP client"); err != nil {
+	if err := m.ctx.Err(); err != nil {
+		m.clientsMu.Unlock()
 		return nil, err
 	}
+	if client, exists := m.clients[key]; exists && client.IsConnected() {
+		managed, owned := client.(*managedMCPClient)
+		if !owned || managed.version.Equal(service.UpdatedAt) {
+			m.clientsMu.Unlock()
+			return client, nil
+		}
+		_ = client.Disconnect()
+		delete(m.clients, key)
+	}
+	pending := m.connecting[key]
+	if pending != nil && !pending.version.Equal(service.UpdatedAt) {
+		pending.cancel()
+		delete(m.connecting, key)
+		pending = nil
+	}
+	if pending == nil {
+		lifeCtx, cancel := context.WithCancel(m.ctx)
+		pending = &pendingMCPConnection{done: make(chan struct{}), cancel: cancel, version: service.UpdatedAt}
+		m.connecting[key] = pending
+		config := &ClientConfig{Service: service, TenantID: tenantID, Principal: principal, OAuthRepo: m.oauthRepo}
+		go m.connectClient(lifeCtx, key, config, pending)
+	}
+	m.clientsMu.Unlock()
+	select {
+	case <-ctx.Done():
+		return nil, ctx.Err()
+	case <-pending.done:
+		return pending.client, pending.err
+	}
+}
 
-	// Store client (only for non-stdio transports)
-	m.clients[service.ID] = client
-
-	logger.GetLogger(m.ctx).Infof("MCP client created and initialized for service: %s", service.Name)
-	return client, nil
+func (m *MCPManager) connectClient(
+	ctx context.Context, key string, config *ClientConfig, pending *pendingMCPConnection,
+) {
+	client, err := NewMCPClient(config)
+	if err == nil {
+		// SSE needs the connection lifetime, not the requesting turn's deadline.
+		err = client.Connect(ctx)
+	}
+	if err == nil {
+		err = m.initializeClient(ctx, config.Service, client, "failed to initialize MCP client")
+	}
+	m.clientsMu.Lock()
+	// CloseClient/CloseAll may retire this attempt while it is connecting.
+	if m.connecting[key] != pending || ctx.Err() != nil {
+		if err == nil {
+			err = context.Canceled
+		}
+	}
+	if err == nil {
+		pending.client = &managedMCPClient{MCPClient: client, cancel: pending.cancel, version: pending.version}
+		m.clients[key] = pending.client
+	} else {
+		pending.err = err
+		pending.cancel()
+		if client != nil {
+			_ = client.Disconnect()
+		}
+	}
+	if m.connecting[key] == pending {
+		delete(m.connecting, key)
+	}
+	close(pending.done)
+	m.clientsMu.Unlock()
 }
 
 // initializeClient handles the shared initialization flow with timeout enforcement.
-func (m *MCPManager) initializeClient(service *types.MCPService, client MCPClient, errPrefix string) error {
+func (m *MCPManager) initializeClient(
+	ctx context.Context, service *types.MCPService, client MCPClient, errPrefix string,
+) error {
 	initTimeout := 30 * time.Second
 	if service.AdvancedConfig != nil && service.AdvancedConfig.Timeout > 0 {
 		initTimeout = time.Duration(service.AdvancedConfig.Timeout) * time.Second
@@ -105,7 +194,7 @@ func (m *MCPManager) initializeClient(service *types.MCPService, client MCPClien
 		}
 	}
 
-	initCtx, initCancel := context.WithTimeout(m.ctx, initTimeout)
+	initCtx, initCancel := context.WithTimeout(ctx, initTimeout)
 	defer initCancel()
 
 	if _, err := client.Initialize(initCtx); err != nil {
@@ -128,22 +217,31 @@ func (m *MCPManager) GetClient(serviceID string) (MCPClient, bool) {
 	return client, exists
 }
 
-// CloseClient closes and removes a specific client
+// CloseClient closes and removes all cached connections for a service. For
+// OAuth services this spans every per-principal connection (keys are prefixed with
+// the service ID).
 func (m *MCPManager) CloseClient(serviceID string) error {
 	m.clientsMu.Lock()
 	defer m.clientsMu.Unlock()
-
-	client, exists := m.clients[serviceID]
-	if !exists {
-		return nil
+	for key, pending := range m.connecting {
+		if key == serviceID || strings.HasPrefix(key, serviceID+"\x00") {
+			pending.cancel()
+			delete(m.connecting, key)
+		}
 	}
 
-	if err := client.Disconnect(); err != nil {
-		logger.GetLogger(m.ctx).Errorf("Failed to disconnect MCP client %s: %v", serviceID, err)
+	for key, client := range m.clients {
+		// Match the plain service-ID key as well as per-principal OAuth keys
+		// ("<serviceID>\x00<principal>").
+		if key != serviceID && !strings.HasPrefix(key, serviceID+"\x00") {
+			continue
+		}
+		if err := client.Disconnect(); err != nil {
+			logger.GetLogger(m.ctx).Errorf("Failed to disconnect MCP client %s: %v", key, err)
+		}
+		delete(m.clients, key)
+		logger.GetLogger(m.ctx).Infof("MCP client closed: %s", key)
 	}
-
-	delete(m.clients, serviceID)
-	logger.GetLogger(m.ctx).Infof("MCP client closed: %s", serviceID)
 	return nil
 }
 
@@ -151,6 +249,10 @@ func (m *MCPManager) CloseClient(serviceID string) error {
 func (m *MCPManager) CloseAll() {
 	m.clientsMu.Lock()
 	defer m.clientsMu.Unlock()
+	for key, pending := range m.connecting {
+		pending.cancel()
+		delete(m.connecting, key)
+	}
 
 	for serviceID, client := range m.clients {
 		if err := client.Disconnect(); err != nil {

@@ -24,6 +24,7 @@
 
 <script setup lang="ts">
 import { ref, computed, nextTick, onMounted, onUnmounted, watch } from 'vue'
+import { getRootZoom, rectToCssPx, cssViewportSize } from '@/utils/zoom'
 
 const props = defineProps<{
   content: string
@@ -51,8 +52,12 @@ const updatePosition = async () => {
   // 再次检查，确保DOM已渲染
   if (!tooltipRef.value) return
   
-  const rect = wrapperRef.value.getBoundingClientRect()
-  const tooltipRect = tooltipRef.value.getBoundingClientRect()
+  // The tooltip is `position: fixed` and rendered under the root `zoom`.
+  // Normalize the visual-pixel rects so subsequent arithmetic stays in CSS px.
+  const zoom = getRootZoom()
+  const rect = rectToCssPx(wrapperRef.value.getBoundingClientRect(), zoom)
+  const tooltipRect = rectToCssPx(tooltipRef.value.getBoundingClientRect(), zoom)
+  const { width: vw, height: vh } = cssViewportSize(zoom)
   const placement = props.placement || 'top'
   
   let top = 0
@@ -80,8 +85,8 @@ const updatePosition = async () => {
   // 边界检测
   const padding = 8
   if (left < padding) left = padding
-  if (left + tooltipRect.width > window.innerWidth - padding) {
-    left = window.innerWidth - tooltipRect.width - padding
+  if (left + tooltipRect.width > vw - padding) {
+    left = vw - tooltipRect.width - padding
   }
   if (top < padding) {
     // 如果上方空间不足，改为下方显示
@@ -91,8 +96,8 @@ const updatePosition = async () => {
       top = padding
     }
   }
-  if (top + tooltipRect.height > window.innerHeight - padding) {
-    top = window.innerHeight - tooltipRect.height - padding
+  if (top + tooltipRect.height > vh - padding) {
+    top = vh - tooltipRect.height - padding
   }
   
   tooltipStyle.value = {
@@ -171,7 +176,7 @@ watch(showTooltip, (newVal) => {
   border: 1px solid var(--td-component-stroke);
   border-radius: 6px;
   box-shadow: 0 0 8px 0 rgba(0, 0, 0, 0.08);
-  font-family: "PingFang SC";
+  font-family: var(--app-font-family);
   font-size: 12px;
   font-weight: 400;
   line-height: 1.6;
@@ -273,7 +278,7 @@ watch(showTooltip, (newVal) => {
 
 .tooltip-content {
   color: var(--td-text-color-primary);
-  font-family: "PingFang SC";
+  font-family: var(--app-font-family);
   font-size: 12px;
   font-weight: 400;
   line-height: 1.6;

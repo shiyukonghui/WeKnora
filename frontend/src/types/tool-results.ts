@@ -21,10 +21,18 @@ export type DisplayType =
     | 'web_search_results'
     | 'web_fetch_results'
     | 'grep_results'
+    | 'knowledge_chunks_list'
     | 'wiki_write_page'
     | 'wiki_replace_text'
     | 'wiki_rename_page'
-    | 'wiki_delete_page';
+    | 'wiki_delete_page'
+    | 'shell_exec'
+    | 'list_sandbox_files'
+    | 'write_sandbox_file'
+    | 'edit_sandbox_file'
+    | 'read_skill'
+    | 'mcp_discovery'
+    | 'mcp_call';
 
 // Search result item
 export interface SearchResultItem {
@@ -34,8 +42,15 @@ export interface SearchResultItem {
     score: number;
     relevance_level: RelevanceLevel;
     knowledge_id: string;
+    knowledge_base_id?: string;
     knowledge_title: string;
     match_type: string;
+    knowledge_base_type?: string;
+    // FAQ entries share the owning document's title; the standard question
+    // gives each entry a distinct, human-readable label.
+    faq_standard_question?: string;
+    faq_similar_questions?: string[];
+    faq_answers?: string[];
 }
 
 // Chunk item
@@ -99,8 +114,14 @@ export interface KnowledgeBaseListData {
 
 // Document info data
 export interface DocumentInfoDocument {
-    knowledge_id: string;
+    knowledge_id?: string;
+    faq_id?: string;
+    chunk_id?: string;
     title: string;
+    faq_question?: string;
+    faq_answers?: string[];
+    faq_similar_questions?: string[];
+    is_faq?: boolean;
     description?: string;
     type?: string;
     source?: string;
@@ -170,6 +191,14 @@ export interface WebSearchResultItem {
     content?: string;
     source?: string;
     published_at?: string;
+    age?: string;
+    page_status?: 'success' | 'failed';
+    page_verified?: boolean;
+    page_content?: string;
+    page_error?: string;
+    page_truncated?: boolean;
+    full_output_path?: string;
+    storage_error?: string;
 }
 
 // Web search results data
@@ -183,11 +212,24 @@ export interface WebSearchResultsData {
 // Web fetch result item
 export interface WebFetchResultItem {
     url: string;
-    prompt?: string;
+    status?: 'success' | 'failed' | 'skipped';
+    retryable?: boolean;
+    error_code?: string;
+    error_message?: string;
     summary?: string;
+    summary_status?: string;
+    summary_error_code?: string;
+    summary_error_message?: string;
+    full_output_path?: string;
+    storage_error?: string;
     raw_content?: string;
     content_length?: number;
+    offset?: number;
+    returned_chars?: number;
+    truncated?: boolean;
+    next_offset?: number;
     method?: string;
+    /** @deprecated use error_message */
     error?: string;
 }
 
@@ -196,28 +238,69 @@ export interface WebFetchResultsData {
     display_type: 'web_fetch_results';
     results: WebFetchResultItem[];
     count?: number;
+    successful_count?: number;
+    failed_count?: number;
+    skipped_count?: number;
+    all_failed?: boolean;
 }
 
-// Grep knowledge aggregation item
+// Grep knowledge aggregation item (legacy, grouped by knowledge_id)
 export interface GrepKnowledgeResult {
     knowledge_id: string;
     knowledge_base_id: string;
     knowledge_title: string;
+    faq_question?: string;
+    title_match?: boolean;
     chunk_hit_count: number;
+    match_snippet?: string;
     pattern_counts: Record<string, number>;
     total_pattern_hits: number;
     distinct_patterns: number;
 }
 
+// Per-chunk grep hit (preferred for UI — one row per FAQ entry or chunk)
+export interface GrepChunkResult {
+    chunk_id: string;
+    faq_id?: string;
+    knowledge_id: string;
+    knowledge_base_id: string;
+    knowledge_title: string;
+    chunk_type?: string;
+    index?: number;
+    chunk_index?: number;
+    faq_question?: string;
+    title_match?: boolean;
+    match_snippet?: string;
+    score?: number;
+}
+
 // Grep results data
 export interface GrepResultsData {
     display_type: 'grep_results';
+    query?: string;
     patterns: string[];
+    chunk_results?: GrepChunkResult[];
     knowledge_results: GrepKnowledgeResult[];
     result_count: number;
+    document_count?: number;
     total_matches: number;
     knowledge_base_ids?: string[];
+    limit?: number;
     max_results: number;
+}
+
+// Knowledge chunks list data (list_knowledge_chunks tool)
+export interface KnowledgeChunksListData {
+    display_type: 'knowledge_chunks_list';
+    knowledge_id?: string;
+    knowledge_title?: string;
+    total_chunks?: number;
+    fetched_chunks?: number;
+    page?: number;
+    page_size?: number;
+    faq_question?: string;
+    faq_id?: string;
+    single_chunk?: boolean;
 }
 
 // Wiki write page data
@@ -258,6 +341,63 @@ export interface WikiDeletePageData {
     affected_pages?: string[];
 }
 
+export interface ShellExecData {
+    display_type: 'shell_exec';
+    command?: string;
+    work_dir?: string;
+    exit_code?: number;
+    duration_ms?: number;
+    killed?: boolean;
+    truncated?: boolean;
+    stdout?: string;
+    stderr?: string;
+    stdout_binary?: boolean;
+    stderr_binary?: boolean;
+    stdout_truncated?: boolean;
+    stderr_truncated?: boolean;
+}
+
+export interface SandboxFileEntry {
+    name?: string;
+    path: string;
+    size?: number;
+    modified_at?: string;
+}
+
+export interface ListSandboxFilesData {
+    display_type?: 'list_sandbox_files';
+    session_id?: string;
+    path?: string;
+    root?: string;
+    entries?: SandboxFileEntry[];
+    count?: number;
+    truncated?: boolean;
+}
+
+export interface WriteSandboxFileData {
+    display_type?: 'write_sandbox_file' | 'edit_sandbox_file';
+    session_id?: string;
+    path?: string;
+    root?: string;
+    name?: string;
+    size?: number;
+    replacements?: number;
+    added_lines?: number;
+    removed_lines?: number;
+    preview?: string;
+}
+
+export interface ReadSkillData {
+    display_type?: 'read_skill';
+    skill_name?: string;
+    file_path?: string;
+    description?: string;
+    instructions?: string;
+    content?: string;
+    files?: string[];
+    skill_dir?: string;
+}
+
 // Union type for all wiki edit data
 export type WikiEditData = WikiWritePageData | WikiReplaceTextData | WikiRenamePageData | WikiDeletePageData;
 
@@ -275,10 +415,14 @@ export type ToolResultData =
     | WebSearchResultsData
     | WebFetchResultsData
     | GrepResultsData
+    | KnowledgeChunksListData
     | WikiWritePageData
     | WikiReplaceTextData
     | WikiRenamePageData
-    | WikiDeletePageData;
+    | WikiDeletePageData
+    | ShellExecData
+    | ListSandboxFilesData
+    | ReadSkillData;
 
 // Action data (from index.vue)
 export interface ActionData {
@@ -292,4 +436,3 @@ export interface ActionData {
     display_type?: DisplayType;
     tool_data?: Record<string, any>;
 }
-

@@ -4,13 +4,22 @@ import (
 	"context"
 	"encoding/json"
 	"errors"
+	"fmt"
+	"sort"
+	"strings"
 	"time"
 
+	"github.com/Tencent/WeKnora/internal/application/access"
+	"github.com/Tencent/WeKnora/internal/application/repository"
 	"github.com/Tencent/WeKnora/internal/application/service/retriever"
+	"github.com/Tencent/WeKnora/internal/datasource"
+	apperrors "github.com/Tencent/WeKnora/internal/errors"
 	"github.com/Tencent/WeKnora/internal/logger"
+	"github.com/Tencent/WeKnora/internal/storageallowlist"
 	"github.com/Tencent/WeKnora/internal/tracing/langfuse"
 	"github.com/Tencent/WeKnora/internal/types"
 	"github.com/Tencent/WeKnora/internal/types/interfaces"
+	secutils "github.com/Tencent/WeKnora/internal/utils"
 	"github.com/google/uuid"
 	"github.com/hibiken/asynq"
 )
@@ -18,19 +27,30 @@ import (
 // ErrInvalidTenantID represents an error for invalid tenant ID
 var ErrInvalidTenantID = errors.New("invalid tenant ID")
 
+const kbTaskCleanupTimeout = 5 * time.Second
+
 // knowledgeBaseService implements the knowledge base service interface
 type knowledgeBaseService struct {
-	repo           interfaces.KnowledgeBaseRepository
-	kgRepo         interfaces.KnowledgeRepository
-	chunkRepo      interfaces.ChunkRepository
-	shareRepo      interfaces.KBShareRepository
-	kbShareService interfaces.KBShareService
-	modelService   interfaces.ModelService
-	retrieveEngine interfaces.RetrieveEngineRegistry
-	tenantRepo     interfaces.TenantRepository
-	fileSvc        interfaces.FileService
-	graphEngine    interfaces.RetrieveGraphRepository
-	asynqClient    interfaces.TaskEnqueuer
+	repo            interfaces.KnowledgeBaseRepository
+	kgRepo          interfaces.KnowledgeRepository
+	chunkRepo       interfaces.ChunkRepository
+	shareRepo       interfaces.KBShareRepository
+	kbShareService  interfaces.KBShareService
+	modelService    interfaces.ModelService
+	retrieveEngine  interfaces.RetrieveEngineRegistry
+	ownership       retriever.TenantStoreOwnership
+	tenantRepo      interfaces.TenantRepository
+	fileSvc         interfaces.FileService
+	storageResolver interfaces.StorageBackendResolver
+	graphEngine     interfaces.RetrieveGraphRepository
+	asynqClient     interfaces.TaskEnqueuer
+	taskInspector   interfaces.TaskInspector
+	taskPendingRepo interfaces.TaskPendingOpsRepository
+	dsRepo          interfaces.DataSourceRepository
+	syncLogRepo     interfaces.SyncLogRepository
+	dsScheduler     *datasource.Scheduler
+	audit           interfaces.AuditLogService
+	resourceCatalog interfaces.ResourceCatalog
 }
 
 // NewKnowledgeBaseService creates a new knowledge base service
@@ -41,23 +61,41 @@ func NewKnowledgeBaseService(repo interfaces.KnowledgeBaseRepository,
 	kbShareService interfaces.KBShareService,
 	modelService interfaces.ModelService,
 	retrieveEngine interfaces.RetrieveEngineRegistry,
+	ownership retriever.TenantStoreOwnership,
 	tenantRepo interfaces.TenantRepository,
 	fileSvc interfaces.FileService,
+	storageResolver interfaces.StorageBackendResolver,
 	graphEngine interfaces.RetrieveGraphRepository,
 	asynqClient interfaces.TaskEnqueuer,
+	taskInspector interfaces.TaskInspector,
+	taskPendingRepo interfaces.TaskPendingOpsRepository,
+	dsRepo interfaces.DataSourceRepository,
+	syncLogRepo interfaces.SyncLogRepository,
+	dsScheduler *datasource.Scheduler,
+	audit interfaces.AuditLogService,
+	resourceCatalog interfaces.ResourceCatalog,
 ) interfaces.KnowledgeBaseService {
 	return &knowledgeBaseService{
-		repo:           repo,
-		kgRepo:         kgRepo,
-		chunkRepo:      chunkRepo,
-		shareRepo:      shareRepo,
-		kbShareService: kbShareService,
-		modelService:   modelService,
-		retrieveEngine: retrieveEngine,
-		tenantRepo:     tenantRepo,
-		fileSvc:        fileSvc,
-		graphEngine:    graphEngine,
-		asynqClient:    asynqClient,
+		repo:            repo,
+		kgRepo:          kgRepo,
+		chunkRepo:       chunkRepo,
+		shareRepo:       shareRepo,
+		kbShareService:  kbShareService,
+		modelService:    modelService,
+		retrieveEngine:  retrieveEngine,
+		ownership:       ownership,
+		tenantRepo:      tenantRepo,
+		fileSvc:         fileSvc,
+		storageResolver: storageResolver,
+		graphEngine:     graphEngine,
+		asynqClient:     asynqClient,
+		taskInspector:   taskInspector,
+		taskPendingRepo: taskPendingRepo,
+		dsRepo:          dsRepo,
+		syncLogRepo:     syncLogRepo,
+		dsScheduler:     dsScheduler,
+		audit:           audit,
+		resourceCatalog: resourceCatalog,
 	}
 }
 
@@ -71,7 +109,12 @@ func (s *knowledgeBaseService) GetRepository() interfaces.KnowledgeBaseRepositor
 	return s.repo
 }
 
-// CreateKnowledgeBase creates a new knowledge base
+// CreateKnowledgeBase creates a new knowledge base.
+//
+// When VectorStoreID is set, the binding is validated against the caller's
+// tenant scope and the engine registry before persisting. A nil or
+// empty-string VectorStoreID is normalized to nil ("use the tenant's
+// effective engines") to match the retrieve-engine factory's pre-condition.
 func (s *knowledgeBaseService) CreateKnowledgeBase(ctx context.Context,
 	kb *types.KnowledgeBase,
 ) (*types.KnowledgeBase, error) {
@@ -82,7 +125,38 @@ func (s *knowledgeBaseService) CreateKnowledgeBase(ctx context.Context,
 	kb.CreatedAt = time.Now()
 	kb.TenantID = types.MustTenantIDFromContext(ctx)
 	kb.UpdatedAt = time.Now()
+	// Record the creator so RBAC's RequireOwnershipOrRole can let
+	// Contributors edit their own KBs without granting them tenant-wide
+	// edit rights. The X-API-Key auth path attaches a synthetic
+	// `system-<tenantID>` user; we deliberately skip those so the KB
+	// stays tenant-owned (CreatorID == ""), which matches the original
+	// API-key semantics (any human Admin can manage it) and prevents a
+	// later "list KBs by creator" feature from surfacing rows nobody can
+	// re-attribute.
+	if uid, ok := types.UserIDFromContext(ctx); ok && !types.IsSyntheticUserID(uid) {
+		kb.CreatorID = uid
+	}
 	kb.EnsureDefaults()
+	applyTenantDefaultStorageProvider(ctx, kb)
+	if err := s.applyAndValidateStorageBackend(ctx, kb); err != nil {
+		return nil, err
+	}
+
+	// Fold empty-string vector_store_id into nil so this path and the
+	// retrieve-engine factory's pre-condition share a single representation.
+	wasEmpty := kb.VectorStoreID != nil && *kb.VectorStoreID == ""
+	kb.Normalize()
+	if wasEmpty {
+		logger.Debugf(ctx,
+			"[kb.create] empty vector_store_id normalized to nil for tenant=%d",
+			kb.TenantID)
+	}
+
+	if kb.HasVectorStore() {
+		if err := s.validateVectorStoreBinding(ctx, kb.TenantID, *kb.VectorStoreID); err != nil {
+			return nil, err
+		}
+	}
 
 	logger.Infof(ctx, "Creating knowledge base, ID: %s, tenant ID: %d, name: %s", kb.ID, kb.TenantID, kb.Name)
 
@@ -93,9 +167,127 @@ func (s *knowledgeBaseService) CreateKnowledgeBase(ctx context.Context,
 		})
 		return nil, err
 	}
+	recordKBActivity(ctx, s.audit, kb.TenantID, kb.ID, types.AuditActionKBCreated,
+		"knowledge_base", kb.ID, types.AuditOutcomeSuccess, map[string]any{
+			"name": kb.Name, "type": kb.Type,
+		})
 
 	logger.Infof(ctx, "Knowledge base created successfully, ID: %s, name: %s", kb.ID, kb.Name)
 	return kb, nil
+}
+
+func (s *knowledgeBaseService) applyAndValidateStorageBackend(ctx context.Context, kb *types.KnowledgeBase) error {
+	if s.storageResolver == nil || kb == nil {
+		return nil
+	}
+	tenant, _ := types.TenantInfoFromContext(ctx)
+	if tenant == nil {
+		return apperrors.NewBadRequestError("workspace context missing")
+	}
+	id := ""
+	if kb.StorageBackendID != nil {
+		id = strings.TrimSpace(*kb.StorageBackendID)
+	}
+	provider := kb.GetStorageProvider()
+	// A newly created KB without an explicit instance follows the concrete
+	// tenant default. The legacy provider is only a fallback for workspaces
+	// that have not been migrated yet.
+	if id == "" && tenant.DefaultStorageBackendID != nil && strings.TrimSpace(*tenant.DefaultStorageBackendID) != "" {
+		provider = ""
+	}
+	backend, err := s.storageResolver.ResolveBackend(ctx, tenant, id, provider)
+	if err != nil {
+		return apperrors.NewBadRequestError("storage backend is unavailable").WithDetails(err.Error())
+	}
+	if backend == nil {
+		return nil
+	}
+	kb.StorageBackendID = &backend.ID
+	kb.SetStorageProvider(backend.Provider)
+	return nil
+}
+
+// applyTenantDefaultStorageProvider fills an empty KB storage provider from the
+// tenant's global default (Settings → Storage engine). Frontend should send the
+// same value; this keeps API clients and legacy UIs consistent.
+func applyTenantDefaultStorageProvider(ctx context.Context, kb *types.KnowledgeBase) {
+	if kb == nil || strings.TrimSpace(kb.GetStorageProvider()) != "" {
+		return
+	}
+	tenant, _ := ctx.Value(types.TenantInfoContextKey).(*types.Tenant)
+	provider := ""
+	if tenant != nil && tenant.StorageEngineConfig != nil {
+		provider = strings.ToLower(strings.TrimSpace(tenant.StorageEngineConfig.DefaultProvider))
+	}
+	if provider == "" || !storageallowlist.IsAllowed(provider) {
+		provider = storageallowlist.FirstAllowed()
+	}
+	if provider == "" {
+		return
+	}
+	kb.SetStorageProvider(provider)
+}
+
+// validateVectorStoreBinding routes through retriever.VerifyBinding so the
+// ownership + registry sentinel hierarchy stays the single source of truth.
+// The service layer's responsibility is to:
+//
+//  1. fast-reject malformed UUIDs (cheap pre-flight that also avoids a DB
+//     round trip for type-confusion inputs like "' OR 1=1 --"),
+//  2. translate retriever sentinels into user-facing AppErrors with
+//     generic messages and the typed error codes.
+//
+// UUID parse failures map to the same "vector store not found" message as
+// cross-tenant attempts to avoid an enumeration oracle that distinguishes
+// "malformed input" from "non-existent UUID".
+func (s *knowledgeBaseService) validateVectorStoreBinding(
+	ctx context.Context, tenantID uint64, storeID string,
+) error {
+	sanitized := secutils.SanitizeForLog(storeID)
+
+	if _, err := uuid.Parse(storeID); err != nil {
+		logger.WarnWithFields(ctx, logger.Fields{
+			"tenant_id": tenantID,
+			"store_id":  sanitized,
+			"reason":    "malformed vector_store_id",
+		}, "[kb.create] vector store id is not a valid UUID")
+		return apperrors.NewVectorStoreBindingInvalidError("vector store not found")
+	}
+
+	switch err := retriever.VerifyBinding(
+		ctx, s.retrieveEngine, s.ownership, tenantID, storeID,
+	); {
+	case err == nil:
+		return nil
+	case errors.Is(err, retriever.ErrVectorStoreForbidden):
+		logger.WarnWithFields(ctx, logger.Fields{
+			"tenant_id": tenantID,
+			"store_id":  sanitized,
+			"reason":    "cross-tenant or unknown store",
+		}, "[kb.create] vector store not owned by tenant")
+		return apperrors.NewVectorStoreBindingInvalidError("vector store not found")
+	case errors.Is(err, retriever.ErrVectorStoreNotFound),
+		errors.Is(err, retriever.ErrVectorStoreUnavailable):
+		logger.WarnWithFields(ctx, logger.Fields{
+			"tenant_id": tenantID,
+			"store_id":  sanitized,
+			"reason":    "store recorded in DB but no engine could be resolved",
+		}, "[kb.create] vector store currently unavailable")
+		return apperrors.NewVectorStoreUnavailableError(
+			"vector store is currently unavailable; check its connection configuration")
+	case errors.Is(err, context.Canceled), errors.Is(err, context.DeadlineExceeded):
+		// The caller went away or ran out of time while the binding was being
+		// verified, which can now include rebuilding the store's engine. That
+		// is not a server fault, so it must not be logged and answered as one.
+		return err
+	default:
+		logger.ErrorWithFields(ctx, err, map[string]interface{}{
+			"tenant_id": tenantID,
+			"store_id":  sanitized,
+			"reason":    "binding verification failed",
+		})
+		return apperrors.NewInternalServerError("failed to verify vector store binding")
+	}
 }
 
 // GetKnowledgeBaseByID retrieves a knowledge base by its ID
@@ -207,6 +399,14 @@ func (s *knowledgeBaseService) ListKnowledgeBases(ctx context.Context) ([]*types
 			kb.ProcessingCount = processingCount
 		}
 	}
+
+	// Per-user pin stamping + ordering. The "main" list view is the
+	// only path that needs to honour the caller's personal pin set;
+	// agent/share/IM callers go through ListKnowledgeBasesByTenantID
+	// which also enriches but keys off the user in their own context.
+	if userID, ok := types.UserIDFromContext(ctx); ok && userID != "" {
+		s.applyUserKBPins(ctx, tenantID, userID, kbs)
+	}
 	return kbs, nil
 }
 
@@ -236,6 +436,15 @@ func (s *knowledgeBaseService) ListKnowledgeBasesByTenantID(ctx context.Context,
 			kb.ProcessingCount = processingCount
 		}
 	}
+
+	// Stamp pin state from the caller's perspective. The tenantID
+	// argument may not match the caller's own tenant (this method is
+	// also used to list a shared-agent's source-tenant KBs); we still
+	// scope user_kb_pins by `tenantID` since a pin tied to one tenant
+	// shouldn't surface when browsing another tenant's KBs.
+	if userID, ok := types.UserIDFromContext(ctx); ok && userID != "" {
+		s.applyUserKBPins(ctx, tenantID, userID, kbs)
+	}
 	return kbs, nil
 }
 
@@ -263,7 +472,23 @@ func (s *knowledgeBaseService) FillKnowledgeBaseCounts(ctx context.Context, kb *
 	return nil
 }
 
-// UpdateKnowledgeBase updates a knowledge base's properties
+// UpdateKnowledgeBase updates a knowledge base's mutable properties.
+//
+// IMPORTANT — vector_store_id immutability contract:
+// The vector_store_id binding is deliberately not accepted by this method.
+// Two layers enforce immutability:
+//
+//  1. ORM layer: the GORM tag `<-:create` on KnowledgeBase.VectorStoreID
+//     makes every UPDATE path (Save / Updates / Select-Updates) a no-op for
+//     that column. Verified by repository/knowledgebase_sqlite_test.go.
+//  2. Service layer: this method intentionally omits VectorStoreID from its
+//     parameter list, and the matching handler DTO UpdateKnowledgeBaseRequest
+//     omits the field as well. A reflection-based regression test
+//     (handler/knowledgebase_request_test.go) fails if either DTO field
+//     is added back, alerting future maintainers.
+//
+// Any future cross-store rebind workflow must use raw SQL through a
+// dedicated repository method — the only sanctioned write path post-creation.
 func (s *knowledgeBaseService) UpdateKnowledgeBase(ctx context.Context,
 	id string,
 	name string,
@@ -286,6 +511,17 @@ func (s *knowledgeBaseService) UpdateKnowledgeBase(ctx context.Context,
 		return nil, err
 	}
 
+	changedFields := make([]string, 0, 3)
+	if kb.Name != name {
+		changedFields = append(changedFields, "name")
+	}
+	if kb.Description != description {
+		changedFields = append(changedFields, "description")
+	}
+	if config != nil {
+		changedFields = append(changedFields, "config")
+	}
+
 	// Update the knowledge base properties
 	kb.Name = name
 	kb.Description = description
@@ -297,6 +533,10 @@ func (s *knowledgeBaseService) UpdateKnowledgeBase(ctx context.Context,
 		}
 		if config.WikiConfig != nil {
 			kb.WikiConfig = config.WikiConfig
+		}
+		if config.AutoTagConfig != nil {
+			config.AutoTagConfig.Normalize()
+			kb.AutoTagConfig = config.AutoTagConfig
 		}
 		// Update indexing strategy — syncs to ExtractConfig for backward compat
 		if config.IndexingStrategy != nil {
@@ -327,26 +567,134 @@ func (s *knowledgeBaseService) UpdateKnowledgeBase(ctx context.Context,
 		})
 		return nil, err
 	}
+	recordKBActivity(ctx, s.audit, kb.TenantID, kb.ID, types.AuditActionKBUpdated,
+		"knowledge_base", kb.ID, types.AuditOutcomeSuccess, map[string]any{
+			"name": kb.Name, "changed_fields": changedFields,
+		})
 
 	logger.Infof(ctx, "Knowledge base updated successfully, ID: %s, name: %s", kb.ID, kb.Name)
 	return kb, nil
 }
 
-// TogglePinKnowledgeBase toggles the pin status of a knowledge base
-func (s *knowledgeBaseService) TogglePinKnowledgeBase(ctx context.Context, id string) (*types.KnowledgeBase, error) {
+// TogglePinKnowledgeBase toggles whether the calling user has pinned
+// this knowledge base. Pin state is per-(user, kb) as of migration
+// 000050; previously this method flipped a tenant-wide column on the
+// KB row which broke down under RBAC (only Admin/creator could pin,
+// and the pin reordered the list for everyone in the tenant). The
+// public signature is unchanged so the HTTP handler / CLI / SDK don't
+// move.
+//
+// The KB still has to belong to the caller's tenant — the route is
+// already gated behind KBAccessRead, but we re-check via
+// GetKnowledgeBaseByIDAndTenant so a stale param survives a tenant
+// switch cleanly.
+func (s *knowledgeBaseService) TogglePinKnowledgeBase(
+	ctx context.Context, id string,
+) (*types.KnowledgeBase, error) {
 	if id == "" {
 		return nil, errors.New("knowledge base ID cannot be empty")
 	}
 	tenantID := types.MustTenantIDFromContext(ctx)
-	kb, err := s.repo.TogglePinKnowledgeBase(ctx, id, tenantID)
+	userID, ok := types.UserIDFromContext(ctx)
+	if !ok || userID == "" {
+		// API-key callers without a user identity can't have a personal
+		// pin set. We surface this rather than silently flipping a
+		// shared-tenant flag like the old behaviour.
+		return nil, errors.New("pin requires an authenticated user")
+	}
+
+	// Look the KB up without a tenant filter: the route's KBAccessRead
+	// guard already validated that this caller can see this KB (own,
+	// org-shared, or agent-shared). Filtering by the caller's tenant
+	// here would 404 every legitimate pin against a shared KB whose
+	// owning tenant differs from the caller's active tenant.
+	kb, err := s.repo.GetKnowledgeBaseByID(ctx, id)
 	if err != nil {
 		logger.ErrorWithFields(ctx, err, map[string]interface{}{
 			"knowledge_base_id": id,
+			"tenant_id":         tenantID,
 		})
 		return nil, err
 	}
-	logger.Infof(ctx, "Knowledge base pin toggled, ID: %s, is_pinned: %v", id, kb.IsPinned)
+
+	// Read current pin state to decide direction. ListUserKBPinIDs is
+	// already optimised for the "many KBs at once" path; for a single-id
+	// check the round-trip is acceptable and avoids leaking a second
+	// repository method just for this.
+	pins, err := s.repo.ListUserKBPinIDs(ctx, tenantID, userID)
+	if err != nil {
+		logger.ErrorWithFields(ctx, err, map[string]interface{}{
+			"knowledge_base_id": id,
+			"tenant_id":         tenantID,
+			"user_id":           userID,
+		})
+		return nil, err
+	}
+	_, currentlyPinned := pins[id]
+
+	pinnedAt, err := s.repo.SetUserKBPin(ctx, tenantID, userID, id, !currentlyPinned)
+	if err != nil {
+		logger.ErrorWithFields(ctx, err, map[string]interface{}{
+			"knowledge_base_id": id,
+			"tenant_id":         tenantID,
+			"user_id":           userID,
+			"target_pinned":     !currentlyPinned,
+		})
+		return nil, err
+	}
+
+	kb.EnsureDefaults()
+	kb.IsPinned = !currentlyPinned
+	kb.PinnedAt = pinnedAt
+	logger.Infof(ctx, "Knowledge base pin toggled, ID: %s, user: %s, is_pinned: %v",
+		id, userID, kb.IsPinned)
 	return kb, nil
+}
+
+// applyUserKBPins stamps IsPinned / PinnedAt onto each KB in the slice
+// from the caller's perspective and sorts the slice so pinned rows
+// float to the top (newest pin first, ties broken by created_at desc).
+// Safe to call with an empty userID (no-op stamp; default sort by
+// created_at preserved).
+func (s *knowledgeBaseService) applyUserKBPins(
+	ctx context.Context, tenantID uint64, userID string, kbs []*types.KnowledgeBase,
+) {
+	if len(kbs) == 0 || userID == "" {
+		return
+	}
+	pins, err := s.repo.ListUserKBPinIDs(ctx, tenantID, userID)
+	if err != nil {
+		// Pin enrichment is best-effort: a transient DB blip here
+		// should not break listing KBs. Log and bail without altering
+		// the slice — caller still gets a valid list, just unsorted by
+		// pin.
+		logger.Warnf(ctx, "applyUserKBPins: failed to load pins for tenant=%d user=%s: %v",
+			tenantID, userID, err)
+		return
+	}
+	if len(pins) == 0 {
+		return
+	}
+	for _, kb := range kbs {
+		if ts, ok := pins[kb.ID]; ok {
+			kb.IsPinned = true
+			t := ts
+			kb.PinnedAt = &t
+		}
+	}
+	sort.SliceStable(kbs, func(i, j int) bool {
+		a, b := kbs[i], kbs[j]
+		if a.IsPinned != b.IsPinned {
+			return a.IsPinned
+		}
+		if a.IsPinned && b.IsPinned {
+			at, bt := a.PinnedAt, b.PinnedAt
+			if at != nil && bt != nil && !at.Equal(*bt) {
+				return at.After(*bt)
+			}
+		}
+		return a.CreatedAt.After(b.CreatedAt)
+	})
 }
 
 // DeleteKnowledgeBase deletes a knowledge base by its ID
@@ -364,26 +712,76 @@ func (s *knowledgeBaseService) DeleteKnowledgeBase(ctx context.Context, id strin
 	tenantID := types.MustTenantIDFromContext(ctx)
 	tenantInfo, _ := types.TenantInfoFromContext(ctx)
 
-	// Step 1: Delete the knowledge base record first (mark as deleted)
-	logger.Infof(ctx, "Deleting knowledge base from database")
-	err := s.repo.DeleteKnowledgeBase(ctx, id)
+	// Load the KB before soft-delete so we can snapshot its VectorStoreID
+	// into the async cleanup payload. GORM's soft-delete filter hides the
+	// row from subsequent reads, so this read must happen first.
+	kb, err := s.repo.GetKnowledgeBaseByID(ctx, id)
 	if err != nil {
 		logger.ErrorWithFields(ctx, err, map[string]interface{}{
 			"knowledge_base_id": id,
 		})
 		return err
 	}
+	var vectorStoreIDSnapshot *string
+	if kb != nil {
+		vectorStoreIDSnapshot = kb.VectorStoreID
+	}
+
+	// Step 1: Delete the knowledge base record first (mark as deleted)
+	logger.Infof(ctx, "Deleting knowledge base from database")
+	err = s.repo.DeleteKnowledgeBase(ctx, id)
+	if err != nil {
+		logger.ErrorWithFields(ctx, err, map[string]interface{}{
+			"knowledge_base_id": id,
+		})
+		return err
+	}
+	deletedName := ""
+	if kb != nil {
+		deletedName = kb.Name
+	}
+	recordKBActivity(ctx, s.audit, tenantID, id, types.AuditActionKBDeleted,
+		"knowledge_base", id, types.AuditOutcomeSuccess, map[string]any{"name": deletedName})
+
+	// Stop both ephemeral queue work and durable wiki operations that target
+	// the now-deleted KB. ProcessKBDelete repeats this with document IDs and
+	// performs one final scrub after heavy cleanup to close enqueue races.
+	//
+	// Run detached with a bounded timeout so a disconnecting API client cannot
+	// truncate this best-effort scrub mid-scan, matching ProcessKBDelete's
+	// cleanup semantics. The KB row is already soft-deleted, so the async
+	// delete task remains the durable backstop even if this pass is cut short.
+	kbCleanupCtx, cancelKBCleanup := context.WithTimeout(
+		context.WithoutCancel(ctx), kbTaskCleanupTimeout,
+	)
+	s.cleanupTasksForKnowledgeBase(kbCleanupCtx, id, nil, nil)
+	cancelKBCleanup()
 
 	// Step 1b: Remove all organization shares for this KB so org settings no longer show them
-	if delErr := s.shareRepo.DeleteByKnowledgeBaseID(ctx, id); delErr != nil {
-		logger.Warnf(ctx, "Failed to delete KB shares for knowledge base %s: %v", id, delErr)
+	if s.shareRepo != nil {
+		if delErr := s.shareRepo.DeleteByKnowledgeBaseID(ctx, id); delErr != nil {
+			logger.Warnf(ctx, "Failed to delete KB shares for knowledge base %s: %v", id, delErr)
+		}
+	}
+
+	// Step 1c: Stop and soft-delete all data sources bound to this KB so cron
+	// schedules and in-flight sync logs do not keep running against a deleted KB.
+	dataSourceIDs := s.deleteDataSourcesForKnowledgeBase(ctx, id)
+	if len(dataSourceIDs) > 0 {
+		dsCancelCtx, cancelDSCancel := context.WithTimeout(
+			context.WithoutCancel(ctx), kbTaskCleanupTimeout,
+		)
+		s.cancelTasksForKnowledgeBase(dsCancelCtx, id, nil, dataSourceIDs)
+		cancelDSCancel()
 	}
 
 	// Step 2: Enqueue async task for heavy cleanup operations
 	payload := types.KBDeletePayload{
 		TenantID:         tenantID,
 		KnowledgeBaseID:  id,
+		DataSourceIDs:    dataSourceIDs,
 		EffectiveEngines: tenantInfo.GetEffectiveEngines(),
+		VectorStoreID:    vectorStoreIDSnapshot, // snapshot taken before soft-delete
 	}
 	langfuse.InjectTracing(ctx, &payload)
 
@@ -394,7 +792,8 @@ func (s *knowledgeBaseService) DeleteKnowledgeBase(ctx context.Context, id strin
 		return nil
 	}
 
-	task := asynq.NewTask(types.TypeKBDelete, payloadBytes, asynq.Queue("low"), asynq.MaxRetry(3))
+	task := asynq.NewTask(types.TypeKBDelete, payloadBytes,
+		asynq.Queue(types.QueueMaintenance), asynq.MaxRetry(3), asynq.Timeout(2*time.Hour))
 	info, err := s.asynqClient.Enqueue(task)
 	if err != nil {
 		logger.Warnf(ctx, "Failed to enqueue KB delete task: %v", err)
@@ -418,9 +817,18 @@ func (s *knowledgeBaseService) ProcessKBDelete(ctx context.Context, t *asynq.Tas
 
 	tenantID := payload.TenantID
 	kbID := payload.KnowledgeBaseID
+	var knowledgeIDs []string
 
 	// Set tenant context for downstream services
 	ctx = context.WithValue(ctx, types.TenantIDContextKey, tenantID)
+	defer func() {
+		// Workers may enqueue downstream work while the delete task performs
+		// heavy storage cleanup. A detached, bounded final scrub runs on every
+		// return path, including retryable failures and cancellation.
+		cleanupCtx, cancel := context.WithTimeout(context.WithoutCancel(ctx), kbTaskCleanupTimeout)
+		defer cancel()
+		s.cleanupTasksForKnowledgeBase(cleanupCtx, kbID, knowledgeIDs, payload.DataSourceIDs)
+	}()
 
 	logger.Infof(ctx, "Processing KB delete task for knowledge base: %s", kbID)
 
@@ -434,24 +842,47 @@ func (s *knowledgeBaseService) ProcessKBDelete(ctx context.Context, t *asynq.Tas
 		return err
 	}
 	logger.Infof(ctx, "Found %d knowledge entries to delete", len(knowledgeList))
+	knowledgeIDs = make([]string, 0, len(knowledgeList))
+	for _, knowledge := range knowledgeList {
+		knowledgeIDs = append(knowledgeIDs, knowledge.ID)
+	}
+
+	// Repeat the best-effort queue scrub with document IDs. Some batch tasks
+	// only carry knowledge_id(s), and active work from the first pass may have
+	// enqueued another downstream task before cancellation reached it.
+	s.cleanupTasksForKnowledgeBase(ctx, kbID, knowledgeIDs, payload.DataSourceIDs)
 
 	// Step 2: Delete all knowledge entries and their resources
 	if len(knowledgeList) > 0 {
-		knowledgeIDs := make([]string, 0, len(knowledgeList))
-		for _, knowledge := range knowledgeList {
-			knowledgeIDs = append(knowledgeIDs, knowledge.ID)
-		}
-
 		logger.Infof(ctx, "Deleting all knowledge entries and their resources")
 
-		// Delete embeddings from vector store
+		// Delete embeddings from vector store.
+		// Resolve the engine via the factory, using the VectorStoreID captured
+		// at enqueue time (may be nil → falls back to payload.EffectiveEngines).
+		// If the payload references a store no longer owned/registered
+		// (e.g. tampered queue entry or a store that was deleted while the
+		// task sat in the queue), the factory returns a sentinel and we
+		// SkipRetry to avoid burning retries on an unrecoverable situation.
 		logger.Infof(ctx, "Deleting embeddings from vector store")
-		retrieveEngine, err := retriever.NewCompositeRetrieveEngine(
+		retrieveEngine, err := retriever.CreateRetrieveEngineFromPayload(
+			ctx,
 			s.retrieveEngine,
+			s.ownership,
+			payload.TenantID,
 			payload.EffectiveEngines,
+			payload.VectorStoreID,
 		)
+		if errors.Is(err, retriever.ErrVectorStoreForbidden) ||
+			errors.Is(err, retriever.ErrVectorStoreNotFound) {
+			logger.Errorf(ctx, "KB delete task aborted: %v (tenant=%d, kb=%s)", err, payload.TenantID, payload.KnowledgeBaseID)
+			return asynq.SkipRetry
+		}
 		if err != nil {
-			logger.Warnf(ctx, "Failed to create retrieve engine: %v", err)
+			// Transient failures — store temporarily unavailable, request
+			// cancellation during resolution, or other retryable errors —
+			// must not fall through and report success while embeddings remain.
+			logger.Errorf(ctx, "KB delete task deferred: %v (tenant=%d, kb=%s)", err, payload.TenantID, payload.KnowledgeBaseID)
+			return err
 		} else {
 			// Group knowledge by embedding model and type
 			type groupKey struct {
@@ -506,7 +937,7 @@ func (s *knowledgeBaseService) ProcessKBDelete(ctx context.Context, t *asynq.Tas
 			}
 			storageAdjust -= knowledge.StorageSize
 		}
-		deleteExtractedImages(ctx, s.fileSvc, imageURLs)
+		deleteExtractedImages(ctx, s.fileSvc, knowledgeResourceOwners(s.resourceCatalog, knowledgeIDs...), imageURLs)
 		if storageAdjust != 0 {
 			if err := s.tenantRepo.AdjustStorageUsed(ctx, tenantID, storageAdjust); err != nil {
 				logger.Warnf(ctx, "Failed to adjust tenant storage: %v", err)
@@ -540,6 +971,85 @@ func (s *knowledgeBaseService) ProcessKBDelete(ctx context.Context, t *asynq.Tas
 
 	logger.Infof(ctx, "KB delete task completed successfully, knowledge base ID: %s", kbID)
 	return nil
+}
+
+// cancelTasksForKnowledgeBase removes queue work for a deleted KB when the
+// configured task backend supports knowledge-base-wide inspection. Queue
+// cleanup is an optimization: the soft-deleted database row remains the
+// durable source of truth, so backend failures must not fail KB deletion.
+func (s *knowledgeBaseService) cancelTasksForKnowledgeBase(
+	ctx context.Context,
+	kbID string,
+	knowledgeIDs []string,
+	dataSourceIDs []string,
+) {
+	canceller, ok := s.taskInspector.(interfaces.KnowledgeBaseTaskCanceller)
+	if !ok || kbID == "" {
+		return
+	}
+	if _, _, err := canceller.CancelTasksForKnowledgeBase(ctx, kbID, knowledgeIDs, dataSourceIDs); err != nil {
+		logger.Warnf(ctx, "Failed to cancel queued tasks for deleted KB %s: %v", kbID, err)
+	}
+}
+
+// cleanupTasksForKnowledgeBase removes both asynq records and durable wiki
+// operations. The latter must be cleared as well or startup recovery can
+// recreate Redis triggers for a KB that no longer exists.
+func (s *knowledgeBaseService) cleanupTasksForKnowledgeBase(
+	ctx context.Context,
+	kbID string,
+	knowledgeIDs []string,
+	dataSourceIDs []string,
+) {
+	if kbID == "" {
+		return
+	}
+	cleaner, ok := s.taskPendingRepo.(interfaces.TaskPendingOpsScopeCleaner)
+	if ok {
+		// Clear durable work before scanning Redis. A large or degraded queue
+		// must not consume the caller's entire deadline and starve the database
+		// fence that prevents startup recovery from reviving this KB.
+		if err := cleaner.DeleteByScope(ctx, types.TaskScopeKnowledgeBase, kbID); err != nil {
+			logger.Warnf(ctx, "Failed to clear durable tasks for deleted KB %s: %v", kbID, err)
+		}
+	}
+	s.cancelTasksForKnowledgeBase(ctx, kbID, knowledgeIDs, dataSourceIDs)
+}
+
+// deleteDataSourcesForKnowledgeBase mirrors DataSourceService.DeleteDataSource for
+// every data source attached to the KB. Errors on individual sources are logged
+// but do not fail KB deletion — the KB record is already soft-deleted.
+func (s *knowledgeBaseService) deleteDataSourcesForKnowledgeBase(ctx context.Context, kbID string) []string {
+	if s.dsRepo == nil {
+		return nil
+	}
+
+	dataSources, err := s.dsRepo.FindByKnowledgeBase(ctx, kbID)
+	if err != nil {
+		logger.Warnf(ctx, "Failed to list data sources for deleted KB %s: %v", kbID, err)
+		return nil
+	}
+	dataSourceIDs := make([]string, 0, len(dataSources))
+	for _, ds := range dataSources {
+		if ds == nil || ds.ID == "" {
+			continue
+		}
+		dataSourceIDs = append(dataSourceIDs, ds.ID)
+		if err := s.dsRepo.Delete(ctx, ds.ID); err != nil {
+			logger.Warnf(ctx, "Failed to delete data source %s for KB %s: %v", ds.ID, kbID, err)
+			continue
+		}
+		if s.dsScheduler != nil {
+			s.dsScheduler.Remove(ds.ID)
+		}
+		if s.syncLogRepo != nil {
+			if err := s.syncLogRepo.CancelPendingByDataSource(ctx, ds.ID); err != nil {
+				logger.Warnf(ctx, "Failed to cancel pending sync logs for ds=%s (kb=%s): %v", ds.ID, kbID, err)
+			}
+		}
+		logger.Infof(ctx, "Data source deleted with knowledge base: ds=%s kb=%s", ds.ID, kbID)
+	}
+	return dataSourceIDs
 }
 
 // SetEmbeddingModel sets the embedding model for a knowledge base
@@ -590,32 +1100,68 @@ func (s *knowledgeBaseService) SetEmbeddingModel(ctx context.Context, id string,
 
 // CopyKnowledgeBase copies a knowledge base to a new knowledge base (shallow copy).
 // Source and target must belong to the tenant in context; cross-tenant access is rejected.
+//
+// The transfer grant fixes both resource IDs and whether a new destination
+// may be created. Existing targets must be compatible with the source. A
+// worker retry reloads the reserved target instead of creating another KB.
 func (s *knowledgeBaseService) CopyKnowledgeBase(ctx context.Context,
 	srcKB string, dstKB string,
 ) (*types.KnowledgeBase, *types.KnowledgeBase, error) {
-	tenantID := types.MustTenantIDFromContext(ctx)
-	// Load source KB with tenant scope to prevent cross-tenant cloning
-	sourceKB, err := s.repo.GetKnowledgeBaseByIDAndTenant(ctx, srcKB, tenantID)
+	destinationID, create, creatorID, err := access.CloneDestination(ctx, srcKB)
 	if err != nil {
-		logger.Errorf(ctx, "Get source knowledge base failed: %v", err)
 		return nil, nil, err
 	}
+	if dstKB != "" && dstKB != destinationID {
+		return nil, nil, access.ErrForbidden
+	}
+	tenantID := types.MustTenantIDFromContext(ctx)
+	sourceKB, err := s.repo.GetKnowledgeBaseByIDAndTenant(ctx, srcKB, tenantID)
+	if err != nil {
+		return nil, nil, err
+	}
+	if sourceKB == nil || sourceKB.ID != srcKB || sourceKB.TenantID != tenantID {
+		return nil, nil, access.ErrForbidden
+	}
+	sourceCopy := *sourceKB
+	sourceKB = &sourceCopy
 	sourceKB.EnsureDefaults()
-	var targetKB *types.KnowledgeBase
-	if dstKB != "" {
-		// Load target KB with tenant scope so we only clone into the caller's tenant
-		targetKB, err = s.repo.GetKnowledgeBaseByIDAndTenant(ctx, dstKB, tenantID)
-		if err != nil {
+	targetKB, err := s.repo.GetKnowledgeBaseByIDAndTenant(ctx, destinationID, tenantID)
+	if err != nil && (!create || !errors.Is(err, repository.ErrKnowledgeBaseNotFound)) {
+		return nil, nil, err
+	}
+	if targetKB != nil {
+		targetCopy := *targetKB
+		targetKB = &targetCopy
+		targetKB.EnsureDefaults()
+		if err := access.RequireKBTransfer(ctx, sourceKB, targetKB, access.KBTransferClone); err != nil {
 			return nil, nil, err
 		}
+		tenant, _ := ctx.Value(types.TenantInfoContextKey).(*types.Tenant)
+		if err := access.ValidateKBTransferCompatibility(sourceKB,
+			targetKB,
+			access.KBTransferClone,
+			"",
+			tenant); err != nil {
+			return nil, nil, apperrors.NewBadRequestError(err.Error())
+		}
 	} else {
+		reserved := &types.KnowledgeBase{ID: destinationID, TenantID: tenantID}
+		if !create {
+			return nil, nil, access.ErrNotFound
+		}
+		if err := access.RequireKBTransfer(ctx, sourceKB, reserved, access.KBTransferClone); err != nil {
+			return nil, nil, err
+		}
 		var faqConfig *types.FAQConfig
 		if sourceKB.FAQConfig != nil {
 			cfg := *sourceKB.FAQConfig
 			faqConfig = &cfg
 		}
+		// Preserve VectorStoreID so the cloned KB lands on the same
+		// physical index. GORM `<-:create` permits the value at INSERT.
 		targetKB = &types.KnowledgeBase{
-			ID:                    uuid.New().String(),
+			ID:                    destinationID,
+			CreatorID:             creatorID,
 			Name:                  sourceKB.Name,
 			Type:                  sourceKB.Type,
 			Description:           sourceKB.Description,
@@ -626,8 +1172,17 @@ func (s *knowledgeBaseService) CopyKnowledgeBase(ctx context.Context,
 			SummaryModelID:        sourceKB.SummaryModelID,
 			VLMConfig:             sourceKB.VLMConfig,
 			StorageProviderConfig: sourceKB.StorageProviderConfig,
+			StorageBackendID:      sourceKB.StorageBackendID,
 			StorageConfig:         sourceKB.StorageConfig,
 			FAQConfig:             faqConfig,
+			VectorStoreID:         sourceKB.VectorStoreID,
+		}
+		// The clone is owned by the caller, not the original creator —
+		// otherwise a Contributor copying someone else's KB would still
+		// not be able to edit the result. Skip synthetic API-key users
+		// (see CreateKnowledgeBase for the same reasoning).
+		if uid, ok := types.UserIDFromContext(ctx); ok && !types.IsSyntheticUserID(uid) {
+			targetKB.CreatorID = uid
 		}
 		targetKB.EnsureDefaults()
 		if err := s.repo.CreateKnowledgeBase(ctx, targetKB); err != nil {
@@ -635,4 +1190,150 @@ func (s *knowledgeBaseService) CopyKnowledgeBase(ctx context.Context,
 		}
 	}
 	return sourceKB, targetKB, nil
+}
+
+// DuplicateKnowledgeBase creates a new KB from the source KB's settings only.
+// Runtime/content state is deliberately reset so this path never copies
+// knowledge entries, chunks, FAQ content, wiki pages, indexes, shares or pins.
+func (s *knowledgeBaseService) DuplicateKnowledgeBase(
+	ctx context.Context,
+	srcKB string,
+) (*types.KnowledgeBase, error) {
+	srcKB = strings.TrimSpace(srcKB)
+	if srcKB == "" {
+		return nil, apperrors.NewBadRequestError("source knowledge base ID cannot be empty")
+	}
+
+	tenantID := types.MustTenantIDFromContext(ctx)
+	sourceKB, err := s.repo.GetKnowledgeBaseByIDAndTenant(ctx, srcKB, tenantID)
+	if err != nil {
+		logger.Errorf(ctx, "Get source knowledge base failed: %v", err)
+		return nil, err
+	}
+	sourceKB.EnsureDefaults()
+
+	targetKB, err := cloneKnowledgeBaseConfiguration(sourceKB)
+	if err != nil {
+		return nil, err
+	}
+	targetKB.ID = uuid.New().String()
+	targetKB.TenantID = tenantID
+	targetKB.Name = s.buildDuplicateKnowledgeBaseName(ctx, tenantID, sourceKB.Name)
+	targetKB.CreatorID = ""
+	if uid, ok := types.UserIDFromContext(ctx); ok && !types.IsSyntheticUserID(uid) {
+		targetKB.CreatorID = uid
+	}
+	now := time.Now()
+	targetKB.CreatedAt = now
+	targetKB.UpdatedAt = now
+	targetKB.DeletedAt.Valid = false
+	targetKB.DeletedAt.Time = time.Time{}
+	targetKB.IsTemporary = false
+	targetKB.IsPinned = false
+	targetKB.PinnedAt = nil
+	targetKB.KnowledgeCount = 0
+	targetKB.ChunkCount = 0
+	targetKB.IsProcessing = false
+	targetKB.ProcessingCount = 0
+	targetKB.ShareCount = 0
+	targetKB.CreatorName = ""
+	targetKB.EnsureDefaults()
+	targetKB.Normalize()
+
+	if targetKB.HasVectorStore() {
+		if err := s.validateVectorStoreBinding(ctx, tenantID, *targetKB.VectorStoreID); err != nil {
+			return nil, err
+		}
+	}
+
+	if err := s.repo.CreateKnowledgeBase(ctx, targetKB); err != nil {
+		return nil, err
+	}
+	recordKBActivity(ctx, s.audit, tenantID, targetKB.ID, types.AuditActionKBDuplicated,
+		"knowledge_base", targetKB.ID, types.AuditOutcomeSuccess, map[string]any{
+			"source_kb_id": sourceKB.ID, "name": targetKB.Name,
+		})
+	return targetKB, nil
+}
+
+func duplicateKBCopySuffix(locale string) string {
+	locale = strings.ToLower(locale)
+	switch {
+	case strings.HasPrefix(locale, "zh"):
+		return " 副本"
+	case strings.HasPrefix(locale, "ko"):
+		return " 사본"
+	case strings.HasPrefix(locale, "ru"):
+		return " копия"
+	default:
+		return " Copy"
+	}
+}
+
+func duplicateKBDefaultName(locale string) string {
+	locale = strings.ToLower(locale)
+	switch {
+	case strings.HasPrefix(locale, "zh"):
+		return "知识库"
+	case strings.HasPrefix(locale, "ko"):
+		return "지식베이스"
+	case strings.HasPrefix(locale, "ru"):
+		return "База знаний"
+	default:
+		return "Knowledge Base"
+	}
+}
+
+func (s *knowledgeBaseService) buildDuplicateKnowledgeBaseName(
+	ctx context.Context,
+	tenantID uint64,
+	sourceName string,
+) string {
+	locale := types.LanguageFromContextOrDefault(ctx)
+	suffix := duplicateKBCopySuffix(locale)
+
+	baseName := strings.TrimSpace(sourceName)
+	if baseName == "" {
+		baseName = duplicateKBDefaultName(locale)
+	}
+
+	kbs, err := s.repo.ListKnowledgeBasesByTenantID(ctx, tenantID)
+	if err != nil {
+		logger.Warnf(ctx, "List tenant knowledge bases failed while building duplicate name: %v", err)
+		return baseName + suffix
+	}
+
+	existing := make(map[string]struct{}, len(kbs))
+	for _, kb := range kbs {
+		if kb == nil {
+			continue
+		}
+		existing[kb.Name] = struct{}{}
+	}
+
+	candidate := baseName + suffix
+	if _, ok := existing[candidate]; !ok {
+		return candidate
+	}
+	for i := 2; ; i++ {
+		candidate = fmt.Sprintf("%s%s %d", baseName, suffix, i)
+		if _, ok := existing[candidate]; !ok {
+			return candidate
+		}
+	}
+}
+
+func cloneKnowledgeBaseConfiguration(sourceKB *types.KnowledgeBase) (*types.KnowledgeBase, error) {
+	if sourceKB == nil {
+		return nil, apperrors.NewBadRequestError("source knowledge base cannot be empty")
+	}
+	data, err := json.Marshal(sourceKB)
+	if err != nil {
+		return nil, err
+	}
+	var targetKB types.KnowledgeBase
+	if err := json.Unmarshal(data, &targetKB); err != nil {
+		return nil, err
+	}
+	return &targetKB, nil
 }

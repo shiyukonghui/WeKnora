@@ -1,4 +1,4 @@
-.PHONY: help build run test clean docker-build-app docker-build-docreader docker-build-frontend docker-build-all docker-run migrate-up migrate-down docker-restart docker-stop start-all stop-all start-ollama stop-ollama build-images build-images-app build-images-docreader build-images-frontend clean-images check-env list-containers pull-images show-platform dev-start dev-stop dev-restart dev-logs dev-status dev-app dev-frontend docs install-swagger build-lite run-lite package-lite
+.PHONY: help build run test clean docker-build-app docker-build-docreader docker-build-frontend docker-build-all docker-run migrate-up migrate-down docker-restart docker-stop start-all stop-all start-ollama stop-ollama build-images build-images-app build-images-docreader build-images-frontend clean-images check-env list-containers pull-images show-platform dev-start dev-stop dev-restart dev-logs dev-status dev-app dev-frontend docs install-swagger build-lite run-lite package-lite anydoc-lib build-anydoc
 
 # Show help
 help:
@@ -8,6 +8,8 @@ help:
 	@echo "  build             构建应用"
 	@echo "  run               运行应用"
 	@echo "  test              运行测试"
+	@echo "  anydoc-lib        构建 anydoc 静态库（需要 Rust 工具链）"
+	@echo "  build-anydoc      构建带 anydoc 解析引擎的应用"
 	@echo "  clean             清理构建文件"
 	@echo ""
 	@echo "Docker 命令:"
@@ -50,11 +52,13 @@ help:
 	@echo ""
 	@echo "开发模式（推荐）:"
 	@echo "  dev-start         启动开发环境基础设施（仅启动依赖服务）"
+	@echo "                    可选: make dev-start DEV_ARGS=--odl-hybrid"
 	@echo "  dev-stop          停止开发环境"
 	@echo "  dev-restart       重启开发环境"
 	@echo "  dev-logs          查看开发环境日志"
 	@echo "  dev-status        查看开发环境状态"
 	@echo "  dev-app           启动后端应用（本地运行，需先运行 dev-start）"
+	@echo "                    已 make anydoc-lib 时自动链接 anydoc 引擎"
 	@echo "  dev-frontend      启动前端（本地运行，需先运行 dev-start）"
 	@echo ""
 	@echo "Lite 模式（零外部依赖）:"
@@ -86,6 +90,15 @@ endif
 build:
 	go build -o $(BINARY_NAME) $(MAIN_PATH)
 
+# Build the anydoc static archive (Rust) that the `anydoc` build tag links.
+# Override the platform with TARGET=<rust-target-triple>.
+anydoc-lib:
+	./scripts/build-anydoc-lib.sh
+
+# Build the application with the in-process anydoc parser engine linked in.
+build-anydoc: anydoc-lib
+	go build -tags anydoc -o $(BINARY_NAME) $(MAIN_PATH)
+
 # Run the application
 run: build
 	./$(BINARY_NAME)
@@ -109,21 +122,30 @@ docker-build-app:
 		--build-arg COMMIT_ID_ARG="$$COMMIT_ID" \
 		--build-arg BUILD_TIME_ARG="$$BUILD_TIME" \
 		--build-arg GO_VERSION_ARG="$$GO_VERSION" \
+		--build-arg WITH_ANYDOC=$${WITH_ANYDOC:-1} \
 		-f docker/Dockerfile.app -t $(DOCKER_IMAGE):$(DOCKER_TAG) .
 
 # Build docreader Docker image
 docker-build-docreader:
 	docker build --platform $(PLATFORM) -f docker/Dockerfile.docreader -t wechatopenai/weknora-docreader:latest .
 
-# Build frontend Docker image
+# Build frontend Docker image (multi-stage: npm runs inside the builder stage)
 docker-build-frontend:
-	docker build --platform $(PLATFORM) -f frontend/Dockerfile -t wechatopenai/weknora-ui:latest frontend/
+	@eval $$(./scripts/get_version.sh env); \
+	docker build --platform $(PLATFORM) \
+		--build-arg VITE_FRONTEND_COMMIT="$$COMMIT_ID" \
+		-f frontend/Dockerfile -t wechatopenai/weknora-ui:latest frontend/
 
 # Build all Docker images
 docker-build-all: docker-build-app docker-build-docreader docker-build-frontend
 
 # Run Docker container (传统方式)
+# Touch .env if missing — docker-compose.yml's `env_file: [.env]` is required
+# for ${ENV} interpolation in builtin_models.yaml and would otherwise refuse
+# to parse on fresh clones. `start-all` handles this via check_env_file; this
+# direct path needs its own guard.
 docker-run:
+	@[ -f .env ] || ([ -f .env.example ] && cp .env.example .env || touch .env)
 	docker-compose up
 
 # 使用新脚本启动所有服务
@@ -164,6 +186,7 @@ clean-images:
 
 # Restart Docker container (stop, start)
 docker-restart:
+	@[ -f .env ] || ([ -f .env.example ] && cp .env.example .env || touch .env)
 	docker-compose stop -t 60
 	docker-compose up
 
@@ -226,6 +249,8 @@ deps:
 
 # Build for production
 # google.golang.org/protobuf/reflect/protoregistry.conflictPolicy=warn for qdrant milvus proto conflict
+# GO_BUILD_TAGS adds optional build tags, e.g. GO_BUILD_TAGS=anydoc to link the
+# in-process office document parser (run `make anydoc-lib` first).
 build-prod:
 	VERSION=$$(git describe --tags --abbrev=0 2>/dev/null || echo "$${VERSION:-unknown}"); \
 	COMMIT_ID=$${COMMIT_ID:-unknown}; \
@@ -235,7 +260,7 @@ build-prod:
 	BUILD_TIME=$${BUILD_TIME:-unknown}; \
 	GO_VERSION=$${GO_VERSION:-unknown}; \
 	LDFLAGS="-X 'github.com/Tencent/WeKnora/internal/handler.Version=$$VERSION' -X 'github.com/Tencent/WeKnora/internal/handler.Edition=standard' -X 'github.com/Tencent/WeKnora/internal/handler.CommitID=$$COMMIT_ID' -X 'github.com/Tencent/WeKnora/internal/handler.BuildTime=$$BUILD_TIME' -X 'github.com/Tencent/WeKnora/internal/handler.GoVersion=$$GO_VERSION' -X 'google.golang.org/protobuf/reflect/protoregistry.conflictPolicy=warn'"; \
-	go build -ldflags="-w -s $$LDFLAGS" -o $(BINARY_NAME) $(MAIN_PATH)
+	go build -tags "$(GO_BUILD_TAGS)" -ldflags="-w -s $$LDFLAGS" -o $(BINARY_NAME) $(MAIN_PATH)
 
 # Build Lite version (single binary, SQLite + in-memory queue)
 # 会先构建前端到 web/，再构建 Go 二进制；SKIP_FRONTEND=1 可跳过前端
@@ -304,7 +329,7 @@ show-platform:
 
 # Development mode commands
 dev-start:
-	./scripts/dev.sh start
+	./scripts/dev.sh start $(DEV_ARGS)
 
 dev-stop:
 	./scripts/dev.sh stop

@@ -1,8 +1,10 @@
 package session
 
 import (
+	stderrors "errors"
 	"net/http"
 
+	"github.com/Tencent/WeKnora/internal/application/service"
 	"github.com/Tencent/WeKnora/internal/config"
 	"github.com/Tencent/WeKnora/internal/errors"
 	"github.com/Tencent/WeKnora/internal/infrastructure/docparser"
@@ -15,7 +17,8 @@ import (
 
 // Handler handles all HTTP requests related to conversation sessions
 type Handler struct {
-	messageService       interfaces.MessageService       // Service for managing messages
+	messageService       interfaces.MessageService // Service for managing messages
+	suggestionService    interfaces.MessageSuggestionService
 	sessionService       interfaces.SessionService       // Service for managing sessions
 	streamManager        interfaces.StreamManager        // Manager for handling streaming responses
 	config               *config.Config                  // Application configuration
@@ -23,37 +26,75 @@ type Handler struct {
 	customAgentService   interfaces.CustomAgentService   // Service for managing custom agents
 	tenantService        interfaces.TenantService        // Service for loading tenant (shared agent context)
 	agentShareService    interfaces.AgentShareService    // Service for resolving shared agents (KB scope in retrieval)
+	kbShareService       interfaces.KBShareService       // Service for resolving shared KB permissions
 	fileService          interfaces.FileService          // Service for file storage (image uploads)
-	modelService         interfaces.ModelService         // Service for model management (VLM access)
-	attachmentProcessor  *AttachmentProcessor            // Processor for file attachments
+	resourceCatalog      interfaces.ResourceCatalog
+	storageResolver      interfaces.StorageBackendResolver
+	modelService         interfaces.ModelService // Service for model management (VLM access)
+	attachmentProcessor  *AttachmentProcessor    // Processor for file attachments
+	temporaryDocuments   interfaces.TemporaryDocumentService
+	// artifactCollector drains skill-generated files from the session sandbox
+	// after an agent turn completes. May be nil when the sandbox backend does
+	// not support artifact collection; handlers must check before using.
+	artifactCollector *service.ArtifactCollector
+	memoryService     interfaces.MemoryService // Service for cross-session long-term memory
+	// userService / memberService back the sandbox terminal's self-contained
+	// handshake (browser WebSocket upgrades cannot send Authorization).
+	userService   interfaces.UserService
+	memberService interfaces.TenantMemberService
+	// terminalService opens PTYs on the sandbox bound to a session. It also
+	// owns first-use provisioning: the WS handshake carries the chat page's
+	// selected agent so the sandbox is created with the same config a
+	// conversation turn would use.
+	terminalService *service.SandboxTerminalService
 }
 
 // NewHandler creates a new instance of Handler with all necessary dependencies
 func NewHandler(
 	sessionService interfaces.SessionService,
 	messageService interfaces.MessageService,
+	suggestionService interfaces.MessageSuggestionService,
 	streamManager interfaces.StreamManager,
 	config *config.Config,
 	knowledgebaseService interfaces.KnowledgeBaseService,
 	customAgentService interfaces.CustomAgentService,
 	tenantService interfaces.TenantService,
 	agentShareService interfaces.AgentShareService,
+	kbShareService interfaces.KBShareService,
 	fileService interfaces.FileService,
+	resourceCatalog interfaces.ResourceCatalog,
+	storageResolver interfaces.StorageBackendResolver,
 	modelService interfaces.ModelService,
 	documentReader interfaces.DocumentReader,
 	imageResolver *docparser.ImageResolver,
+	temporaryDocuments interfaces.TemporaryDocumentService,
+	artifactCollector *service.ArtifactCollector,
+	memoryService interfaces.MemoryService,
+	userService interfaces.UserService,
+	memberService interfaces.TenantMemberService,
+	terminalService *service.SandboxTerminalService,
 ) *Handler {
 	return &Handler{
 		sessionService:       sessionService,
 		messageService:       messageService,
+		suggestionService:    suggestionService,
 		streamManager:        streamManager,
 		config:               config,
 		knowledgebaseService: knowledgebaseService,
 		customAgentService:   customAgentService,
 		tenantService:        tenantService,
 		agentShareService:    agentShareService,
+		kbShareService:       kbShareService,
 		fileService:          fileService,
+		resourceCatalog:      resourceCatalog,
+		storageResolver:      storageResolver,
 		modelService:         modelService,
+		temporaryDocuments:   temporaryDocuments,
+		artifactCollector:    artifactCollector,
+		memoryService:        memoryService,
+		userService:          userService,
+		memberService:        memberService,
+		terminalService:      terminalService,
 		attachmentProcessor: NewAttachmentProcessor(
 			fileService,
 			documentReader,
@@ -106,7 +147,13 @@ func (h *Handler) CreateSession(c *gin.Context) {
 	createdSession := &types.Session{
 		TenantID:    tenantID.(uint64),
 		Title:       request.Title,
-		Description: request.Description,
+		Description: types.SanitizeClientSessionDescription(request.Description, ""),
+	}
+	// Attach the calling user as the session owner when available.
+	// API-key callers scope sessions per external user when configured;
+	// otherwise they fall back to the synthetic tenant user.
+	if ownerID := types.SessionOwnerIDFromContext(ctx); ownerID != "" {
+		createdSession.UserID = ownerID
 	}
 
 	// Call service to create session
@@ -155,7 +202,7 @@ func (h *Handler) GetSession(c *gin.Context) {
 	logger.Infof(ctx, "Retrieving session, ID: %s", id)
 	session, err := h.sessionService.GetSession(ctx, id)
 	if err != nil {
-		if err == errors.ErrSessionNotFound {
+		if stderrors.Is(err, errors.ErrSessionNotFound) {
 			logger.Warnf(ctx, "Session not found, ID: %s", id)
 			c.Error(errors.NewNotFoundError(err.Error()))
 			return
@@ -175,12 +222,15 @@ func (h *Handler) GetSession(c *gin.Context) {
 
 // GetSessionsByTenant godoc
 // @Summary      获取会话列表
-// @Description  获取当前租户的会话列表，支持分页
+// @Description  获取当前空间的会话列表，支持分页、关键字搜索、按来源/Agent 筛选
 // @Tags         会话
 // @Accept       json
 // @Produce      json
-// @Param        page       query     int  false  "页码"
-// @Param        page_size  query     int  false  "每页数量"
+// @Param        page       query     int     false  "页码"
+// @Param        page_size  query     int     false  "每页数量"
+// @Param        keyword    query     string  false  "标题模糊搜索"
+// @Param        source     query     string  false  "来源过滤：web / embed / api / feishu / wechat / slack / ...（api、embed、IM 渠道需 Admin+）"
+// @Param        agent_id   query     string  false  "按 Agent 过滤（仅对 IM 会话生效）"
 // @Success      200        {object}  map[string]interface{}  "会话列表"
 // @Failure      400        {object}  errors.AppError         "请求参数错误"
 // @Security     Bearer
@@ -197,15 +247,22 @@ func (h *Handler) GetSessionsByTenant(c *gin.Context) {
 		return
 	}
 
-	// Use paginated query to get sessions
-	result, err := h.sessionService.GetPagedSessionsByTenant(ctx, &pagination)
+	// Response items always include pin state and (when available) IM origin
+	// fields so the frontend can render pin icons / source badges without a
+	// second roundtrip. Unset filter params behave like "no filter".
+	result, err := h.sessionService.ListSessions(ctx, &types.SessionListQuery{
+		Keyword:  c.Query("keyword"),
+		Source:   c.Query("source"),
+		AgentID:  c.Query("agent_id"),
+		Page:     pagination.Page,
+		PageSize: pagination.PageSize,
+	})
 	if err != nil {
 		logger.ErrorWithFields(ctx, err, nil)
 		c.Error(errors.NewInternalServerError(err.Error()))
 		return
 	}
 
-	// Return sessions with pagination data
 	c.JSON(http.StatusOK, gin.H{
 		"success":   true,
 		"data":      result.Data,
@@ -260,7 +317,7 @@ func (h *Handler) UpdateSession(c *gin.Context) {
 
 	// Call service to update session
 	if err := h.sessionService.UpdateSession(ctx, &session); err != nil {
-		if err == errors.ErrSessionNotFound {
+		if stderrors.Is(err, errors.ErrSessionNotFound) {
 			logger.Warnf(ctx, "Session not found, ID: %s", id)
 			c.Error(errors.NewNotFoundError(err.Error()))
 			return
@@ -311,7 +368,7 @@ func (h *Handler) DeleteSession(c *gin.Context) {
 
 	// Call service to delete session
 	if err := h.sessionService.DeleteSession(ctx, id); err != nil {
-		if err == errors.ErrSessionNotFound {
+		if stderrors.Is(err, errors.ErrSessionNotFound) {
 			logger.Warnf(ctx, "Session not found, ID: %s", id)
 			c.Error(errors.NewNotFoundError(err.Error()))
 			return
@@ -354,13 +411,14 @@ func (h *Handler) ClearSessionMessages(c *gin.Context) {
 	logger.Infof(ctx, "Clearing all messages for session: %s", id)
 
 	if err := h.messageService.ClearSessionMessages(ctx, id); err != nil {
+		if stderrors.Is(err, errors.ErrSessionNotFound) {
+			logger.Warnf(ctx, "Session not found, ID: %s", id)
+			c.Error(errors.NewNotFoundError(err.Error()))
+			return
+		}
 		logger.ErrorWithFields(ctx, err, map[string]interface{}{"session_id": id})
 		c.Error(errors.NewInternalServerError(err.Error()))
 		return
-	}
-
-	if err := h.sessionService.ClearContext(ctx, id); err != nil {
-		logger.Warnf(ctx, "Failed to clear LLM context for session %s: %v", id, err)
 	}
 
 	logger.Infof(ctx, "Session messages cleared successfully, ID: %s", id)
@@ -378,7 +436,7 @@ type batchDeleteRequest struct {
 
 // BatchDeleteSessions godoc
 // @Summary      批量删除会话
-// @Description  根据ID列表批量删除对话会话，或设置 delete_all=true 删除当前租户的所有会话
+// @Description  根据ID列表批量删除对话会话，或设置 delete_all=true 删除当前空间的所有会话
 // @Tags         会话
 // @Accept       json
 // @Produce      json
@@ -431,6 +489,11 @@ func (h *Handler) BatchDeleteSessions(c *gin.Context) {
 	}
 
 	if err := h.sessionService.BatchDeleteSessions(ctx, sanitizedIDs); err != nil {
+		if stderrors.Is(err, errors.ErrSessionNotFound) {
+			logger.Warnf(ctx, "No visible sessions found for batch delete")
+			c.Error(errors.NewNotFoundError(err.Error()))
+			return
+		}
 		logger.ErrorWithFields(ctx, err, nil)
 		c.Error(errors.NewInternalServerError(err.Error()))
 		return
@@ -439,5 +502,73 @@ func (h *Handler) BatchDeleteSessions(c *gin.Context) {
 	c.JSON(http.StatusOK, gin.H{
 		"success": true,
 		"message": "Sessions deleted successfully",
+	})
+}
+
+// PinSession godoc
+// @Summary      置顶会话
+// @Description  将指定会话置顶（用户维度）
+// @Tags         会话
+// @Produce      json
+// @Param        session_id   path      string  true  "会话ID"
+// @Success      200  {object}  map[string]interface{}  "置顶成功"
+// @Failure      404  {object}  errors.AppError         "会话不存在"
+// @Security     Bearer
+// @Security     ApiKeyAuth
+// @Router       /sessions/{session_id}/pin [post]
+func (h *Handler) PinSession(c *gin.Context) {
+	h.setSessionPinned(c, true)
+}
+
+// UnpinSession godoc
+// @Summary      取消置顶会话
+// @Description  取消指定会话的置顶
+// @Tags         会话
+// @Produce      json
+// @Param        id   path      string  true  "会话ID"
+// @Success      200  {object}  map[string]interface{}  "取消置顶成功"
+// @Failure      404  {object}  errors.AppError         "会话不存在"
+// @Security     Bearer
+// @Security     ApiKeyAuth
+// @Router       /sessions/{id}/pin [delete]
+func (h *Handler) UnpinSession(c *gin.Context) {
+	h.setSessionPinned(c, false)
+}
+
+func (h *Handler) setSessionPinned(c *gin.Context, pinned bool) {
+	ctx := c.Request.Context()
+
+	// POST and DELETE for /sessions/.../pin register under different wildcards
+	// (POST :session_id, DELETE :id — see router.go). Accept whichever is set.
+	rawID := c.Param("session_id")
+	if rawID == "" {
+		rawID = c.Param("id")
+	}
+	id := secutils.SanitizeForLog(rawID)
+	if id == "" {
+		logger.Error(ctx, "Session ID is empty")
+		c.Error(errors.NewBadRequestError(errors.ErrInvalidSessionID.Error()))
+		return
+	}
+
+	rows, err := h.sessionService.SetSessionPinned(ctx, id, pinned)
+	if err != nil {
+		logger.ErrorWithFields(ctx, err, map[string]interface{}{
+			"session_id": id,
+			"pinned":     pinned,
+		})
+		c.Error(errors.NewInternalServerError(err.Error()))
+		return
+	}
+	// Zero rows means the session doesn't exist or isn't visible to this user;
+	// tell the client rather than reporting success.
+	if rows == 0 {
+		c.Error(errors.NewNotFoundError(errors.ErrSessionNotFound.Error()))
+		return
+	}
+
+	c.JSON(http.StatusOK, gin.H{
+		"success":   true,
+		"is_pinned": pinned,
 	})
 }

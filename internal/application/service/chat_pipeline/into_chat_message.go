@@ -3,6 +3,7 @@ package chatpipeline
 import (
 	"context"
 	"fmt"
+	"html"
 	"strings"
 
 	"github.com/Tencent/WeKnora/internal/searchutil"
@@ -240,6 +241,7 @@ func buildDocumentHeader(results []*types.SearchResult) string {
 	type docMeta struct {
 		title       string
 		description string
+		metadata    string
 	}
 
 	seen := make(map[string]struct{})
@@ -265,6 +267,7 @@ func buildDocumentHeader(results []*types.SearchResult) string {
 		docs = append(docs, docMeta{
 			title:       title,
 			description: r.KnowledgeDescription,
+			metadata:    r.KnowledgeCustomMetadata,
 		})
 	}
 
@@ -276,9 +279,12 @@ func buildDocumentHeader(results []*types.SearchResult) string {
 	b.WriteString("<documents>\n")
 	for _, d := range docs {
 		b.WriteString("<document>\n")
-		b.WriteString(fmt.Sprintf("<title>%s</title>\n", d.title))
+		b.WriteString(fmt.Sprintf("<title>%s</title>\n", html.EscapeString(d.title)))
 		if d.description != "" {
-			b.WriteString(fmt.Sprintf("<description>%s</description>\n", d.description))
+			b.WriteString(fmt.Sprintf("<description>%s</description>\n", html.EscapeString(d.description)))
+		}
+		if d.metadata != "" {
+			b.WriteString(fmt.Sprintf("<metadata>%s</metadata>\n", html.EscapeString(d.metadata)))
 		}
 		b.WriteString("</document>\n")
 	}
@@ -304,5 +310,5 @@ func getEnrichedPassageForChat(ctx context.Context, result *types.SearchResult) 
 
 // enrichContentWithImageInfo delegates to the shared searchutil implementation.
 func enrichContentWithImageInfo(_ context.Context, content string, imageInfoJSON string) string {
-	return searchutil.EnrichContentWithImageInfo(content, imageInfoJSON)
+	return searchutil.EnrichContentWithImageInfoForChat(content, imageInfoJSON)
 }

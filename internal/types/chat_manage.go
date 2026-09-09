@@ -4,11 +4,10 @@ import "maps"
 
 // PipelineRequest holds immutable configuration set once at the request entry point.
 type PipelineRequest struct {
-	SessionID    string `json:"session_id"`
-	UserID       string `json:"user_id"`
-	Query        string `json:"query,omitempty"`
-	EnableMemory bool   `json:"enable_memory"`
-	MaxRounds    int    `json:"max_rounds"`
+	SessionID string `json:"session_id"`
+	UserID    string `json:"user_id"`
+	Query     string `json:"query,omitempty"`
+	MaxRounds int    `json:"max_rounds"`
 
 	// Knowledge base retrieval parameters
 	KnowledgeBaseIDs []string      `json:"knowledge_base_ids"`
@@ -30,17 +29,29 @@ type PipelineRequest struct {
 	FallbackStrategy FallbackStrategy `json:"fallback_strategy"`
 	FallbackResponse string           `json:"fallback_response"`
 	FallbackPrompt   string           `json:"fallback_prompt"`
+	// CitationEnabled controls only final knowledge/web source citations. Nil
+	// defaults to true for requests and agents created before this option existed.
+	CitationEnabled *bool `json:"citation_enabled,omitempty"`
 
 	// Rewrite parameters
 	EnableRewrite        bool   `json:"enable_rewrite"`
 	EnableQueryExpansion bool   `json:"enable_query_expansion"`
 	RewritePromptSystem  string `json:"rewrite_prompt_system"`
 	RewritePromptUser    string `json:"rewrite_prompt_user"`
+	// QueryUnderstandModelID, when set, overrides the chat model used for
+	// the query-understanding (rewrite + intent classification) stage only.
+	// Empty means fall back to ChatModelID.
+	QueryUnderstandModelID string `json:"query_understand_model_id,omitempty"`
 
 	// FAQ strategy
 	FAQPriorityEnabled       bool    `json:"-"`
 	FAQDirectAnswerThreshold float64 `json:"-"`
 	FAQScoreBoost            float64 `json:"-"`
+
+	// DataAnalysisEnabled controls whether the in-pipeline DuckDB SQL
+	// data-analysis stage runs. Off by default to avoid an extra LLM call on
+	// every RAG request that happens to retrieve CSV/Excel chunks.
+	DataAnalysisEnabled bool `json:"-"`
 
 	// Image / multimodal support
 	Images                  []string `json:"-"`
@@ -50,6 +61,10 @@ type PipelineRequest struct {
 	// File attachments support
 	Attachments MessageAttachments `json:"-"`
 
+	// IntentPromptOverrides holds agent-level intent prompt overrides for the
+	// query-understanding stage. Empty values fall back to tenant/global defaults.
+	IntentPromptOverrides map[string]string `json:"-"`
+
 	// Misc request-scoped config
 	TenantID            uint64 `json:"-"`
 	WebSearchEnabled    bool   `json:"-"`
@@ -58,6 +73,11 @@ type PipelineRequest struct {
 	WebFetchEnabled     bool   `json:"-"` // Auto-fetch full page content for web search results after rerank
 	WebFetchTopN        int    `json:"-"` // Max pages to fetch (default 3)
 	Language            string `json:"-"`
+}
+
+// CitationsEnabled returns the effective citation setting for this request.
+func (c *PipelineRequest) CitationsEnabled() bool {
+	return c == nil || c.CitationEnabled == nil || *c.CitationEnabled
 }
 
 // QueryIntent represents the classified intent of a user query.
@@ -108,6 +128,12 @@ type PipelineState struct {
 	ImageDescription     string            `json:"-"`
 	QuotedContext        string            `json:"-"` // Quoted message text, injected at LLM prompt stage
 	SystemPromptOverride string            `json:"-"`
+	// MemoryPrompt is the long-term memory envelope appended to the system
+	// prompt for this turn, empty when memory is off or nothing matched.
+	MemoryPrompt string `json:"-"`
+	// UsedMemories mirrors MemoryPrompt in structured form so the answer can
+	// tell the user which memories it saw.
+	UsedMemories UsedMemories `json:"-"`
 }
 
 // PipelineContext holds runtime context for the current pipeline execution.
@@ -152,10 +178,18 @@ func (c *ChatManage) Clone() *ChatManage {
 		if t != nil {
 			kidsCopy := make([]string, len(t.KnowledgeIDs))
 			copy(kidsCopy, t.KnowledgeIDs)
+			tagIDsCopy := make([]string, len(t.TagIDs))
+			copy(tagIDsCopy, t.TagIDs)
+			scopeTagIDsCopy := make([]string, len(t.ScopeTagIDs))
+			copy(scopeTagIDsCopy, t.ScopeTagIDs)
 			searchTargets[i] = &SearchTarget{
-				Type:            t.Type,
-				KnowledgeBaseID: t.KnowledgeBaseID,
-				KnowledgeIDs:    kidsCopy,
+				Type:                    t.Type,
+				KnowledgeBaseID:         t.KnowledgeBaseID,
+				TenantID:                t.TenantID,
+				KnowledgeIDs:            kidsCopy,
+				TagIDs:                  tagIDsCopy,
+				ScopeTagIDs:             scopeTagIDsCopy,
+				DisableRecallThresholds: t.DisableRecallThresholds,
 			}
 		}
 	}
@@ -175,7 +209,6 @@ func (c *ChatManage) Clone() *ChatManage {
 			Query:                    c.Query,
 			SessionID:                c.SessionID,
 			UserID:                   c.UserID,
-			EnableMemory:             c.EnableMemory,
 			MaxRounds:                c.MaxRounds,
 			KnowledgeBaseIDs:         knowledgeBaseIDs,
 			KnowledgeIDs:             knowledgeIDs,
@@ -192,13 +225,16 @@ func (c *ChatManage) Clone() *ChatManage {
 			FallbackStrategy:         c.FallbackStrategy,
 			FallbackResponse:         c.FallbackResponse,
 			FallbackPrompt:           c.FallbackPrompt,
+			CitationEnabled:          c.CitationEnabled,
 			EnableRewrite:            c.EnableRewrite,
 			EnableQueryExpansion:     c.EnableQueryExpansion,
 			RewritePromptSystem:      c.RewritePromptSystem,
 			RewritePromptUser:        c.RewritePromptUser,
+			QueryUnderstandModelID:   c.QueryUnderstandModelID,
 			FAQPriorityEnabled:       c.FAQPriorityEnabled,
 			FAQDirectAnswerThreshold: c.FAQDirectAnswerThreshold,
 			FAQScoreBoost:            c.FAQScoreBoost,
+			DataAnalysisEnabled:      c.DataAnalysisEnabled,
 			Images:                   append([]string(nil), c.Images...),
 			VLMModelID:               c.VLMModelID,
 			ChatModelSupportsVision:  c.ChatModelSupportsVision,
@@ -210,6 +246,7 @@ func (c *ChatManage) Clone() *ChatManage {
 			WebFetchEnabled:          c.WebFetchEnabled,
 			WebFetchTopN:             c.WebFetchTopN,
 			Language:                 c.Language,
+			IntentPromptOverrides:    maps.Clone(c.IntentPromptOverrides),
 		},
 		PipelineState: PipelineState{
 			RewriteQuery:         c.RewriteQuery,
@@ -217,6 +254,8 @@ func (c *ChatManage) Clone() *ChatManage {
 			ImageDescription:     c.ImageDescription,
 			QuotedContext:        c.QuotedContext,
 			SystemPromptOverride: c.SystemPromptOverride,
+			MemoryPrompt:         c.MemoryPrompt,
+			UsedMemories:         append(UsedMemories(nil), c.UsedMemories...),
 			RenderedContexts:     c.RenderedContexts,
 			Entity:               entity,
 			EntityKBIDs:          entityKBIDs,
@@ -230,6 +269,7 @@ type EventType string
 
 const (
 	LOAD_HISTORY           EventType = "load_history"
+	MEMORY_RECALL          EventType = "memory_recall"
 	QUERY_UNDERSTAND       EventType = "query_understand"
 	CHUNK_SEARCH           EventType = "chunk_search"
 	CHUNK_SEARCH_PARALLEL  EventType = "chunk_search_parallel"
@@ -242,8 +282,6 @@ const (
 	CHAT_COMPLETION        EventType = "chat_completion"
 	CHAT_COMPLETION_STREAM EventType = "chat_completion_stream"
 	FILTER_TOP_K           EventType = "filter_top_k"
-	MEMORY_RETRIEVAL       EventType = "memory_retrieval"
-	MEMORY_STORAGE         EventType = "memory_storage"
 )
 
 // PipelineBuilder dynamically assembles a pipeline as an ordered list of EventTypes.
@@ -288,9 +326,7 @@ var Pipeline = map[string][]EventType{
 	},
 	"chat_history_stream": {
 		LOAD_HISTORY,
-		MEMORY_RETRIEVAL,
 		CHAT_COMPLETION_STREAM,
-		MEMORY_STORAGE,
 	},
 	"rag": {
 		CHUNK_SEARCH,

@@ -1,30 +1,52 @@
 <script setup lang="ts">
 import { ref, onMounted, onUnmounted, computed, watch, nextTick, h } from "vue";
+import { storeToRefs } from 'pinia';
 import { useRoute, useRouter } from 'vue-router';
 import { onBeforeRouteUpdate } from 'vue-router';
 import { MessagePlugin } from "tdesign-vue-next";
 import { useSettingsStore } from '@/stores/settings';
 import { useUIStore } from '@/stores/ui';
 import { useMenuStore } from '@/stores/menu';
-import { listKnowledgeBases, searchKnowledge, batchQueryKnowledge } from '@/api/knowledge-base';
+import { listKnowledgeBases, searchKnowledge, batchQueryKnowledge, listKnowledgeTags } from '@/api/knowledge-base';
+import { listMCPServices, type MCPService } from '@/api/mcp-service';
 import { stopSession } from '@/api/chat';
 import { useOrganizationStore } from '@/stores/organization';
 import KnowledgeBaseSelector from './KnowledgeBaseSelector.vue';
 import MentionSelector from './MentionSelector.vue';
 import AgentSelector from './AgentSelector.vue';
 import { getCaretCoordinates } from '@/utils/caret';
-import { listModels, type ModelConfig } from '@/api/model';
-import { listAgents, type CustomAgent, BUILTIN_QUICK_ANSWER_ID, BUILTIN_SMART_REASONING_ID } from '@/api/agent';
-import { listWebSearchProviders, type WebSearchProviderEntity } from '@/api/web-search-provider';
-import { getConversationConfig, updateConversationConfig, type ConversationConfig } from '@/api/system';
+import { getRootZoom, rectToCssPx, cssViewportSize } from '@/utils/zoom';
+import { type ModelConfig } from '@/api/model';
+import {
+  formatContextWindow,
+  isDefaultContextWindow,
+  effectiveContextWindow,
+} from '@/utils/contextWindow';
+import { type CustomAgent, BUILTIN_QUICK_ANSWER_ID, BUILTIN_SMART_REASONING_ID } from '@/api/agent';
+import { useChatResourcesStore } from '@/stores/chatResources';
+import { useEditorResourcesStore } from '@/stores/editorResources';
 import { useI18n } from 'vue-i18n';
 import AttachmentUpload, { type AttachmentFile } from './AttachmentUpload.vue';
 import {
-  kbSatisfiesToolRequirements,
-  deriveKbFilterFromTools,
+  kbSatisfiesAgentRequirements,
+  deriveKbFilterForAgent,
   toolsConsumeFiles,
   type ScopeCapabilities,
 } from '@/utils/tool-capabilities';
+import {
+  isAgentWebSearchEnabled,
+  isAgentWebSearchReady,
+  isTenantWebSearchReady,
+} from '@/utils/agentWebSearch';
+import {
+  getAgentNotReadyReasonKeys,
+  resolveAgentNotReadySection,
+  resolveAgentNotReadyHighlight,
+  canLocallyConfigureAgent,
+  type AgentNotReadyReasonKey,
+} from '@/utils/agent-readiness';
+import { formatLocalizedList } from '@/utils/format-list';
+import { SKILL_ICON, type MentionItem, type MentionItemType, type MentionRequestItem } from '@/types/mention';
 
 const route = useRoute();
 const router = useRouter();
@@ -32,7 +54,16 @@ const settingsStore = useSettingsStore();
 const uiStore = useUIStore();
 const orgStore = useOrganizationStore();
 const menuStore = useMenuStore();
-const { t } = useI18n();
+const chatResources = useChatResourcesStore();
+const editorResources = useEditorResourcesStore();
+const {
+  agents,
+  disabledOwnAgentIds,
+  allModels,
+  chatModels: availableModels,
+  webSearchProviders,
+} = storeToRefs(chatResources);
+const { t, locale } = useI18n();
 
 let query = ref("");
 const showKbSelector = ref(false);
@@ -45,6 +76,41 @@ const imageUploading = ref(false);
 // Attachment upload state
 const attachmentUploadRef = ref<InstanceType<typeof AttachmentUpload>>();
 const uploadedAttachments = ref<AttachmentFile[]>([]);
+const CHAT_FILE_DROP_EVENT = 'weknora:chat-file-drop';
+
+const isImageFile = (file: File) => {
+  if (file.type.startsWith('image/')) {
+    return true;
+  }
+  const fileName = file.name.toLowerCase();
+  return ['.jpg', '.jpeg', '.png', '.gif', '.webp', '.bmp'].some(ext => fileName.endsWith(ext));
+};
+
+const handleDroppedFiles = (files: File[]) => {
+  if (!files.length) return;
+
+  const imageFiles = files.filter(isImageFile);
+  const attachmentFiles = files.filter(file => !isImageFile(file));
+
+  if (imageFiles.length > 0) {
+    if (isImageUploadEnabledByAgent.value) {
+      addImageFiles(imageFiles);
+    } else {
+      MessagePlugin.warning(t('input.imageUploadDisabledByAgent'));
+    }
+  }
+
+  if (attachmentFiles.length > 0) {
+    attachmentUploadRef.value?.addFiles(attachmentFiles);
+  }
+};
+
+const handleChatFileDrop = (event: Event) => {
+  const customEvent = event as CustomEvent<{ files?: File[] }>;
+  const files = customEvent.detail?.files;
+  if (!files || files.length === 0) return;
+  handleDroppedFiles(files);
+};
 
 const handleImageSelect = (event: Event) => {
   const input = event.target as HTMLInputElement;
@@ -87,17 +153,15 @@ const showAgentModeSelector = ref(false);
 const agentModeButtonRef = ref<HTMLElement>();
 const agentModeDropdownStyle = ref<Record<string, string>>({});
 
-// 智能体相关状态（完整列表供选中态解析；对话下拉用 enabledAgents）
-const agents = ref<CustomAgent[]>([]);
-/** 当前租户在对话下拉中停用的「我的」智能体 ID（仅影响本租户） */
-const disabledOwnAgentIds = ref<string[]>([]);
 const selectedAgentId = computed({
   get: () => settingsStore.selectedAgentId || BUILTIN_QUICK_ANSWER_ID,
   set: (val: string) => settingsStore.selectAgent(val)
 });
 const selectedAgent = computed(() => {
-  const mine = agents.value.find(a => a.id === selectedAgentId.value);
-  if (mine) return mine;
+  // When a shared-agent source tenant is set, resolve from sharedAgents FIRST.
+  // Builtin agents (e.g. builtin-smart-reasoning) use the same constant ID across
+  // tenants, so falling back to agents.value first would incorrectly return the
+  // current tenant's own builtin instead of the shared one.
   const sourceTenantId = settingsStore.selectedAgentSourceTenantId;
   if (sourceTenantId && orgStore.sharedAgents?.length) {
     const shared = orgStore.sharedAgents.find(
@@ -105,12 +169,21 @@ const selectedAgent = computed(() => {
     );
     if (shared?.agent) return shared.agent as CustomAgent;
   }
+  const mine = agents.value.find(a => a.id === selectedAgentId.value);
+  if (mine) return mine;
   return {
     id: BUILTIN_QUICK_ANSWER_ID,
     name: t('input.normalMode'),
     is_builtin: true,
     config: { agent_mode: 'quick-answer' as const }
   } as CustomAgent;
+});
+const selectedSharedAgent = computed(() => {
+  const sourceTenantId = settingsStore.selectedAgentSourceTenantId;
+  if (!sourceTenantId) return undefined;
+  return orgStore.sharedAgents?.find(
+    s => s.agent.id === selectedAgentId.value && String(s.source_tenant_id) === sourceTenantId
+  );
 });
 
 // 判断是否为自定义智能体（非内置）
@@ -122,8 +195,9 @@ const isCustomAgent = computed(() => {
 // 判断是否有智能体配置（包括内置智能体）
 const hasAgentConfig = computed(() => {
   const agent = selectedAgent.value;
-  // 内置智能体需要从 agents 列表中获取实际配置
-  if (agent?.is_builtin) {
+  // 共享智能体的 config 来自源空间，直接使用 agent.config，避免被本空间同 ID 的 builtin 覆盖
+  const sourceTenantId = settingsStore.selectedAgentSourceTenantId;
+  if (agent?.is_builtin && !sourceTenantId) {
     const builtinAgent = agents.value.find(a => a.id === agent.id);
     return !!builtinAgent?.config;
   }
@@ -133,7 +207,11 @@ const hasAgentConfig = computed(() => {
 // 获取当前智能体的实际配置（内置智能体从 agents 列表获取）
 const currentAgentConfig = computed(() => {
   const agent = selectedAgent.value;
-  if (agent?.is_builtin) {
+  // For shared agents, agent.config already carries the source tenant's settings.
+  // Re-looking it up by ID in the local agents.value would clobber it with the
+  // current tenant's own builtin config (same constant ID for builtins).
+  const sourceTenantId = settingsStore.selectedAgentSourceTenantId;
+  if (agent?.is_builtin && !sourceTenantId) {
     const builtinAgent = agents.value.find(a => a.id === agent.id);
     return builtinAgent?.config || {};
   }
@@ -155,9 +233,10 @@ const agentKBSelectionMode = computed(() => {
 // 共享智能体下的知识库列表（来自 listKnowledgeBases(agent_id)），用于已选知识库展示与 org 角标
 const sharedAgentKbList = ref<Array<{ id: string; name: string; type?: string; knowledge_count?: number; chunk_count?: number }>>([]);
 
-// 当智能体改变时，模型、网络搜索、可@知识库列表均跟随新智能体配置
+// 当智能体改变时，模型、可@知识库列表均跟随新智能体配置；网络搜索由用户主动开启
 // 知识库：用新智能体配置的列表替换当前选中，使已选与可@列表一致（含共享智能体）
 watch([selectedAgentId, agentKnowledgeBases, agentKBSelectionMode], ([newAgentId, newAgentKbs, newKbMode], [oldAgentId]) => {
+  if (settingsStore._isApplyingSessionState) return;
   if (newAgentId !== oldAgentId && oldAgentId !== undefined) {
     if (newKbMode === 'none') {
       settingsStore.selectKnowledgeBases([]);
@@ -180,8 +259,7 @@ watch([selectedAgentId, agentKnowledgeBases, agentKBSelectionMode], ([newAgentId
 watch([selectedAgentId, () => settingsStore.selectedAgentSourceTenantId], async ([agentId, sourceTenantId]) => {
   if (sourceTenantId && agentId) {
     try {
-      const res: any = await listKnowledgeBases({ agent_id: agentId });
-      const list = res?.data && Array.isArray(res.data) ? res.data : [];
+      const list = await chatResources.ensureAgentKnowledgeBases(agentId, sourceTenantId);
       sharedAgentKbList.value = list.map((kb: any) => ({
         id: kb.id,
         name: kb.name,
@@ -197,20 +275,15 @@ watch([selectedAgentId, () => settingsStore.selectedAgentSourceTenantId], async 
   }
 }, { immediate: true });
 
-// 智能体是否启用了网络搜索
-const agentWebSearchEnabled = computed(() => {
-  if (!hasAgentConfig.value) return null; // null 表示不受智能体控制
-  return currentAgentConfig.value?.web_search_enabled ?? true;
+// 智能体是否启用了网络搜索（仅显式开启才算支持）
+const isWebSearchEnabledByAgent = computed(() => {
+  if (!hasAgentConfig.value) return null;
+  return isAgentWebSearchEnabled(currentAgentConfig.value);
 });
 
-const agentWebSearchProviderId = computed(() => {
-  if (!hasAgentConfig.value) return '';
-  return currentAgentConfig.value?.web_search_provider_id || '';
-});
-
-// 网络搜索是否被智能体禁用（只读状态）- 只有明确设置为 false 时才禁用
+// 网络搜索是否被智能体禁用
 const isWebSearchDisabledByAgent = computed(() => {
-  return hasAgentConfig.value && agentWebSearchEnabled.value === false;
+  return hasAgentConfig.value && isWebSearchEnabledByAgent.value !== true;
 });
 
 // 知识库选择是否被智能体锁定
@@ -226,6 +299,12 @@ const isKnowledgeBaseLockedByAgent = computed(() => {
 const isKnowledgeBaseDisabledByAgent = computed(() => {
   if (!hasAgentConfig.value) return false;
   return agentKBSelectionMode.value === 'none';
+});
+const isMentionDisabled = computed(() => {
+  if (settingsStore.isAgentStreamMode && isKnowledgeBaseDisabledByAgent.value) {
+    return agentMCPSelectionMode.value === 'none' && agentSkillsSelectionMode.value === 'none';
+  }
+  return isKnowledgeBaseLockedByAgent.value && !settingsStore.isAgentStreamMode;
 });
 
 // 智能体配置的模型 ID
@@ -244,6 +323,71 @@ const agentSupportedFileTypes = computed(() => {
 const agentAllowedTools = computed<string[]>(() => {
   if (!hasAgentConfig.value) return [];
   return currentAgentConfig.value?.allowed_tools || [];
+});
+
+type SelectionMode = 'all' | 'selected' | 'none';
+const normalizeSelectionMode = (mode?: string): SelectionMode => {
+  return mode === 'all' || mode === 'selected' || mode === 'none' ? mode : 'none';
+};
+
+const agentMCPSelectionMode = computed<SelectionMode>(() => {
+  if (!settingsStore.isAgentStreamMode || !hasAgentConfig.value) return 'none';
+  return normalizeSelectionMode(currentAgentConfig.value?.mcp_selection_mode);
+});
+
+const agentMCPServiceIds = computed<string[]>(() => {
+  if (agentMCPSelectionMode.value !== 'selected') return [];
+  return currentAgentConfig.value?.mcp_services || [];
+});
+
+const isMCPAllowedByAgent = (service: MCPService) => {
+  if (!settingsStore.isAgentStreamMode || !service.enabled) return false;
+  const mode = agentMCPSelectionMode.value;
+  if (mode === 'none') return false;
+  if (mode === 'selected') return agentMCPServiceIds.value.includes(service.id);
+  return true;
+};
+
+const agentSkillsSelectionMode = computed<SelectionMode>(() => {
+  if (!settingsStore.isAgentStreamMode || !hasAgentConfig.value) return 'none';
+  return normalizeSelectionMode(currentAgentConfig.value?.skills_selection_mode);
+});
+
+const agentSelectedSkills = computed<string[]>(() => {
+  if (agentSkillsSelectionMode.value !== 'selected') return [];
+  return currentAgentConfig.value?.selected_skills || [];
+});
+
+const isSkillAllowedByAgent = (skillName: string) => {
+  if (!settingsStore.isAgentStreamMode || !editorResources.skillsAvailable) return false;
+  const mode = agentSkillsSelectionMode.value;
+  if (mode === 'none') return false;
+  if (mode === 'selected') return agentSelectedSkills.value.includes(skillName);
+  return true;
+};
+
+// 切换智能体时清理不允许的 MCP / Skill @mention
+watch([selectedAgentId, agentMCPSelectionMode, agentSkillsSelectionMode], ([newAgentId], [oldAgentId]) => {
+  if (settingsStore._isApplyingSessionState) return;
+  if (newAgentId === oldAgentId || oldAgentId === undefined) return;
+
+  const mcpMode = agentMCPSelectionMode.value;
+  if (mcpMode === 'none') {
+    settingsStore.settings.selectedMCPServices = [];
+  } else if (mcpMode === 'selected') {
+    const allowed = new Set(agentMCPServiceIds.value);
+    settingsStore.settings.selectedMCPServices = (settingsStore.settings.selectedMCPServices || [])
+      .filter(id => allowed.has(id));
+  }
+
+  const skillsMode = agentSkillsSelectionMode.value;
+  if (skillsMode === 'none') {
+    settingsStore.settings.selectedSkills = [];
+  } else if (skillsMode === 'selected') {
+    const allowed = new Set(agentSelectedSkills.value);
+    settingsStore.settings.selectedSkills = (settingsStore.settings.selectedSkills || [])
+      .filter(name => allowed.has(name));
+  }
 });
 
 // 从 KB 对象里抽能力位，优先用 backend 显式的 capabilities 字段；否则回退到 indexing_strategy，
@@ -268,12 +412,19 @@ const kbToScopeCaps = (kb: any): Partial<ScopeCapabilities> => {
   };
 };
 
+// 当前智能体的 agent_mode（quick-answer / smart-reasoning），用于把
+// "RAG-only 模式不能 @ wiki-only 知识库"这种隐式约束带进 KB 过滤。
+const agentMode = computed(() => {
+  if (!hasAgentConfig.value) return '';
+  return currentAgentConfig.value?.agent_mode || '';
+});
+
 // "all" 模式 + 智能体工具有 KB 依赖时的兼容性过滤；'selected'/'none' 不在这里二次过滤
 // （selected 由编辑器负责，none 已经空表）。
 const isKbCompatibleWithAgent = (kb: any): boolean => {
   if (!hasAgentConfig.value) return true;
   if (agentKBSelectionMode.value !== 'all') return true;
-  return kbSatisfiesToolRequirements(kbToScopeCaps(kb), agentAllowedTools.value);
+  return kbSatisfiesAgentRequirements(kbToScopeCaps(kb), agentMode.value, agentAllowedTools.value);
 };
 
 // 仅在用户没输入搜索词、且是因智能体工具兼容性把列表清空的场景展示专用空态文案
@@ -283,7 +434,7 @@ const mentionEmptyHint = computed(() => {
   if (agentKBSelectionMode.value !== 'all') return '';
   // 列表为空 && 兼容性过滤器其实是有效的（否则"全部"不会被剔空）
   if (mentionItems.value.length !== 0) return '';
-  const filter = deriveKbFilterFromTools(agentAllowedTools.value);
+  const filter = deriveKbFilterForAgent(agentMode.value, agentAllowedTools.value);
   if (!filter) return '';
   return t('mentionDetail.noCompatibleKbForAgent');
 });
@@ -294,6 +445,22 @@ const isImageUploadEnabledByAgent = computed(() => {
   return currentAgentConfig.value?.image_upload_enabled === true;
 });
 
+// Input 工具栏：仅当智能体已启用且搜索引擎可用时才显示
+const showWebSearchButton = computed(() => {
+  if (hasAgentConfig.value && settingsStore.selectedAgentSourceTenantId && !isWebSearchReadinessKnown.value) {
+    return false;
+  }
+  if (!hasAgentConfig.value) {
+    return isTenantWebSearchReady(webSearchProviders.value);
+  }
+  return isAgentWebSearchReady(
+    currentAgentConfig.value,
+    webSearchProviders.value,
+    selectedSharedAgent.value?.web_search_ready,
+  );
+});
+const showImageUploadButton = computed(() => isImageUploadEnabledByAgent.value);
+
 // 模型选择是否被智能体锁定 - 已移除锁定逻辑，允许用户自由切换模型
 const isModelLockedByAgent = computed(() => {
   return false;
@@ -302,16 +469,19 @@ const isModelLockedByAgent = computed(() => {
 // Mention related state
 const showMention = ref(false);
 const mentionQuery = ref("");
-const mentionItems = ref<Array<{ id: string; name: string; type: 'kb' | 'file'; kbType?: 'document' | 'faq'; count?: number; kbName?: string; orgName?: string; kbId?: string }>>([]);
+const mentionItems = ref<MentionItem[]>([]);
 /** 文件 ID -> 知识库 ID（用于批量查询时传 kb_id，支持共享知识库下的文档） */
 const fileIdToKbId = ref<Record<string, string>>({});
+const mcpServices = ref<MCPService[]>([]);
 const mentionActiveIndex = ref(0);
 const mentionStyle = ref<Record<string, string>>({});
 const textareaRef = ref<any>(null); // Ref to t-textarea component
+const mentionSelectorRef = ref<any>(null);
 const mentionStartPos = ref(0);
 const isComposing = ref(false);
 const isMentionTriggeredByButton = ref(false);
 const mentionHasMore = ref(false);
+const mentionGroupCounts = ref<Partial<Record<MentionItemType, number>>>({});
 // 当前 @ 会话可见的 KB ID 集合（含工具兼容性过滤），分页加载文件时复用，
 // 避免 append 请求把不兼容 KB 的文件漏进来。`null` 表示"不受限制"（非智能体场景）
 const mentionAllowedKbIds = ref<Set<string> | null>(null);
@@ -353,9 +523,12 @@ const isAgentEnabled = computed(() => settingsStore.isAgentEnabled);
 const isWebSearchEnabled = computed(() => settingsStore.isWebSearchEnabled);
 const selectedKbIds = computed(() => settingsStore.settings.selectedKnowledgeBases || []);
 const selectedFileIds = computed(() => settingsStore.settings.selectedFiles || []);
+const selectedTags = computed(() => settingsStore.settings.selectedTags || []);
+const selectedMCPServiceIds = computed(() => settingsStore.settings.selectedMCPServices || []);
+const selectedSkillNames = computed(() => settingsStore.settings.selectedSkills || []);
 
-// 获取已选择的知识库信息
-const knowledgeBases = ref<Array<{ id: string; name: string; type?: 'document' | 'faq'; knowledge_count?: number; chunk_count?: number }>>([]);
+// 已就绪的知识库（来自空间级缓存）
+const knowledgeBases = computed(() => chatResources.validKnowledgeBases);
 const fileList = ref<Array<{ id: string; name: string }>>([]);
 
 // 选中的知识库：包含自己的 + 组织共享的 + 共享智能体下的（用于展示已选列表与 org 角标）
@@ -397,67 +570,126 @@ const selectedFiles = computed(() => {
   });
 });
 
-  // 合并所有选中项（用于输入框内显示）
-  // 现在智能体配置的知识库也在 store 中，统一从 selectedKbs 获取
-  const allSelectedItems = computed(() => {
-    // 获取智能体预配置的知识库 IDs（用于标记和排序）
-    const agentKbIds = agentKnowledgeBases.value;
-    
-    // 所有选中的知识库，标记是否为智能体配置
-    const allKbs = selectedKbs.value.map(kb => ({ 
-      ...kb, 
-      type: 'kb' as const,
-      kbType: kb.type,
-      isAgentConfigured: agentKbIds.includes(kb.id)
-    }));
-    
-    // 用户选择的文件（根据 fileIdToKbId + 共享列表/共享智能体补全 org_name，用于角标）
-    const sharedKbOrgMap: Record<string, string> = {};
-    (orgStore.sharedKnowledgeBases || []).forEach((s: any) => {
-      if (s.knowledge_base?.id != null && s.org_name) {
-        sharedKbOrgMap[String(s.knowledge_base.id)] = s.org_name;
-      }
-    });
-    if (sharedAgentOrgName.value) {
-      (sharedAgentKbList.value || []).forEach((kb) => {
-        sharedKbOrgMap[String(kb.id)] = sharedAgentOrgName.value;
-      });
+const skillMentionItems = computed<MentionItem[]>(() => {
+  return selectedSkillNames.value
+    .filter((name: string) => isSkillAllowedByAgent(name))
+    .map((name: string) => {
+    const skill = editorResources.skills.find(s => s.name === name);
+    return {
+      id: name,
+      name: skill?.name || name,
+      type: 'skill' as const,
+      skillName: name,
+      description: skill?.description || '',
+    };
+  });
+});
+
+const toMCPMentionItem = (svc: MCPService): MentionItem => ({
+  id: svc.id,
+  name: svc.name,
+  type: 'mcp',
+  description: svc.description || '',
+  toolCount: svc.catalog?.tool_count,
+  catalogStale: Boolean(svc.catalog?.stale),
+  catalogSynced: Boolean(svc.catalog),
+});
+
+const selectedMCPItems = computed<MentionItem[]>(() => {
+  return selectedMCPServiceIds.value
+    .map((id: string) => mcpServices.value.find(service => service.id === id))
+    .filter((svc): svc is MCPService => !!svc && isMCPAllowedByAgent(svc))
+    .map(toMCPMentionItem);
+});
+
+// 合并所有选中项（用于输入框内显示）
+// 现在智能体配置的知识库也在 store 中，统一从 selectedKbs 获取
+const allSelectedItems = computed(() => {
+  // 获取智能体预配置的知识库 IDs（用于标记和排序）
+  const agentKbIds = agentKnowledgeBases.value;
+
+  // 所有选中的知识库，标记是否为智能体配置
+  const allKbs = selectedKbs.value.map(kb => ({
+    ...kb,
+    type: 'kb' as const,
+    kbType: kb.type,
+    isAgentConfigured: agentKbIds.includes(kb.id)
+  }));
+
+  // 用户选择的文件（根据 fileIdToKbId + 共享列表/共享智能体补全 org_name，用于角标）
+  const sharedKbOrgMap: Record<string, string> = {};
+  (orgStore.sharedKnowledgeBases || []).forEach((s: any) => {
+    if (s.knowledge_base?.id != null && s.org_name) {
+      sharedKbOrgMap[String(s.knowledge_base.id)] = s.org_name;
     }
-    const files = selectedFiles.value.map((f: { id: string; name: string }) => {
-      const kbId = fileIdToKbId.value[f.id];
-      const org_name = kbId ? sharedKbOrgMap[String(kbId)] || '' : '';
-      return {
-        ...f,
-        type: 'file' as const,
-        isAgentConfigured: false,
-        org_name
-      };
+  });
+  if (sharedAgentOrgName.value) {
+    (sharedAgentKbList.value || []).forEach((kb) => {
+      sharedKbOrgMap[String(kb.id)] = sharedAgentOrgName.value;
     });
-    
-    // 智能体配置的放在前面
-    const agentConfiguredKbs = allKbs.filter(kb => kb.isAgentConfigured);
-    const userSelectedKbs = allKbs.filter(kb => !kb.isAgentConfigured);
-    
-    return [...agentConfiguredKbs, ...userSelectedKbs, ...files];
+  }
+  const files = selectedFiles.value.map((f: { id: string; name: string }) => {
+    const kbId = fileIdToKbId.value[f.id];
+    const org_name = kbId ? sharedKbOrgMap[String(kbId)] || '' : '';
+    return {
+      ...f,
+      type: 'file' as const,
+      isAgentConfigured: false,
+      org_name
+    };
   });
 
+  // 智能体配置的放在前面
+  const agentConfiguredKbs = allKbs.filter(kb => kb.isAgentConfigured);
+  const userSelectedKbs = allKbs.filter(kb => !kb.isAgentConfigured);
+  const tags = selectedTags.value.map((tag: any) => ({
+    id: tag.id,
+    name: tag.name,
+    type: 'tag' as const,
+    kbId: tag.kbId,
+    kbName: tag.kbName,
+    description: tag.kbName || '',
+    isAgentConfigured: false,
+  }));
+
+  return [...agentConfiguredKbs, ...userSelectedKbs, ...files, ...tags, ...selectedMCPItems.value, ...skillMentionItems.value];
+});
+
 // 移除选中项（智能体配置的项也可以移除）
-const removeSelectedItem = (item: { id: string; type: 'kb' | 'file'; isAgentConfigured?: boolean }) => {
+const removeSelectedItem = (item: MentionItem) => {
   if (item.type === 'kb') {
     settingsStore.removeKnowledgeBase(item.id);
-  } else {
+  } else if (item.type === 'file') {
     settingsStore.removeFile(item.id);
+  } else if (item.type === 'tag') {
+    settingsStore.removeTag(item.id, item.kbId);
+  } else if (item.type === 'mcp') {
+    settingsStore.removeMCPService(item.id);
+  } else if (item.type === 'skill') {
+    settingsStore.removeSkill(item.skillName || item.id);
   }
 };
 
-// 模型相关状态
-const availableModels = ref<ModelConfig[]>([]);
+const getMentionIcon = (item: MentionItem) => {
+  switch (item.type) {
+    case 'file': return 'file';
+    case 'tag': return 'tag';
+    case 'mcp': return 'tools';
+    case 'skill': return SKILL_ICON;
+    default: return 'folder';
+  }
+};
+
+const getMentionChipClass = (item: MentionItem) => {
+  if (item.type === 'kb') return item.kbType === 'faq' ? 'mention-chip--faq' : 'mention-chip--kb';
+  return `mention-chip--${item.type}`;
+};
+
 // 使用 computed 从 store 读取，并通过 setter 同步回 store
 const selectedModelId = computed({
   get: () => settingsStore.conversationModels.selectedChatModelId || '',
   set: (val: string) => settingsStore.updateConversationModels({ selectedChatModelId: val })
 });
-const conversationConfig = ref<ConversationConfig | null>(null);
 const modelsLoading = ref(false);
 const showModelSelector = ref(false);
 const modelButtonRef = ref<HTMLElement>();
@@ -477,10 +709,10 @@ const inputPlaceholder = computed(() => {
     }
     return t('input.placeholderAgent', { name: selectedAgent.value.name });
   }
-  
+
   const hasKnowledge = allSelectedItems.value.length > 0;
   const hasWebSearch = isWebSearchEnabled.value && isWebSearchConfigured.value;
-  
+
   if (hasKnowledge && hasWebSearch) {
     // 有知识库 + 有网络搜索
     return t('input.placeholderKbAndWeb');
@@ -497,47 +729,33 @@ const inputPlaceholder = computed(() => {
 });
 
 // 加载知识库列表（自己的 + 共享的，用于 @ 提及等）
-const loadKnowledgeBases = async () => {
+const loadKnowledgeBases = async (force = false) => {
   try {
-    const response: any = await listKnowledgeBases();
-    if (response.data && Array.isArray(response.data)) {
-      const validKbs = response.data.filter((kb: any) => {
-        if (!kb.summary_model_id || kb.summary_model_id === '') return false
-        const strategy = kb.indexing_strategy
-        const needsEmbedding = !strategy || strategy.vector_enabled || strategy.keyword_enabled
-        if (needsEmbedding && (!kb.embedding_model_id || kb.embedding_model_id === '')) return false
-        return true
-      });
-      knowledgeBases.value = validKbs;
+    await chatResources.ensureKnowledgeBases(force);
+    const validKbs = knowledgeBases.value;
 
-      // 拉取共享知识库（供 @ 提及与清理选中项时识别）
-      await orgStore.fetchSharedKnowledgeBases().catch(() => {});
-
-      // 清理无效的知识库ID：只移除既不在自己列表、也不在组织共享、也不在共享智能体知识库中的 ID（刷新后保留共享智能体下已选知识库）
-      const validKbIds = new Set(validKbs.map((kb: any) => kb.id));
-      const sharedKbIds = new Set(
-        (orgStore.sharedKnowledgeBases || []).map((s: any) => s.knowledge_base?.id).filter(Boolean)
-      );
-      let sharedAgentKbIdSet = new Set<string>();
-      const sourceTenantId = settingsStore.selectedAgentSourceTenantId;
-      const agentId = settingsStore.selectedAgentId;
-      if (sourceTenantId && agentId) {
-        try {
-          const res: any = await listKnowledgeBases({ agent_id: agentId });
-          const list = res?.data && Array.isArray(res.data) ? res.data : [];
-          list.forEach((kb: any) => kb?.id && sharedAgentKbIdSet.add(kb.id));
-        } catch {
-          sharedAgentKbIdSet = new Set();
-        }
+    const validKbIds = new Set(validKbs.map((kb: any) => kb.id));
+    const sharedKbIds = new Set(
+      (orgStore.sharedKnowledgeBases || []).map((s: any) => s.knowledge_base?.id).filter(Boolean)
+    );
+    let sharedAgentKbIdSet = new Set<string>();
+    const sourceTenantId = settingsStore.selectedAgentSourceTenantId;
+    const agentId = settingsStore.selectedAgentId;
+    if (sourceTenantId && agentId) {
+      try {
+        const list = await chatResources.ensureAgentKnowledgeBases(agentId, sourceTenantId, force);
+        list.forEach((kb: any) => kb?.id && sharedAgentKbIdSet.add(kb.id));
+      } catch {
+        sharedAgentKbIdSet = new Set();
       }
-      const currentSelectedIds = settingsStore.settings.selectedKnowledgeBases || [];
-      const validSelectedIds = currentSelectedIds.filter(
-        (id: string) => validKbIds.has(id) || sharedKbIds.has(id) || sharedAgentKbIdSet.has(id)
-      );
+    }
+    const currentSelectedIds = settingsStore.settings.selectedKnowledgeBases || [];
+    const validSelectedIds = currentSelectedIds.filter(
+      (id: string) => validKbIds.has(id) || sharedKbIds.has(id) || sharedAgentKbIdSet.has(id)
+    );
 
-      if (validSelectedIds.length !== currentSelectedIds.length) {
-        settingsStore.selectKnowledgeBases(validSelectedIds);
-      }
+    if (validSelectedIds.length !== currentSelectedIds.length) {
+      settingsStore.selectKnowledgeBases(validSelectedIds);
     }
   } catch (error) {
     console.error('Failed to load knowledge bases:', error);
@@ -570,7 +788,8 @@ const loadFiles = async () => {
     const runBatch = async (batchIds: string[], kbId?: string, agentId?: string) => {
       const query = new URLSearchParams();
       batchIds.forEach((id: string) => query.append('ids', id));
-      const res: any = await batchQueryKnowledge(query.toString(), kbId, agentId);
+      const sourceTenantId = agentId ? settingsStore.selectedAgentSourceTenantId ?? undefined : undefined;
+      const res: any = await batchQueryKnowledge(query.toString(), kbId, agentId, sourceTenantId);
       if (res.data && Array.isArray(res.data)) {
         res.data.forEach((f: any) => allNewFiles.push({ id: f.id, name: f.title || f.file_name }));
       }
@@ -590,91 +809,154 @@ const loadFiles = async () => {
   }
 };
 
+const loadMCPServices = async () => {
+  try {
+    mcpServices.value = await listMCPServices();
+  } catch (error) {
+    console.error('Failed to load MCP services:', error);
+    mcpServices.value = [];
+  }
+};
+
 watch(selectedFileIds, () => {
   loadFiles();
 }, { immediate: true });
 
-const webSearchProviders = ref<WebSearchProviderEntity[]>([]);
-
 const isWebSearchConfigured = computed(() => {
-  const agentProviderId = agentWebSearchProviderId.value;
-  if (agentProviderId) {
-    return webSearchProviders.value.some(p => p.id === agentProviderId);
+  if (hasAgentConfig.value) {
+    return isAgentWebSearchReady(
+      currentAgentConfig.value,
+      webSearchProviders.value,
+      selectedSharedAgent.value?.web_search_ready,
+    );
   }
-
-  return webSearchProviders.value.some(p => p.is_default);
+  return isTenantWebSearchReady(webSearchProviders.value);
 });
+const isWebSearchReadinessKnown = computed(
+  () => !settingsStore.selectedAgentSourceTenantId || selectedSharedAgent.value !== undefined
+);
 
-const loadWebSearchConfig = async () => {
+const loadWebSearchConfig = async (force = false) => {
   try {
-    const response = await listWebSearchProviders();
-    const providers = (response as any)?.data;
-    webSearchProviders.value = Array.isArray(providers) ? providers : [];
+    await chatResources.ensureWebSearchProviders(force);
 
-    if (!isWebSearchConfigured.value && settingsStore.isWebSearchEnabled) {
+    if (isWebSearchReadinessKnown.value && !isWebSearchConfigured.value && settingsStore.isWebSearchEnabled) {
       settingsStore.toggleWebSearch(false);
     }
   } catch (error) {
     console.error('Failed to load web search config:', error);
-    webSearchProviders.value = [];
-    if (settingsStore.isWebSearchEnabled) {
+    chatResources.invalidate('webSearchProviders');
+    if (!settingsStore.selectedAgentSourceTenantId && settingsStore.isWebSearchEnabled) {
       settingsStore.toggleWebSearch(false);
     }
   }
 };
 
 // 加载智能体列表（我的 + 共享，供选中态与就绪检查用）
-const loadAgents = async () => {
+const loadAgents = async (force = false) => {
   try {
-    const [agentsRes] = await Promise.all([
-      listAgents(),
-      orgStore.fetchSharedAgents(),
-    ]);
-    const res = agentsRes as { data?: CustomAgent[]; disabled_own_agent_ids?: string[] }
-    agents.value = res.data || []
-    disabledOwnAgentIds.value = res.disabled_own_agent_ids || []
+    await chatResources.ensureAgents(force);
+    ensureSelectedAgentNotDisabled();
   } catch (error) {
-    console.error('Failed to load agents:', error)
+    console.error('Failed to load agents:', error);
+  }
+};
+
+// 默认选中的 builtin（builtin-quick-answer）也可能被当前空间管理员停用。
+// 列表加载完后做一次纠偏：若当前选中的是本空间停用的 agent（仅限「我的/builtin」，
+// 共享智能体由源空间决定，本地停用列表不适用），按 智能推理 → 快速问答 →
+// 第一个可用 的顺序兜底切换。全部都被停用时保持原选择不动（极端场景，UI 仍会
+// 在 enabledAgents 过滤后显示空，由用户在智能体页恢复任意一个）。
+const ensureSelectedAgentNotDisabled = () => {
+  if (settingsStore.selectedAgentSourceTenantId) return
+  const currentId = settingsStore.selectedAgentId || BUILTIN_QUICK_ANSWER_ID
+  if (!disabledOwnAgentIds.value.includes(currentId)) return
+
+  const isEnabled = (id: string) =>
+    agents.value.some(a => a.id === id) && !disabledOwnAgentIds.value.includes(id)
+
+  let fallback: CustomAgent | undefined
+  if (isEnabled(BUILTIN_SMART_REASONING_ID)) {
+    fallback = agents.value.find(a => a.id === BUILTIN_SMART_REASONING_ID)
+  } else if (isEnabled(BUILTIN_QUICK_ANSWER_ID)) {
+    fallback = agents.value.find(a => a.id === BUILTIN_QUICK_ANSWER_ID)
+  } else {
+    fallback = agents.value.find(a => !disabledOwnAgentIds.value.includes(a.id))
+  }
+  if (!fallback) return
+
+  settingsStore.selectAgent(fallback.id)
+  // selectAgent 内部仅对两个 builtin 常量自动切 isAgentEnabled；自定义 agent 兜底时
+  // 需要按其 agent_mode 显式同步一次，保证模式徽标与对话行为一致。
+  if (fallback.id !== BUILTIN_QUICK_ANSWER_ID && fallback.id !== BUILTIN_SMART_REASONING_ID) {
+    settingsStore.toggleAgent(fallback.config?.agent_mode === 'smart-reasoning')
   }
 }
 
-// 对话下拉中展示的「我的」智能体（排除当前租户已停用的）
+// 对话下拉中展示的「我的」智能体（排除当前空间已停用的）
 const enabledAgents = computed(() =>
   agents.value.filter(a => !disabledOwnAgentIds.value.includes(a.id))
 );
 
-const loadConversationConfig = async () => {
+// LAST_CHAT_MODEL_KEY scopes the per-user "last selected chat model"
+// to localStorage. The previous implementation wrote this back to the
+// tenant-level KV /tenants/kv/conversation-config — which (a) required
+// Admin+ to mutate, so a Viewer/Contributor switching models in the
+// chat input got a 403, and (b) silently overwrote the tenant default
+// for everyone else. localStorage is per-user-per-browser, which is
+// what "remember my last pick" actually wants.
+const LAST_CHAT_MODEL_KEY = 'weknora_last_chat_model_id'
+
+const readLastChatModelID = (): string => {
   try {
-    const response = await getConversationConfig();
-    conversationConfig.value = response.data;
-    const modelId = response.data?.summary_model_id || '';
-    
-    // 保留当前已选择的模型（如果有），避免覆盖从其他页面传递的模型选择
-    const currentSelectedModel = settingsStore.conversationModels.selectedChatModelId;
-    settingsStore.updateConversationModels({
-      summaryModelId: modelId,
-      selectedChatModelId: currentSelectedModel || modelId,  // 优先保留当前选择
-      rerankModelId: response.data?.rerank_model_id || '',
-    });
-    if (!selectedModelId.value) {
-      selectedModelId.value = modelId;
-    }
-    ensureModelSelection();
-  } catch (error) {
-    console.error('Failed to load conversation config:', error);
+    return localStorage.getItem(LAST_CHAT_MODEL_KEY) || ''
+  } catch {
+    return ''
   }
+}
+
+const writeLastChatModelID = (id: string) => {
+  try {
+    if (id) {
+      localStorage.setItem(LAST_CHAT_MODEL_KEY, id)
+    } else {
+      localStorage.removeItem(LAST_CHAT_MODEL_KEY)
+    }
+  } catch {
+    // localStorage may be disabled in incognito mode; ignore.
+  }
+}
+
+// Initial chat-model selection priority: per-user last pick
+// (localStorage) > current store value (e.g. carried over from
+// settings page) > first available model. The tenant-level
+// conversation-config used to feed summary_model_id/rerank_model_id
+// into the dropdown, but those fields were removed: per-user last pick
+// belongs in localStorage, agent-level model belongs on the agent.
+const initChatModelSelection = () => {
+  const lastPick = readLastChatModelID();
+  const currentSelectedModel = settingsStore.conversationModels.selectedChatModelId;
+  const initialSelection = lastPick || currentSelectedModel || '';
+  settingsStore.updateConversationModels({
+    summaryModelId: initialSelection,
+    selectedChatModelId: initialSelection,
+    rerankModelId: '',
+  });
+  if (!selectedModelId.value) {
+    selectedModelId.value = initialSelection;
+  }
+  ensureModelSelection();
 };
 
-const loadChatModels = async () => {
+const loadChatModels = async (force = false) => {
   if (modelsLoading.value) return;
   modelsLoading.value = true;
   try {
-    const models = await listModels('KnowledgeQA');
-    availableModels.value = Array.isArray(models) ? models : [];
+    await chatResources.ensureChatModels(force);
     ensureModelSelection();
   } catch (error) {
     console.error('Failed to load chat models:', error);
-    availableModels.value = [];
+    chatResources.invalidate('models');
   } finally {
     modelsLoading.value = false;
   }
@@ -684,14 +966,45 @@ const ensureModelSelection = () => {
   if (selectedModelId.value) {
     return;
   }
-  if (conversationConfig.value?.summary_model_id) {
-    selectedModelId.value = conversationConfig.value.summary_model_id;
+  const lastPick = readLastChatModelID();
+  if (lastPick) {
+    selectedModelId.value = lastPick;
     return;
   }
   if (availableModels.value.length > 0) {
     selectedModelId.value = availableModels.value[0].id || '';
   }
 };
+
+// 智能体身份或其数据到位时，把对话模型同步到智能体配置的 model_id。
+// 修复场景：导航离开再返回时，initChatModelSelection 会用 localStorage 的 lastPick
+// 覆盖共享智能体绑定的源空间 model_id，UI 显示「未配置」——此时需要拉回 agent 模型。
+// 但若用户在本页手动改过模型（lastPick 与 agent 默认不同且当前选中即为 lastPick），
+// 则保留用户选择，避免 creatChat → chat 跳转后把模型 B 冲回智能体默认 A。
+watch(
+  [selectedAgentId, () => settingsStore.selectedAgentSourceTenantId, agentModelId],
+  ([, sourceTenantId, newModelId]) => {
+    if (!newModelId || newModelId.trim() === '') return;
+
+    const lastPick = readLastChatModelID();
+    const isSharedAgent = !!sourceTenantId;
+    const agentModelInList = availableModels.value.some(m => m.id === newModelId);
+
+    if (
+      lastPick &&
+      selectedModelId.value === lastPick &&
+      lastPick !== newModelId &&
+      (!isSharedAgent || agentModelInList)
+    ) {
+      return;
+    }
+
+    if (newModelId !== selectedModelId.value) {
+      selectedModelId.value = newModelId;
+    }
+  },
+  { immediate: true }
+);
 
 const handleGoToConversationModels = () => {
   showModelSelector.value = false;
@@ -704,7 +1017,7 @@ const handleGoToConversationModels = () => {
   }, 100);
 };
 
-const handleModelChange = async (value: string | number | Array<string | number> | undefined) => {
+const handleModelChange = (value: string | number | Array<string | number> | undefined) => {
   const normalized = Array.isArray(value) ? value[0] : value;
   const val = normalized !== undefined && normalized !== null ? String(normalized) : '';
 
@@ -713,54 +1026,65 @@ const handleModelChange = async (value: string | number | Array<string | number>
     return;
   }
   if (val === '__add_model__') {
-    selectedModelId.value = conversationConfig.value?.summary_model_id || '';
+    selectedModelId.value = readLastChatModelID();
     handleGoToConversationModels();
     return;
   }
-  
-  // 保存到后端
-  try {
-    if (conversationConfig.value) {
-      const updatedConfig = {
-        ...conversationConfig.value,
-        summary_model_id: val
-      };
-      const response = await updateConversationConfig(updatedConfig);
-      
-      // 更新本地状态
-      conversationConfig.value = response.data;
-      selectedModelId.value = val;
-      showModelSelector.value = false;
-      
-      // 同步到 store
-      settingsStore.updateConversationModels({
-        summaryModelId: val,
-        selectedChatModelId: val,
-        rerankModelId: conversationConfig.value?.rerank_model_id || '',
-      });
-      
-      MessagePlugin.success(t('conversationSettings.toasts.chatModelSaved'));
-    }
-  } catch (error) {
-    console.error('保存模型配置失败:', error);
-    MessagePlugin.error(t('conversationSettings.toasts.saveFailed'));
-    // 恢复到之前的值
-    selectedModelId.value = conversationConfig.value?.summary_model_id || '';
-  }
+
+  // The chat-level model picker now persists per-user-per-browser via
+  // localStorage instead of writing to the tenant-shared KV. This is what
+  // "remember my last pick" should always have meant — the previous PUT
+  // /tenants/kv/conversation-config required Admin+, so a Viewer or
+  // Contributor switching models from the chat input got a 403.
+  writeLastChatModelID(val);
+  selectedModelId.value = val;
+  showModelSelector.value = false;
+
+  settingsStore.updateConversationModels({
+    summaryModelId: val,
+    selectedChatModelId: val,
+    rerankModelId: '',
+  });
 };
 
 const selectedModel = computed(() => {
   return availableModels.value.find(model => model.id === selectedModelId.value);
 });
 
-// 模型展示名：本租户列表中有则用名称；若为共享智能体且其 model_id 不在本租户列表中则显示“共享智能体配置的模型”
+// 模型展示名：本空间列表中有则用名称；若为共享智能体且其 model_id 不在本空间列表中则显示“共享智能体配置的模型”
 const selectedModelDisplayName = computed(() => {
-  if (selectedModel.value) return selectedModel.value.name;
+  if (selectedModel.value) return modelDisplayName(selectedModel.value);
   if (!selectedModelId.value) return t('input.notConfigured');
   const isSharedAgent = !!settingsStore.selectedAgentSourceTenantId;
   const modelFromAgent = agentModelId.value && agentModelId.value === selectedModelId.value;
   if (isSharedAgent && modelFromAgent) return t('input.sharedAgentModelLabel');
   return t('input.notConfigured');
+});
+
+const modelDisplayName = (model: ModelConfig) => {
+  const displayName = model.display_name?.trim();
+  return displayName || model.name;
+};
+
+const contextWindowTitle = (tokens?: number) => {
+  if (isDefaultContextWindow(tokens)) {
+    return t('model.editor.contextWindowDefaultHint', { value: formatContextWindow(tokens) });
+  }
+  return t('model.editor.contextWindowTokens', { count: effectiveContextWindow(tokens) });
+};
+
+const selectedModelContextLabel = computed(() => {
+  if (!selectedModel.value) return '';
+  return formatContextWindow(selectedModel.value.parameters?.context_window);
+});
+
+const selectedModelContextIsDefault = computed(() => {
+  return isDefaultContextWindow(selectedModel.value?.parameters?.context_window);
+});
+
+const selectedModelContextTitle = computed(() => {
+  if (!selectedModel.value) return '';
+  return contextWindowTitle(selectedModel.value.parameters?.context_window);
 });
 
 const updateModelDropdownPosition = () => {
@@ -774,9 +1098,11 @@ const updateModelDropdownPosition = () => {
     };
     return;
   }
-  
-  // 获取按钮相对于视口的位置
-  const rect = anchor.getBoundingClientRect();
+
+  // Normalize coordinates to CSS pixels so they are interpreted the same way
+  // the browser will render them under the root `zoom` (see utils/zoom.ts).
+  const zoom = getRootZoom();
+  const rect = rectToCssPx(anchor.getBoundingClientRect(), zoom);
   console.log('[Model Dropdown] Button rect:', {
     top: rect.top,
     bottom: rect.bottom,
@@ -785,16 +1111,15 @@ const updateModelDropdownPosition = () => {
     width: rect.width,
     height: rect.height
   });
-  
+
   const dropdownWidth = 280;
   const offsetY = 8;
-  const vw = window.innerWidth;
-  const vh = window.innerHeight;
-  
+  const { width: vw, height: vh } = cssViewportSize(zoom);
+
   // 左对齐到触发元素的左边缘
   // 使用 Math.floor 而不是 Math.round，避免像素对齐问题
   let left = Math.floor(rect.left);
-  
+
   // 边界处理：不超出视口左右（留 16px margin）
   const minLeft = 16;
   const maxLeft = Math.max(16, vw - dropdownWidth - 16);
@@ -807,16 +1132,16 @@ const updateModelDropdownPosition = () => {
   const topMargin = 20; // 顶部留白
   const spaceBelow = vh - rect.bottom; // 下方剩余空间
   const spaceAbove = rect.top; // 上方剩余空间
-  
+
   console.log('[Model Dropdown] Space check:', {
     spaceBelow,
     spaceAbove,
     windowHeight: vh
   });
-  
+
   let actualHeight: number;
   let shouldOpenBelow: boolean;
-  
+
   // 优先考虑下方空间
   if (spaceBelow >= minDropdownHeight + offsetY) {
     // 下方有足够空间，向下弹出
@@ -836,7 +1161,7 @@ const updateModelDropdownPosition = () => {
     shouldOpenBelow = false;
     console.log('[Model Dropdown] Position: above button', { actualHeight });
   }
-  
+
   // 根据弹出方向使用不同的定位方式
   if (shouldOpenBelow) {
     // 向下弹出：使用 top 定位，左对齐
@@ -867,7 +1192,7 @@ const updateModelDropdownPosition = () => {
       padding: '0 !important'
     };
   }
-  
+
   console.log('[Model Dropdown] Applied style:', modelDropdownStyle.value);
 };
 
@@ -875,22 +1200,24 @@ const updateModelDropdownPosition = () => {
 let lastMentionQuery = '';
 const loadMentionItems = async (q: string, resetIndex = true, append = false) => {
   console.log('[Mention] loadMentionItems called with query:', q, 'append:', append);
-  
+
   if (!append) {
     mentionOffset.value = 0;
   }
-  
-  // 根据智能体的 kb_selection_mode 过滤知识库；选中共享智能体时使用该租户下的知识库，否则使用本租户 + 共享给自己的
+
+  // 根据智能体的 kb_selection_mode 过滤知识库；选中共享智能体时使用该空间下的知识库，否则使用本空间 + 共享给自己的
   let kbItems: any[] = [];
+  let tagItems: MentionItem[] = [];
+  let mcpItems: MentionItem[] = [];
+  let skillItems: MentionItem[] = [];
   if (!append) {
     let availableKbs: any[];
     const sourceTenantId = settingsStore.selectedAgentSourceTenantId;
     const agentId = selectedAgentId.value;
     if (sourceTenantId && agentId) {
-      // 共享智能体：按 agent_id 拉取该智能体配置的知识库范围（后端从共享关系解析租户）
+      // 共享智能体：按 agent_id 拉取该智能体配置的知识库范围（后端从共享关系解析空间）
       try {
-        const res: any = await listKnowledgeBases({ agent_id: agentId });
-        const list = res?.data && Array.isArray(res.data) ? res.data : [];
+        const list = await chatResources.ensureAgentKnowledgeBases(agentId, sourceTenantId);
         const orgLabel = sharedAgentOrgName.value || '';
         // 保留 capabilities / indexing_strategy，后面过滤时要用
         availableKbs = list.map((kb: any) => ({
@@ -971,16 +1298,79 @@ const loadMentionItems = async (q: string, resetIndex = true, append = false) =>
     const kbs = availableKbs.filter((kb: any) =>
       !q || (kb.name && kb.name.toLowerCase().includes(q.toLowerCase()))
     );
-    kbItems = kbs.map((kb: any) => ({
-      id: kb.id,
-      name: kb.name,
-      type: 'kb' as const,
-      kbType: kb.type || 'document',
-      count: kb.type === 'faq' ? (kb.chunk_count || 0) : (kb.knowledge_count || 0),
-      orgName: kb.org_name || sharedAgentOrgName.value || undefined
+    kbItems = await Promise.all(kbs.map(async (kb: any) => {
+      const kbType = kb.type || 'document';
+      let count = kbType === 'faq' ? Number(kb.chunk_count || 0) : Number(kb.knowledge_count || 0);
+      if (!count) {
+        const detail = await chatResources.fetchKnowledgeBaseById(kb.id);
+        if (detail) {
+          count = detail.type === 'faq'
+            ? Number(detail.chunk_count || 0)
+            : Number(detail.knowledge_count || 0);
+        }
+      }
+      return {
+        id: kb.id,
+        name: kb.name,
+        type: 'kb' as const,
+        kbType: kbType === 'faq' ? 'faq' as const : 'document' as const,
+        count,
+        orgName: kb.org_name || sharedAgentOrgName.value || undefined
+      };
     }));
+    mentionGroupCounts.value.kb = kbItems.length;
+
+    const tagKeyword = q.trim();
+    const tagSources = availableKbs;
+    try {
+      const tagResults = await Promise.all(tagSources.map(async (kb: any) => {
+        const res: any = await listKnowledgeTags(kb.id, { page: 1, page_size: 20, keyword: tagKeyword || undefined });
+        const payload = res?.data ?? res;
+        const list = Array.isArray(payload?.data) ? payload.data : (Array.isArray(payload) ? payload : []);
+        return list.map((tag: any) => ({
+          id: tag.id,
+          name: tag.name,
+          type: 'tag' as const,
+          kbId: kb.id,
+          kbName: kb.name,
+        }));
+      }));
+      tagItems = tagResults.flat();
+      mentionGroupCounts.value.tag = tagItems.length;
+    } catch (e) {
+      console.error('[Mention] listKnowledgeTags error:', e);
+      tagItems = [];
+    }
+
+    const mcpMode = agentMCPSelectionMode.value;
+    if (mcpMode !== 'none') {
+      mcpItems = mcpServices.value
+        .filter(service => isMCPAllowedByAgent(service))
+        .filter(service => !q || service.name?.toLowerCase().includes(q.toLowerCase()) || (service.description || '').toLowerCase().includes(q.toLowerCase()))
+        .map(toMCPMentionItem);
+    }
+
+    const skillsMode = agentSkillsSelectionMode.value;
+    if (skillsMode !== 'none') {
+      await editorResources.ensureSkills(currentAgentConfig.value?.sandbox_config_id);
+      skillItems = editorResources.skills
+        .filter(skill => isSkillAllowedByAgent(skill.name))
+        .map(skill => ({
+          id: skill.name,
+          name: skill.name,
+          type: 'skill' as const,
+          skillName: skill.name,
+          description: skill.description || '',
+        }))
+        .filter(skill => {
+          if (!q) return true;
+          const keyword = q.toLowerCase();
+          return skill.name.toLowerCase().includes(keyword)
+            || (skill.description || '').toLowerCase().includes(keyword);
+        });
+    }
   }
-  
+
   // Fetch Files from API
   // 仅当满足以下两点才加载文件：
   //   1. 智能体确实会用到知识库（kb_selection_mode !== 'none'）；
@@ -990,16 +1380,22 @@ const loadMentionItems = async (q: string, resetIndex = true, append = false) =>
   const kbModeAllowsFiles = !hasAgentConfig.value || agentKBSelectionMode.value !== 'none';
   const toolsAllowFiles = !hasAgentConfig.value || toolsConsumeFiles(agentAllowedTools.value);
   const shouldLoadFiles = kbModeAllowsFiles && toolsAllowFiles;
-  
+
+  // 空关键词时显式请求最近文件；有关键词时返回匹配文件。
+  // `recent=true` 只用于浏览态，避免其他搜索调用漏传关键词时静默退化为最近列表。
+  const fileSearchKeyword = q.trim();
   if (shouldLoadFiles) {
     mentionLoading.value = true;
     try {
       const fileTypesParam = agentSupportedFileTypes.value.length > 0 ? agentSupportedFileTypes.value : undefined;
       const sourceTenantId = settingsStore.selectedAgentSourceTenantId;
       const agentId = selectedAgentId.value;
-      const searchOptions = sourceTenantId && agentId ? { agent_id: agentId } : undefined;
+      const searchOptions = {
+        ...(sourceTenantId && agentId ? { agent_id: agentId, agent_source_tenant_id: sourceTenantId } : {}),
+        recent: !fileSearchKeyword,
+      };
       const res: any = await searchKnowledge(
-        q || '',
+        fileSearchKeyword,
         mentionOffset.value,
         MENTION_PAGE_SIZE,
         fileTypesParam,
@@ -1008,6 +1404,8 @@ const loadMentionItems = async (q: string, resetIndex = true, append = false) =>
       console.log('[Mention] searchKnowledge response:', res);
       if (res.data && Array.isArray(res.data)) {
         let files = res.data;
+        const rawTotal = typeof res.total === 'number' ? res.total : undefined;
+        const apiPageSize = res.data.length;
         // 按当前 @ 会话的兼容 KB 集合过滤：
         //   - 非智能体场景：`mentionAllowedKbIds` 为 null，跳过；
         //   - 智能体场景（含 shared agent）：'selected' 会把 ID 收敛到用户勾的 KB，
@@ -1040,6 +1438,14 @@ const loadMentionItems = async (q: string, resetIndex = true, append = false) =>
             orgName: fileOrgName || undefined
           };
         });
+        if (!append) {
+          const clientFiltered = !!mentionAllowedKbIds.value && fileItems.length < apiPageSize;
+          if (!clientFiltered && rawTotal != null) {
+            mentionGroupCounts.value.file = rawTotal;
+          } else {
+            delete mentionGroupCounts.value.file;
+          }
+        }
       }
       mentionHasMore.value = res.has_more || false;
       mentionOffset.value += fileItems.length;
@@ -1052,15 +1458,15 @@ const loadMentionItems = async (q: string, resetIndex = true, append = false) =>
   } else {
     mentionHasMore.value = false;
   }
-  
+
   if (append) {
     // Append file items to existing list
     mentionItems.value = [...mentionItems.value, ...fileItems];
   } else {
-    mentionItems.value = [...kbItems, ...fileItems];
+    mentionItems.value = [...kbItems, ...tagItems, ...mcpItems, ...skillItems, ...fileItems];
   }
-  console.log('[Mention] Total items:', mentionItems.value.length, { kbItems: kbItems.length, fileItems: fileItems.length });
-  
+  console.log('[Mention] Total items:', mentionItems.value.length, { kbItems: kbItems.length, fileItems: fileItems.length, tagItems: tagItems.length, mcpItems: mcpItems.length, skillItems: skillItems.length });
+
   // Only reset index if query changed or explicitly requested
   if (resetIndex || q !== lastMentionQuery) {
     mentionActiveIndex.value = 0;
@@ -1095,18 +1501,18 @@ const onInput = (val: string | InputEvent) => {
 
   // TDesign t-textarea passes the value directly, not an event
   const inputVal = typeof val === 'string' ? val : query.value;
-  
+
   const textarea = getTextareaEl();
   if (!textarea) {
     console.warn('[Mention] Could not get textarea element');
     return;
   }
-  
+
   const cursor = textarea.selectionStart;
   const textBeforeCursor = inputVal.slice(0, cursor);
-  
+
   console.log('[Mention] onInput called', { inputVal, cursor, textBeforeCursor, showMention: showMention.value });
-  
+
   if (showMention.value) {
     // 如果不是按钮触发的，检查 @ 符号
     if (!isMentionTriggeredByButton.value) {
@@ -1122,12 +1528,12 @@ const onInput = (val: string | InputEvent) => {
       showMention.value = false;
       return;
     }
-    
+
     // Get query
     // 如果是按钮触发，mentionStartPos 是起始位置，不需要 +1 跳过 @
     const start = isMentionTriggeredByButton.value ? mentionStartPos.value : mentionStartPos.value + 1;
     const q = inputVal.slice(start, cursor);
-    
+
     if (q.includes(' ')) {
       showMention.value = false;
       return;
@@ -1140,57 +1546,55 @@ const onInput = (val: string | InputEvent) => {
   } else {
     if (textBeforeCursor.endsWith('@')) {
       // 如果智能体禁用了知识库，不触发 @ 菜单
-      if (isKnowledgeBaseDisabledByAgent.value) {
+      if (isMentionDisabled.value) {
         return;
       }
-      // 如果智能体锁定了知识库且不允许用户选择，也不触发 @ 菜单
-      if (isKnowledgeBaseLockedByAgent.value) {
-        return;
-      }
-      
+
       console.log('[Mention] @ detected, opening menu');
       isMentionTriggeredByButton.value = false;
       mentionStartPos.value = cursor - 1;
       showMention.value = true;
       mentionQuery.value = "";
-      
+
       const coords = getCaretCoordinates(textarea, cursor);
-      const rect = textarea.getBoundingClientRect();
+      // Normalize coordinates to CSS pixels (root <html> may carry `zoom`).
+      const zoom = getRootZoom();
+      const rect = rectToCssPx(textarea.getBoundingClientRect(), zoom);
+      const { width: vw, height: vh } = cssViewportSize(zoom);
       const scrollTop = textarea.scrollTop;
       const menuHeight = 320; // 预估最大高度
-      
+
       let left = rect.left + coords.left;
       // Prevent menu from going off-screen horizontally
-      if (left + 300 > window.innerWidth) {
-        left = window.innerWidth - 300 - 10;
+      if (left + 300 > vw) {
+        left = vw - 300 - 10;
       }
-      
-      // 光标相对于视口的实际 top 位置
+
+      // 光标相对于视口的实际 top 位置（CSS 像素）
       const cursorAbsoluteTop = rect.top + coords.top - scrollTop;
       const lineHeight = coords.height; // 光标高度
 
       // Check vertical space below cursor
-      const spaceBelow = window.innerHeight - (cursorAbsoluteTop + lineHeight);
-      
+      const spaceBelow = vh - (cursorAbsoluteTop + lineHeight);
+
       if (spaceBelow < menuHeight && cursorAbsoluteTop > menuHeight) {
-         // Show above cursor (using bottom positioning)
-         // bottom distance = viewport height - cursor top position
-         const bottom = window.innerHeight - cursorAbsoluteTop;
-         mentionStyle.value = {
-           left: `${left}px`,
-           bottom: `${bottom}px`,
-           top: 'auto'
-         };
+        // Show above cursor (using bottom positioning)
+        const bottom = vh - cursorAbsoluteTop;
+        mentionStyle.value = {
+          left: `${left}px`,
+          bottom: `${bottom}px`,
+          top: 'auto'
+        };
       } else {
-         // Show below cursor (using top positioning)
-         const top = cursorAbsoluteTop + lineHeight;
-         mentionStyle.value = {
-           left: `${left}px`,
-           top: `${top}px`,
-           bottom: 'auto'
-         };
+        // Show below cursor (using top positioning)
+        const top = cursorAbsoluteTop + lineHeight;
+        mentionStyle.value = {
+          left: `${left}px`,
+          top: `${top}px`,
+          bottom: 'auto'
+        };
       }
-      
+
       loadMentionItems("");
     }
   }
@@ -1211,41 +1615,44 @@ const onCompositionEnd = (e: CompositionEvent) => {
 };
 
 const triggerMention = () => {
-  // 如果智能体锁定或禁用了知识库，不允许打开选择器
-  if (isKnowledgeBaseLockedByAgent.value) {
+  // 如果当前没有任何可提及资源，不允许打开选择器
+  if (isMentionDisabled.value) {
     const msgKey = isKnowledgeBaseDisabledByAgent.value ? 'input.kbDisabledByAgent' : 'input.kbLockedByAgent';
     MessagePlugin.warning(t(msgKey));
     return;
   }
-  
+
   const textarea = getTextareaEl();
   if (!textarea) return;
-  
+
   // 关闭其他选择器
   showAgentModeSelector.value = false;
   showModelSelector.value = false;
 
   textarea.focus();
-  
+
   // 直接显示菜单，不插入 @
   showMention.value = true;
   isMentionTriggeredByButton.value = true;
   mentionQuery.value = "";
   mentionStartPos.value = textarea.selectionStart;
-  
-  const rect = textarea.getBoundingClientRect();
+
+  // Normalize coordinates to CSS pixels (root <html> may carry `zoom`).
+  const zoom = getRootZoom();
+  const rect = rectToCssPx(textarea.getBoundingClientRect(), zoom);
+  const { height: vh } = cssViewportSize(zoom);
   const menuHeight = 320;
-  
+
   // 判断输入框上方空间
   const spaceAbove = rect.top;
-  const spaceBelow = window.innerHeight - rect.bottom;
-  
+  const spaceBelow = vh - rect.bottom;
+
   // 优先显示在上方，除非上方空间不足且下方空间充足
   if (spaceAbove > menuHeight || spaceAbove > spaceBelow) {
     // Show above textarea
     mentionStyle.value = {
       left: `${rect.left}px`,
-      bottom: `${window.innerHeight - rect.top + 8}px`, // 8px padding
+      bottom: `${vh - rect.top + 8}px`, // 8px padding
       top: 'auto'
     };
   } else {
@@ -1256,25 +1663,33 @@ const triggerMention = () => {
       bottom: 'auto'
     };
   }
-  
+
   loadMentionItems("");
 };
 
 const onMentionSelect = (item: any) => {
   if (item.type === 'kb') {
-      settingsStore.addKnowledgeBase(item.id);
+    settingsStore.addKnowledgeBase(item.id);
   } else if (item.type === 'file') {
-      settingsStore.addFile(item.id);
-      if (item.kbId) {
-        fileIdToKbId.value[item.id] = item.kbId;
-        settingsStore.setFileKbMap({ [item.id]: item.kbId });
-      }
-      // Add to local cache immediately
-      if (!fileList.value.find(f => f.id === item.id)) {
-        fileList.value.push({ id: item.id, name: item.name });
-      }
+    settingsStore.addFile(item.id);
+    if (item.kbId) {
+      fileIdToKbId.value[item.id] = item.kbId;
+      settingsStore.setFileKbMap({ [item.id]: item.kbId });
+    }
+    // Add to local cache immediately
+    if (!fileList.value.find(f => f.id === item.id)) {
+      fileList.value.push({ id: item.id, name: item.name });
+    }
+  } else if (item.type === 'tag') {
+    if (item.kbId) {
+      settingsStore.addTag({ id: item.id, name: item.name, kbId: item.kbId, kbName: item.kbName });
+    }
+  } else if (item.type === 'mcp') {
+    settingsStore.addMCPService(item.id);
+  } else if (item.type === 'skill') {
+    settingsStore.addSkill(item.skillName || item.id);
   }
-  
+
   const textarea = getTextareaEl();
   if (textarea) {
     // 如果是通过输入 @ 触发的，需要删除 @ 和后面的查询文字
@@ -1283,7 +1698,7 @@ const onMentionSelect = (item: any) => {
       const textBeforeAt = query.value.slice(0, mentionStartPos.value);
       const textAfterCursor = query.value.slice(cursor);
       query.value = textBeforeAt + textAfterCursor;
-      
+
       nextTick(() => {
         textarea.selectionStart = textarea.selectionEnd = mentionStartPos.value;
         textarea.focus();
@@ -1292,21 +1707,21 @@ const onMentionSelect = (item: any) => {
       // 通过按钮触发的，如果用户输入了查询词，需要删除查询词
       const cursor = textarea.selectionStart;
       if (cursor > mentionStartPos.value) {
-         const textBeforeStart = query.value.slice(0, mentionStartPos.value);
-         const textAfterCursor = query.value.slice(cursor);
-         query.value = textBeforeStart + textAfterCursor;
-         
-         nextTick(() => {
-           textarea.selectionStart = textarea.selectionEnd = mentionStartPos.value;
-           textarea.focus();
-         });
+        const textBeforeStart = query.value.slice(0, mentionStartPos.value);
+        const textAfterCursor = query.value.slice(cursor);
+        query.value = textBeforeStart + textAfterCursor;
+
+        nextTick(() => {
+          textarea.selectionStart = textarea.selectionEnd = mentionStartPos.value;
+          textarea.focus();
+        });
       } else {
-         // 直接聚焦
-         textarea.focus();
+        // 直接聚焦
+        textarea.focus();
       }
     }
   }
-  
+
   showMention.value = false;
 };
 
@@ -1321,7 +1736,7 @@ const toggleModelSelector = () => {
     MessagePlugin.warning(t('input.modelLockedByAgent'));
     return;
   }
-  
+
   // 互斥：关闭其他
   showMention.value = false;
   showAgentModeSelector.value = false;
@@ -1367,11 +1782,19 @@ let resizeHandler: (() => void) | null = null;
 let scrollHandler: (() => void) | null = null;
 
 onMounted(() => {
-  loadKnowledgeBases();
-  loadWebSearchConfig();
-  loadConversationConfig();
-  loadChatModels();
-  loadAgents();
+  // Embed 渠道由宿主注入 agent/KB，勿拉取需 JWT 的平台资源
+  if (props.embeddedMode) return;
+
+  // 并行拉取；若 platform 已预取且缓存未过期则直接复用
+  initChatModelSelection();
+  void Promise.all([
+    loadKnowledgeBases(),
+    loadWebSearchConfig(),
+    loadChatModels(),
+    loadAgents(),
+    loadMCPServices(),
+  ]);
+  window.addEventListener(CHAT_FILE_DROP_EVENT, handleChatFileDrop as EventListener);
 
   // 从持久化恢复 fileId -> kbId，刷新后共享知识库文件可带 kb_id 拉取（仅保留当前仍选中的文件）
   const persisted = settingsStore.settings.selectedFileKbMap;
@@ -1383,7 +1806,7 @@ onMounted(() => {
     });
     fileIdToKbId.value = next;
   }
-  
+
   // 如果从知识库内部进入，自动选中该知识库
   const kbId = (route.params as any)?.kbId as string;
   if (kbId && !selectedKbIds.value.includes(kbId)) {
@@ -1403,7 +1826,7 @@ onMounted(() => {
   document.addEventListener('click', closeAgentModeSelector);
   document.addEventListener('click', closeModelSelector);
   document.addEventListener('click', closeMentionSelector);
-  
+
   // 监听窗口大小变化和滚动，重新计算位置
   resizeHandler = () => {
     if (showModelSelector.value) {
@@ -1421,12 +1844,13 @@ onMounted(() => {
       updateAgentModeDropdownPosition();
     }
   };
-  
+
   window.addEventListener('resize', resizeHandler, { passive: true });
   window.addEventListener('scroll', scrollHandler, { passive: true, capture: true });
 });
 
 onUnmounted(() => {
+  window.removeEventListener(CHAT_FILE_DROP_EVENT, handleChatFileDrop as EventListener);
   document.removeEventListener('click', closeAgentModeSelector);
   document.removeEventListener('click', closeModelSelector);
   document.removeEventListener('click', closeMentionSelector);
@@ -1447,7 +1871,15 @@ watch(() => route.params.kbId, (newKbId) => {
 
 watch(() => uiStore.showSettingsModal, (visible, prevVisible) => {
   if (prevVisible && !visible) {
-    loadWebSearchConfig();
+    loadWebSearchConfig(true);
+    loadChatModels(true);
+  }
+});
+
+watch(() => route.path, (path, prev) => {
+  if (prev === '/platform/settings' && path !== '/platform/settings') {
+    loadWebSearchConfig(true);
+    loadChatModels(true);
   }
 });
 
@@ -1458,7 +1890,7 @@ watch([selectedKbIds, selectedFileIds], ([kbIds, fileIds]) => {
 }, { deep: true });
 
 const emit = defineEmits<{
-  (e: 'send-msg', query: string, modelId: string, mentionedItems: any[], imageFiles: File[], attachmentFiles: AttachmentFile[]): void;
+  (e: 'send-msg', query: string, modelId: string, mentionedItems: MentionRequestItem[], imageFiles: File[], attachmentFiles: AttachmentFile[]): void;
   (e: 'stop-generation'): void;
 }>();
 
@@ -1470,10 +1902,52 @@ const createSession = async (val: string) => {
   if (props.isReplying) {
     return MessagePlugin.error(t('input.messages.replying'));
   }
+  // Only block while the file is still uploading (no document ID yet). Once
+  // uploaded, sending is allowed even if parsing is still in progress: the
+  // backend shows a "parsing attachment" step on the timeline and waits.
+  const pendingAttachment = uploadedAttachments.value.find(item =>
+    item.status === 'uploading'
+  );
+  if (pendingAttachment) {
+    MessagePlugin.warning(t('chat.attachmentStillProcessing', { name: pendingAttachment.name }));
+    return;
+  }
+  const failedAttachment = uploadedAttachments.value.find(item => item.status === 'failed');
+  if (failedAttachment) {
+    MessagePlugin.error(failedAttachment.error || t('chat.attachmentParseFailed'));
+    return;
+  }
+
+  // Embed 渠道由后端绑定 agent/KB，勿走平台侧 agent 列表与就绪校验
+  if (props.embeddedMode) {
+    const textarea = getTextareaEl();
+    if (textarea) textarea.blur();
+    emit('send-msg', val, selectedModelId.value || '', [], [], []);
+    clearvalue();
+    return;
+  }
+
+  // Images and non-embedded attachments both travel to the backend as
+  // `attachment_ids`, which enforces a combined cap (MaxTemporaryAttachmentsPerMessage).
+  // The per-picker limits (5 images / 5 attachments) are independent, so guard the
+  // merged total here to avoid a late 400 after the files are already uploaded.
+  const MAX_TOTAL_ATTACHMENTS = 5;
+  const combinedAttachmentCount =
+    uploadedImages.value.length +
+    uploadedAttachments.value.filter(item => item.status !== 'failed').length;
+  if (combinedAttachmentCount > MAX_TOTAL_ATTACHMENTS) {
+    MessagePlugin.warning(t('chat.attachmentTotalTooMany', { max: MAX_TOTAL_ATTACHMENTS }));
+    return;
+  }
+
+  if (!chatResources.isFresh('models')) {
+    await loadChatModels()
+  }
+
   // 发送前校验当前选中的智能体（含默认快速问答）是否已配置完成
   const agentToCheck = selectedAgent.value;
   let actualAgent = agentToCheck;
-  if (agentToCheck.is_builtin) {
+  if (agentToCheck.is_builtin && !settingsStore.selectedAgentSourceTenantId) {
     let builtin = agents.value.find(a => a.id === selectedAgentId.value);
     if (!builtin) {
       await loadAgents();
@@ -1482,44 +1956,55 @@ const createSession = async (val: string) => {
     actualAgent = builtin || agentToCheck;
   }
   const isAgentMode = actualAgent.config?.agent_mode === 'smart-reasoning';
-  const notReadyReasons = actualAgent.is_builtin
-    ? getBuiltinAgentNotReadyReasons(actualAgent, isAgentMode)
-    : getCustomAgentNotReadyReasons(actualAgent);
+  const { keys: notReadyKeys, labels: notReadyReasons } = collectAgentNotReadyReasons(
+    actualAgent,
+    isAgentMode,
+    settingsStore.selectedAgentSourceTenantId ?? undefined,
+  );
   if (notReadyReasons.length > 0) {
-    showAgentNotReadyMessage(actualAgent, notReadyReasons);
+    showAgentNotReadyMessage(
+      actualAgent,
+      notReadyReasons,
+      notReadyKeys,
+      settingsStore.selectedAgentSourceTenantId ?? undefined,
+    );
     return;
   }
   // 获取@提及的知识库和文件信息
-  const mentionedItems = allSelectedItems.value.map(item => ({
+  const mentionedItems: MentionRequestItem[] = allSelectedItems.value.map(item => ({
     id: item.id,
     name: item.name,
     type: item.type,
-    kb_type: item.type === 'kb' ? (item.kbType || 'document') : undefined
+    kb_type: item.type === 'kb' ? (item.kbType || 'document') : undefined,
+    kb_id: item.kbId,
+    kb_name: item.kbName,
+    service_id: item.serviceId,
+    skill_name: item.skillName,
   }));
   const imageFiles = uploadedImages.value.map(img => img.file);
   const attachmentFiles = uploadedAttachments.value;
-  
+
   // Blur the textarea BEFORE emitting, so that when the parent navigates away
   // and Vue unmounts this component, TDesign's blur handler won't fire on a
   // detached DOM element (which causes getComputedStyle to throw).
   const textarea = getTextareaEl();
   if (textarea) textarea.blur();
   emit('send-msg', val, selectedModelId.value, mentionedItems, imageFiles, attachmentFiles);
-  
+
   // Clean up image previews
   uploadedImages.value.forEach(img => URL.revokeObjectURL(img.preview));
   uploadedImages.value = [];
-  
+
   // Clean up attachments
   attachmentUploadRef.value?.clear();
   uploadedAttachments.value = [];
-  
+
   clearvalue();
 }
 
 const updateAgentModeDropdownPosition = () => {
   const anchor = agentModeButtonRef.value;
-  
+
   if (!anchor) {
     agentModeDropdownStyle.value = {
       position: 'fixed',
@@ -1530,18 +2015,19 @@ const updateAgentModeDropdownPosition = () => {
     return;
   }
 
-  const rect = anchor.getBoundingClientRect();
+  // Normalize coordinates to CSS pixels (root <html> may carry `zoom`).
+  const zoom = getRootZoom();
+  const rect = rectToCssPx(anchor.getBoundingClientRect(), zoom);
   const dropdownWidth = 200;
   const offsetY = 8;
-  const vw = window.innerWidth;
-  const vh = window.innerHeight;
-  
+  const { width: vw, height: vh } = cssViewportSize(zoom);
+
   // 水平位置：左对齐
   let left = Math.floor(rect.left);
   const minLeft = 16;
   const maxLeft = Math.max(16, vw - dropdownWidth - 16);
   left = Math.max(minLeft, Math.min(maxLeft, left));
-  
+
   // 垂直位置：紧贴按钮，使用合理的高度避免空白
   const preferredDropdownHeight = 140; // Agent 模式选择器内容较少，用更小的优选高度
   const maxDropdownHeight = 150;
@@ -1549,21 +2035,21 @@ const updateAgentModeDropdownPosition = () => {
   const topMargin = 20;
   const spaceBelow = vh - rect.bottom;
   const spaceAbove = rect.top;
-  
+
   console.log('[Agent Dropdown] Space check:', {
     spaceBelow,
     spaceAbove,
     windowHeight: vh
   });
-  
+
   let actualHeight: number;
-  
+
   // 优先考虑下方空间
   if (spaceBelow >= minDropdownHeight + offsetY) {
     // 下方有足够空间，向下弹出
     actualHeight = Math.min(preferredDropdownHeight, spaceBelow - offsetY - 16);
     const top = Math.floor(rect.bottom + offsetY);
-    
+
     agentModeDropdownStyle.value = {
       position: 'fixed !important',
       width: `${dropdownWidth}px`,
@@ -1583,9 +2069,9 @@ const updateAgentModeDropdownPosition = () => {
     } else {
       actualHeight = Math.max(minDropdownHeight, availableHeight);
     }
-    
+
     const bottom = vh - rect.top + offsetY;
-    
+
     agentModeDropdownStyle.value = {
       position: 'fixed !important',
       width: `${dropdownWidth}px`,
@@ -1607,8 +2093,9 @@ const toggleAgentModeSelector = () => {
 
   showAgentModeSelector.value = !showAgentModeSelector.value;
   if (showAgentModeSelector.value) {
-    // 重新加载智能体列表
-    loadAgents();
+    if (!chatResources.isFresh('agents')) {
+      void loadAgents(true);
+    }
     // 多次更新位置确保准确
     nextTick(() => {
       updateAgentModeDropdownPosition();
@@ -1622,19 +2109,26 @@ const toggleAgentModeSelector = () => {
   }
 }
 
-const selectAgentMode = (mode: 'quick-answer' | 'smart-reasoning') => {
+const selectAgentMode = async (mode: 'quick-answer' | 'smart-reasoning') => {
+  if (!chatResources.isFresh('models')) {
+    await loadChatModels()
+  }
+
   const builtinAgentId = mode === 'smart-reasoning' ? BUILTIN_SMART_REASONING_ID : BUILTIN_QUICK_ANSWER_ID;
   const builtinAgent = agents.value.find(a => a.id === builtinAgentId);
-  
+
   if (builtinAgent) {
-    const notReadyReasons = getBuiltinAgentNotReadyReasons(builtinAgent, mode === 'smart-reasoning');
+    const { keys: notReadyKeys, labels: notReadyReasons } = collectAgentNotReadyReasons(
+      builtinAgent,
+      mode === 'smart-reasoning',
+    );
     if (notReadyReasons.length > 0) {
-      showAgentNotReadyMessage(builtinAgent, notReadyReasons);
       showAgentModeSelector.value = false;
+      showAgentNotReadyMessage(builtinAgent, notReadyReasons, notReadyKeys);
       return;
     }
   }
-  
+
   const shouldEnableAgent = mode === 'smart-reasoning';
   if (shouldEnableAgent !== isAgentEnabled.value) {
     settingsStore.toggleAgent(shouldEnableAgent);
@@ -1646,49 +2140,66 @@ const selectAgentMode = (mode: 'quick-answer' | 'smart-reasoning') => {
 }
 
 // 选择智能体（新版）；sourceTenantId 为共享智能体时传入
-const handleSelectAgent = (agent: CustomAgent, sourceTenantId?: string) => {
+const handleAgentNotReady = (
+  agent: CustomAgent,
+  labels: string[],
+  keys: AgentNotReadyReasonKey[],
+  sourceTenantId?: string,
+) => {
+  showAgentNotReadyMessage(agent, labels, keys, sourceTenantId);
+};
+
+const handleSelectAgent = async (agent: CustomAgent, sourceTenantId?: string) => {
+  if (!chatResources.isFresh('models')) {
+    await loadChatModels()
+  }
+
   // 根据智能体的 agent_mode 判断是否为 Agent 模式
   const isAgentType = agent.config?.agent_mode === 'smart-reasoning';
-  
+
   // 统一检查智能体是否就绪（内置和自定义智能体使用相同逻辑）
-  const actualAgent = agent.is_builtin 
+  const actualAgent = agent.is_builtin && !sourceTenantId
     ? (agents.value.find(a => a.id === agent.id) || agent)
     : agent;
-  
-  const notReadyReasons = agent.is_builtin
-    ? getBuiltinAgentNotReadyReasons(actualAgent, isAgentType)
-    : getCustomAgentNotReadyReasons(actualAgent);
-  
+
+  const { keys: notReadyKeys, labels: notReadyReasons } = collectAgentNotReadyReasons(
+    actualAgent,
+    isAgentType,
+    sourceTenantId,
+  );
+
   if (notReadyReasons.length > 0) {
-    showAgentNotReadyMessage(agent, notReadyReasons);
+    showAgentModeSelector.value = false;
+    showAgentNotReadyMessage(actualAgent, notReadyReasons, notReadyKeys, sourceTenantId);
     return;
   }
-  
+
   settingsStore.selectAgent(agent.id, sourceTenantId);
   settingsStore.toggleAgent(!!isAgentType);
-  
-  // 同步智能体的配置状态（含内置、自定义、共享智能体）：模型、网络搜索、知识库由 watch 同步
-  // 1. 同步网络搜索状态
-  const agentWebSearch = agent.config?.web_search_enabled;
-  if (agentWebSearch !== undefined) {
-    settingsStore.toggleWebSearch(agentWebSearch);
-  } else if (agent.is_builtin) {
-    // 内置智能体未配置时保留当前用户设置
-  }
-  
-  // 2. 同步模型（选中的对话模型随智能体切换，含共享智能体）
+
+  // 同步模型（选中的对话模型随智能体切换，含共享智能体）。
+  // 网络搜索已由 selectAgent 重置为关闭，智能体配置只控制该开关是否可用。
   const agentModel = agent.config?.model_id;
   if (agentModel && agentModel.trim() !== '') {
     selectedModelId.value = agentModel;
   } else {
-    if (conversationConfig.value?.summary_model_id) {
-      selectedModelId.value = conversationConfig.value.summary_model_id;
+    const lastPick = readLastChatModelID();
+    if (lastPick) {
+      selectedModelId.value = lastPick;
     }
   }
-  
+
   showAgentModeSelector.value = false;
-  
-  const message = agent.is_builtin 
+
+  // Only the two "mode-entry" built-ins are re-branded as "Normal / Agent Mode"
+  // in the dropdown — the switched-on/off toasts only make sense for them.
+  // Other built-ins (wiki researcher, data analyst, etc.) share `is_builtin`
+  // but should fall back to the generic agentSelected toast like custom agents,
+  // otherwise selecting e.g. the Wiki Questioner incorrectly says
+  // "Switched to Intelligent Reasoning".
+  const isModeBuiltin =
+    agent.id === BUILTIN_QUICK_ANSWER_ID || agent.id === BUILTIN_SMART_REASONING_ID;
+  const message = isModeBuiltin
     ? (isAgentType ? t('input.messages.agentSwitchedOn') : t('input.messages.agentSwitchedOff'))
     : t('input.messages.agentSelected', { name: agent.name });
   MessagePlugin.success(message);
@@ -1701,28 +2212,40 @@ const clearvalue = () => {
   query.value = "";
 }
 
+// Drop any pending images/attachments and stop their status polling. Used when
+// switching sessions: leftover documentIds belong to the previous session, so
+// keeping them would make polling 404 (falsely marking them failed) or send IDs
+// the new session does not own ("attachment ... not found in this session").
+const clearPendingUploads = () => {
+  uploadedImages.value.forEach(img => URL.revokeObjectURL(img.preview));
+  uploadedImages.value = [];
+  attachmentUploadRef.value?.clear();
+  uploadedAttachments.value = [];
+}
+
 const onKeydown = (val: string, event: { e: { preventDefault(): unknown; keyCode: number; shiftKey: any; ctrlKey: any; }; }) => {
   if (showMention.value) {
     if (event.e.keyCode === 38) { // Up
       event.e.preventDefault();
-      mentionActiveIndex.value = Math.max(0, mentionActiveIndex.value - 1);
+      mentionSelectorRef.value?.moveActive(-1);
       return;
     }
     if (event.e.keyCode === 40) { // Down
       event.e.preventDefault();
-      mentionActiveIndex.value = Math.min(mentionItems.value.length - 1, mentionActiveIndex.value + 1);
+      mentionSelectorRef.value?.moveActive(1);
       return;
     }
     if (event.e.keyCode === 13) { // Enter
       event.e.preventDefault();
-      if (mentionItems.value[mentionActiveIndex.value]) {
-        onMentionSelect(mentionItems.value[mentionActiveIndex.value]);
-      }
+      mentionSelectorRef.value?.confirmActive();
       return;
     }
     if (event.e.keyCode === 27) { // Esc
-        showMention.value = false;
+      if (mentionSelectorRef.value?.leaveGroup()) {
         return;
+      }
+      showMention.value = false;
+      return;
     }
   }
 
@@ -1768,11 +2291,8 @@ const onPaste = (e: ClipboardEvent) => {
 const onDrop = (e: DragEvent) => {
   e.preventDefault();
   const files = e.dataTransfer?.files;
-  if (!files) return;
-  const imageFiles = Array.from(files).filter(f => f.type.startsWith('image/'));
-  if (imageFiles.length > 0 && isImageUploadEnabledByAgent.value) {
-    addImageFiles(imageFiles);
-  }
+  if (!files || files.length === 0) return;
+  handleDroppedFiles(Array.from(files));
 };
 
 const onDragOver = (e: DragEvent) => {
@@ -1786,87 +2306,117 @@ const handleGoToWebSearchSettings = () => {
   }
 };
 
-const handleGoToAgentSettings = (section?: string) => {
-  // 跳转到智能体列表页并打开编辑弹窗
-  if (selectedAgent.value && !selectedAgent.value.is_builtin) {
-    const query: Record<string, string> = { edit: selectedAgent.value.id };
-    if (section) {
-      query.section = section;
-    }
-    router.push({ path: '/platform/agents', query });
-  } else {
-    router.push('/platform/agents');
+const handleGoToWebSearchConfig = () => {
+  if (hasAgentConfig.value && selectedAgent.value) {
+    handleGoToAgentSettings('websearch');
+    return;
   }
+  handleGoToWebSearchSettings();
 };
 
-// 获取内置智能体不就绪的原因
-const getBuiltinAgentNotReadyReasons = (agent: CustomAgent, isAgentMode: boolean): string[] => {
-  const reasons: string[] = []
-  const config = agent.config || {}
-  
-  // 内置智能体会自动回退到租户的默认模型，因此不再在前端强制校验 model_id
-  
-  // 检查重排模型（Rerank Model）- 仅当允许使用 knowledge_search 工具时需要
-  // 内置智能体允许重排模型为空（使用默认配置）
-  // const hasKnowledgeSearchTool = config.allowed_tools && config.allowed_tools.includes('knowledge_search')
-  // if (hasKnowledgeSearchTool) {
-  //   if (!config.rerank_model_id || config.rerank_model_id.trim() === '') {
-  //     reasons.push(t('input.customAgentMissingRerankModel'))
-  //   }
-  // }
-  
-  // Agent 模式还需要检查允许的工具
-  if (isAgentMode) {
-    if (!config.allowed_tools || config.allowed_tools.length === 0) {
-      reasons.push(t('input.agentMissingAllowedTools'))
-    }
+const handleGoToAgentSettings = (section?: string) => {
+  const agent = selectedAgent.value;
+  if (!agent) {
+    router.push('/platform/agents');
+    return;
   }
-  
-  return reasons
-}
+  const query: Record<string, string> = { edit: agent.id };
+  if (section) {
+    query.section = section;
+  }
+  router.push({ path: '/platform/agents', query });
+};
 
-// 获取自定义智能体不就绪的原因（非 Agent 模式，快速回答）
-const getCustomAgentNotReadyReasons = (agent: CustomAgent): string[] => {
-  const reasons: string[] = []
-  const config = agent.config || {}
-  
-  // 检查对话模型（Summary Model）
-  if (!config.model_id || config.model_id.trim() === '') {
-    reasons.push(t('input.customAgentMissingSummaryModel'))
-  }
-  // 检查重排模型（Rerank Model）- 仅当允许使用 knowledge_search 工具时需要
-  const hasKnowledgeSearchTool = config.allowed_tools && config.allowed_tools.includes('knowledge_search')
-  if (hasKnowledgeSearchTool) {
-    if (!config.rerank_model_id || config.rerank_model_id.trim() === '') {
-      reasons.push(t('input.customAgentMissingRerankModel'))
+const formatAgentNotReadyReasons = (
+  reasonKeys: AgentNotReadyReasonKey[],
+  isBuiltin: boolean,
+): string[] => {
+  return reasonKeys.map((key) => {
+    if (key === 'summary_model') {
+      return isBuiltin
+        ? t('input.agentMissingSummaryModel')
+        : t('input.customAgentMissingSummaryModel');
     }
-  }
-  
-  return reasons
-}
+    if (key === 'rerank_model') {
+      return isBuiltin
+        ? t('input.agentMissingRerankModel')
+        : t('input.customAgentMissingRerankModel');
+    }
+    return t('input.agentMissingAllowedTools');
+  });
+};
+
+const collectAgentNotReadyReasons = (
+  agent: CustomAgent,
+  isAgentMode: boolean,
+  sourceTenantId?: string,
+): { keys: AgentNotReadyReasonKey[]; labels: string[] } => {
+  const isSharedAgent = !!sourceTenantId;
+  const keys = getAgentNotReadyReasonKeys(agent.config, allModels.value, {
+    isAgentMode,
+    isSharedAgent,
+  });
+  return {
+    keys,
+    labels: formatAgentNotReadyReasons(keys, agent.is_builtin),
+  };
+};
+
+const goToAgentEditor = (
+  agent: CustomAgent,
+  section = 'model',
+  highlight?: AgentNotReadyReasonKey,
+  sourceTenantId?: string,
+) => {
+  router.push({
+    path: '/platform/agents',
+    query: {
+      edit: agent.id,
+      section,
+      ...(highlight ? { highlight } : {}),
+      ...(sourceTenantId ? { sourceTenantId } : {}),
+    },
+  });
+};
 
 // 显示智能体未就绪的消息（统一处理内置和自定义智能体）
-const showAgentNotReadyMessage = (agent: CustomAgent, reasons: string[]) => {
-  const reasonsText = reasons.join('、')
-  
+const showAgentNotReadyMessage = (
+  agent: CustomAgent,
+  reasons: string[],
+  reasonKeys?: AgentNotReadyReasonKey[],
+  sourceTenantId?: string,
+) => {
+  const reasonsText = formatLocalizedList(reasons, locale.value)
+  const isRemoteShared = !canLocallyConfigureAgent(sourceTenantId)
+
   const messageContent = h('div', { style: 'display: flex; flex-direction: column; gap: 8px; max-width: 320px;' }, [
-    h('span', { style: 'color: var(--td-text-color-primary); line-height: 1.5;' }, t('input.agentNotReadyDetail', { agentName: agent.name, reasons: reasonsText })),
-    h('a', {
-      href: '#',
-      onClick: (e: Event) => {
-        e.preventDefault();
-        router.push(`/platform/agents?edit=${agent.id}`);
-      },
-      style: 'color: var(--td-brand-color); text-decoration: none; font-weight: 500; cursor: pointer; align-self: flex-start;',
-      onMouseenter: (e: Event) => {
-        (e.target as HTMLElement).style.textDecoration = 'underline';
-      },
-      onMouseleave: (e: Event) => {
-        (e.target as HTMLElement).style.textDecoration = 'none';
-      }
-    }, t('input.goToAgentEditor'))
+    h(
+      'span',
+      { style: 'color: var(--td-text-color-primary); line-height: 1.5;' },
+      isRemoteShared
+        ? t('input.sharedAgentNotReadyDetail', { agentName: agent.name, reasons: reasonsText })
+        : t('input.agentNotReadyDetail', { agentName: agent.name, reasons: reasonsText }),
+    ),
+    ...(isRemoteShared ? [] : [
+      h('a', {
+        href: '#',
+        onClick: (e: Event) => {
+          e.preventDefault();
+          const section = resolveAgentNotReadySection(reasonKeys || ['summary_model'])
+          const highlight = resolveAgentNotReadyHighlight(reasonKeys || ['summary_model'])
+          goToAgentEditor(agent, section, highlight, sourceTenantId);
+        },
+        style: 'color: var(--td-brand-color); text-decoration: none; font-weight: 500; cursor: pointer; align-self: flex-start;',
+        onMouseenter: (e: Event) => {
+          (e.target as HTMLElement).style.textDecoration = 'underline';
+        },
+        onMouseleave: (e: Event) => {
+          (e.target as HTMLElement).style.textDecoration = 'none';
+        }
+      }, t('input.goToAgentEditor')),
+    ]),
   ]);
-  
+
   MessagePlugin.warning({
     content: () => messageContent,
     duration: 5000
@@ -1892,7 +2442,7 @@ const toggleWebSearch = () => {
         href: '#',
         onClick: (e: Event) => {
           e.preventDefault();
-          handleGoToWebSearchSettings();
+          handleGoToWebSearchConfig();
         },
         style: 'color: var(--td-brand-color); text-decoration: none; font-weight: 500; cursor: pointer; align-self: flex-start;',
         onMouseenter: (e: Event) => {
@@ -1901,7 +2451,7 @@ const toggleWebSearch = () => {
         onMouseleave: (e: Event) => {
           (e.target as HTMLElement).style.textDecoration = 'none';
         }
-      }, t('input.goToSettings'))
+      }, t('input.goToAgentSettings'))
     ]);
     MessagePlugin.warning({
       content: () => messageContent,
@@ -1929,18 +2479,18 @@ const handleStop = async () => {
     MessagePlugin.warning(t('input.messages.sessionMissing'));
     return;
   }
-  
+
   if (!props.assistantMessageId) {
     console.error('[Stop] Assistant message ID is empty');
     MessagePlugin.warning(t('input.messages.messageMissing'));
     return;
   }
-  
+
   console.log('[Stop] Stopping generation for message:', props.assistantMessageId);
-  
+
   // 发送 stop 事件，通知父组件立即清除 loading 状态
   emit('stop-generation');
-  
+
   try {
     await stopSession(props.sessionId, props.assistantMessageId);
     MessagePlugin.success(t('input.messages.stopSuccess'));
@@ -1952,6 +2502,7 @@ const handleStop = async () => {
 
 onBeforeRouteUpdate((to, from, next) => {
   clearvalue()
+  clearPendingUploads()
   next()
 })
 
@@ -1965,339 +2516,261 @@ defineExpose({
 
 </script>
 <template>
-  <div class="answers-input" @drop="onDrop" @dragover="onDragOver">
+  <div class="answers-input" :class="{ 'is-embedded': embeddedMode }" @drop="onDrop" @dragover="onDragOver">
     <!-- Hidden file input for image upload -->
-    <input
-      ref="imageInputRef"
-      type="file"
-      accept="image/jpeg,image/png,image/gif,image/webp"
-      multiple
-      style="display:none"
-      @change="handleImageSelect"
-    />
+    <input ref="imageInputRef" type="file" accept="image/jpeg,image/png,image/gif,image/webp" multiple
+      style="display:none" @change="handleImageSelect" />
     <!-- 富文本输入框容器 -->
-    <div class="rich-input-container">
-        <!-- 图片预览区域 -->
+    <div class="rich-input-container" data-guide="chat-input">
+      <!-- 图片预览区域 -->
       <div v-if="uploadedImages.length > 0" class="image-preview-bar">
         <div v-for="(img, idx) in uploadedImages" :key="idx" class="image-preview-item">
           <img :src="img.preview" class="image-preview-thumb" />
           <span class="image-preview-remove" @click="removeImage(idx)">×</span>
         </div>
       </div>
-      
+
       <!-- 附件列表区域 (由 AttachmentUpload 组件渲染) -->
-      <AttachmentUpload
-        ref="attachmentUploadRef"
-        :max-files="5"
-        :max-size="20"
-        @update:files="uploadedAttachments = $event"
-      />
-      
-        <!-- 选中的知识库和文件标签（显示在输入框内顶部） -->
+      <AttachmentUpload ref="attachmentUploadRef" :max-files="5"
+        :session-id="sessionId" :agent-id="selectedAgentId"
+        :agent-source-tenant-id="settingsStore.selectedAgentSourceTenantId ?? undefined"
+        @update:files="uploadedAttachments = $event" />
+
+      <!-- 选中的知识库和文件标签（显示在输入框内顶部） -->
       <div v-if="allSelectedItems.length > 0" class="selected-tags-inline">
-        <span 
-          v-for="item in allSelectedItems" 
-          :key="item.id" 
-          class="mention-chip"
-          :class="[
-            item.type === 'kb' ? (item.kbType === 'faq' ? 'mention-chip--faq' : 'mention-chip--kb') : 'mention-chip--file',
-            { 'mention-chip--agent': item.isAgentConfigured }
-          ]"
-        >
+        <span v-for="item in allSelectedItems" :key="`${item.type}:${item.id}`" class="mention-chip" :class="[
+          getMentionChipClass(item),
+          { 'mention-chip--agent': item.isAgentConfigured }
+        ]">
           <span class="mention-chip__icon-wrap" :class="{ 'has-org': item.org_name }">
             <span class="mention-chip__icon">
               <t-icon v-if="item.type === 'kb'" :name="item.kbType === 'faq' ? 'chat-bubble-help' : 'folder'" />
-              <t-icon v-else name="file" />
+              <t-icon v-else :name="getMentionIcon(item)" />
             </span>
             <span v-if="item.org_name" class="mention-chip__org-badge">
-              <img :src="getImgSrc(item.type === 'file' ? 'organization-grey.svg' : 'organization-green.svg')" class="mention-chip__org-img" alt="" aria-hidden="true" />
+              <img :src="getImgSrc(item.type === 'file' ? 'organization-grey.svg' : 'organization-green.svg')"
+                class="mention-chip__org-img" alt="" aria-hidden="true" />
             </span>
           </span>
           <span class="mention-chip__name" :title="item.name">{{ item.name }}</span>
-          <span class="mention-chip__remove" @click.stop="removeSelectedItem(item)" :aria-label="$t('common.remove')">×</span>
+          <span class="mention-chip__remove" @click.stop="removeSelectedItem(item)"
+            :aria-label="$t('common.remove')">×</span>
         </span>
       </div>
-      
+
       <!-- 实际输入框 -->
-      <t-textarea 
-        ref="textareaRef"
-        v-model="query" 
-        :placeholder="inputPlaceholder" 
-        name="description" 
-        :autosize="true" 
-        @keydown="onKeydown" 
-        @input="onInput"
-        @compositionstart="onCompositionStart"
-        @compositionend="onCompositionEnd"
-        @paste="onPaste"
-      />
-    </div>
-    
-    <!-- Mention Selector -->
-    <Teleport to="body">
-      <MentionSelector
-        :visible="showMention"
-        :style="mentionStyle"
-        :items="mentionItems"
-        :hasMore="mentionHasMore"
-        :loading="mentionLoading"
-        :emptyHint="mentionEmptyHint"
-        v-model:activeIndex="mentionActiveIndex"
-        @select="onMentionSelect"
-        @loadMore="loadMoreMentionItems"
-      />
-    </Teleport>
-    
-    <!-- 控制栏 -->
-    <div class="control-bar">
-      <!-- 左侧控制按钮 -->
-      <div class="control-left" v-if="!embeddedMode">
-        <!-- Agent 模式切换按钮 -->
-        <div 
-          ref="agentModeButtonRef"
-          class="control-btn agent-mode-btn"
-          :class="{ 
+      <t-textarea ref="textareaRef" v-model="query" :placeholder="inputPlaceholder" name="description" :autosize="true"
+        @keydown="onKeydown" @input="onInput" @compositionstart="onCompositionStart" @compositionend="onCompositionEnd"
+        @paste="onPaste" />
+
+      <!-- 控制栏（放在 rich-input-container 内，相对输入框边框定位） -->
+      <div class="control-bar" :class="{ 'is-embedded': embeddedMode }">
+        <!-- 左侧控制按钮 -->
+        <div class="control-left" v-if="!embeddedMode">
+          <!-- Agent 模式切换按钮 -->
+          <div ref="agentModeButtonRef" class="control-btn agent-mode-btn" :class="{
             'is-normal': !isCustomAgent && !isAgentEnabled,
             'is-agent': !isCustomAgent && isAgentEnabled,
             'is-custom': isCustomAgent
-          }"
-          @click.stop="toggleAgentModeSelector"
-        >
-          <span class="agent-mode-text">
-            {{ selectedAgent.name || (isAgentEnabled ? $t('input.agentMode') : $t('input.normalMode')) }}
-          </span>
-          <svg 
-            width="12" 
-            height="12" 
-            viewBox="0 0 12 12" 
-            fill="currentColor"
-            class="dropdown-arrow"
-            :class="{ 'rotate': showAgentModeSelector }"
-          >
-            <path d="M2.5 4.5L6 8L9.5 4.5H2.5Z"/>
-          </svg>
-        </div>
-
-        <!-- Agent 选择器下拉菜单 -->
-        <AgentSelector
-          :visible="showAgentModeSelector"
-          :anchorEl="agentModeButtonRef"
-          :currentAgentId="selectedAgentId"
-          :agents="enabledAgents"
-          @close="closeAgentModeSelector"
-          @select="handleSelectAgent"
-        />
-
-        <!-- WebSearch 开关按钮 -->
-        <t-tooltip placement="top" theme="light" :popupProps="{ overlayClassName: 'input-field-tooltip' }">
-          <template #content>
-            <div v-if="isWebSearchDisabledByAgent" class="tooltip-with-link">
-              <span>{{ $t('input.webSearchDisabledByAgent') }}</span>
-              <a href="#" @click.prevent="handleGoToAgentSettings('websearch')">{{ $t('input.goToAgentSettings') }}</a>
-            </div>
-            <span v-else-if="isWebSearchConfigured">{{ isWebSearchEnabled ? $t('input.webSearch.toggleOff') : $t('input.webSearch.toggleOn') }}</span>
-            <div v-else class="tooltip-with-link">
-              <span>{{ $t('input.webSearch.notConfigured') }}</span>
-              <a href="#" @click.prevent="handleGoToWebSearchSettings">{{ $t('input.goToSettings') }}</a>
-            </div>
-          </template>
-          <div 
-            class="control-btn websearch-btn"
-            :class="{ 
-              'active': isWebSearchEnabled && isWebSearchConfigured, 
-              'disabled': !isWebSearchConfigured || isWebSearchDisabledByAgent
-            }"
-            @click.stop="toggleWebSearch"
-          >
-            <svg 
-              width="18" 
-              height="18" 
-              viewBox="0 0 18 18" 
-              fill="none"
-              xmlns="http://www.w3.org/2000/svg"
-              class="control-icon websearch-icon"
-              :class="{ 'active': isWebSearchEnabled && isWebSearchConfigured }"
-            >
-              <circle cx="9" cy="9" r="7" stroke="currentColor" stroke-width="1.2" fill="none"/>
-              <path d="M 9 2 A 3.5 7 0 0 0 9 16" stroke="currentColor" stroke-width="1.2" fill="none"/>
-              <path d="M 9 2 A 3.5 7 0 0 1 9 16" stroke="currentColor" stroke-width="1.2" fill="none"/>
-              <line x1="2.94" y1="5.5" x2="15.06" y2="5.5" stroke="currentColor" stroke-width="1.2" stroke-linecap="round"/>
-              <line x1="2.94" y1="12.5" x2="15.06" y2="12.5" stroke="currentColor" stroke-width="1.2" stroke-linecap="round"/>
+          }" @click.stop="toggleAgentModeSelector">
+            <span class="agent-mode-text">
+              {{ selectedAgent.name || (isAgentEnabled ? $t('input.agentMode') : $t('input.normalMode')) }}
+            </span>
+            <svg width="12" height="12" viewBox="0 0 12 12" fill="currentColor" class="dropdown-arrow"
+              :class="{ 'rotate': showAgentModeSelector }">
+              <path d="M2.5 4.5L6 8L9.5 4.5H2.5Z" />
             </svg>
           </div>
-        </t-tooltip>
 
-        <!-- 图片上传按钮 -->
-        <t-tooltip placement="top" theme="light" :popupProps="{ overlayClassName: 'input-field-tooltip' }">
-          <template #content>
-            <div v-if="!isImageUploadEnabledByAgent" class="tooltip-with-link">
-              <span>{{ $t('input.imageUploadDisabledByAgent') }}</span>
-              <a href="#" @click.prevent="handleGoToAgentSettings('model')">{{ $t('input.goToAgentSettings') }}</a>
-            </div>
-            <span v-else>{{ $t('chat.imageUploadTooltip') }}</span>
-          </template>
-          <div
-            class="control-btn image-upload-btn"
-            :class="{ 
-              'active': uploadedImages.length > 0,
-              'disabled': !isImageUploadEnabledByAgent
-            }"
-            @click.stop="isImageUploadEnabledByAgent && triggerImageUpload()"
-          >
-            <svg width="18" height="18" viewBox="0 0 1024 1024" fill="currentColor" class="control-icon">
-              <path d="M896 128H128c-35.3 0-64 28.7-64 64v640c0 35.3 28.7 64 64 64h768c35.3 0 64-28.7 64-64V192c0-35.3-28.7-64-64-64zM128 832V192h768l0.1 640H128z"/>
-              <path d="M352 448a96 96 0 1 0 0-192 96 96 0 0 0 0 192z"/>
-              <path d="M128 768l224-288 160 160 192-256L896 640v128H128z"/>
-            </svg>
-            <span v-if="uploadedImages.length > 0" class="image-count">{{ uploadedImages.length }}</span>
-          </div>
-        </t-tooltip>
+          <!-- Agent 选择器下拉菜单 -->
+          <AgentSelector :visible="showAgentModeSelector" :anchorEl="agentModeButtonRef"
+            :currentAgentId="selectedAgentId" :agents="enabledAgents" :all-models="allModels"
+            @close="closeAgentModeSelector" @select="handleSelectAgent" @not-ready="handleAgentNotReady" />
 
-        <!-- 附件上传按钮 -->
-        <t-tooltip placement="top" theme="light" :popupProps="{ overlayClassName: 'input-field-tooltip' }">
-          <template #content>
-            <span>{{ uploadedAttachments.length > 0 ? $t('chat.attachmentWithCount', { count: uploadedAttachments.length }) : $t('chat.attachmentUploadTooltip') }}</span>
-          </template>
-          <div
-            class="control-btn attachment-upload-btn"
-            :class="{ 'active': uploadedAttachments.length > 0 }"
-            @click.stop="attachmentUploadRef?.triggerFileSelect()"
-          >
-            <!-- 回形针图标 -->
-            <svg width="18" height="18" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.8" stroke-linecap="round" stroke-linejoin="round" class="control-icon">
-              <path d="M21.44 11.05l-9.19 9.19a6 6 0 0 1-8.49-8.49l9.19-9.19a4 4 0 0 1 5.66 5.66l-9.2 9.19a2 2 0 0 1-2.83-2.83l8.49-8.48"/>
-            </svg>
-            <span v-if="uploadedAttachments.length > 0" class="attachment-count">{{ uploadedAttachments.length }}</span>
-          </div>
-        </t-tooltip>
-
-        <!-- @ 知识库/文件选择按钮 -->
-        <t-tooltip placement="top" theme="light" :popupProps="{ overlayClassName: 'input-field-tooltip' }">
-          <template #content>
-            <div v-if="isKnowledgeBaseDisabledByAgent" class="tooltip-with-link">
-              <span>{{ $t('input.kbDisabledByAgent') }}</span>
-              <a href="#" @click.prevent="handleGoToAgentSettings('knowledge')">{{ $t('input.goToAgentSettings') }}</a>
-            </div>
-            <span v-else>{{ allSelectedItems.length > 0 ? $t('input.knowledgeBaseWithCount', { count: allSelectedItems.length }) : $t('input.knowledgeBase') }}</span>
-          </template>
-          <div 
-            ref="atButtonRef"
-            class="control-btn kb-btn"
-            :class="{ 
-              'active': allSelectedItems.length > 0,
-              'disabled': isKnowledgeBaseDisabledByAgent
-            }"
-            @click.stop
-            @mousedown.prevent="triggerMention"
-          >
-            <svg width="18" height="18" viewBox="0 0 20 20" fill="none" xmlns="http://www.w3.org/2000/svg" class="control-icon at-icon">
-              <circle cx="10" cy="10" r="3.5" stroke="currentColor" stroke-width="1.8"/>
-              <path d="M13.5 10V11.5C13.5 12.163 13.7634 12.7989 14.2322 13.2678C14.7011 13.7366 15.337 14 16 14C16.663 14 17.2989 13.7366 17.7678 13.2678C18.2366 12.7989 18.5 12.163 18.5 11.5V10C18.5 7.74566 17.6045 5.58365 16.0104 3.98959C14.4163 2.39553 12.2543 1.5 10 1.5C7.74566 1.5 5.58365 2.39553 3.98959 3.98959C2.39553 5.58365 1.5 7.74566 1.5 10C1.5 12.2543 2.39553 14.4163 3.98959 16.0104C5.58365 17.6045 7.74566 18.5 10 18.5H12" stroke="currentColor" stroke-width="1.8" stroke-linecap="round" stroke-linejoin="round"/>
-            </svg>
-            <span v-if="allSelectedItems.length > 0" class="kb-count">{{ allSelectedItems.length }}</span>
-          </div>
-        </t-tooltip>
-
-        <!-- 模型显示 -->
-        <t-tooltip :content="isModelLockedByAgent ? $t('input.modelLockedByAgent') : ''" :disabled="!isModelLockedByAgent">
-          <div class="model-display" :class="{ 'agent-controlled': isModelLockedByAgent }">
-            <div
-              ref="modelButtonRef"
-              class="model-selector-trigger"
-              @click.stop="toggleModelSelector"
-            >
-              <span class="model-selector-name">
-                {{ selectedModelDisplayName }}
-              </span>
-              <svg 
-                width="12" 
-                height="12" 
-                viewBox="0 0 12 12" 
-                fill="currentColor"
-                class="model-dropdown-arrow"
-                :class="{ 'rotate': showModelSelector }"
-              >
-                <path d="M2.5 4.5L6 8L9.5 4.5H2.5Z"/>
+          <!-- WebSearch 开关按钮（智能体未启用时不显示） -->
+          <t-tooltip v-if="showWebSearchButton" placement="top" theme="light"
+            :popupProps="{ overlayClassName: 'input-field-tooltip' }">
+            <template #content>
+              <span v-if="isWebSearchConfigured">{{ isWebSearchEnabled ? $t('input.webSearch.toggleOff') :
+                $t('input.webSearch.toggleOn') }}</span>
+              <div v-else class="tooltip-with-link">
+                <span>{{ $t('input.webSearch.notConfigured') }}</span>
+                <a href="#" @click.prevent="handleGoToWebSearchConfig">{{ $t('input.goToAgentSettings') }}</a>
+              </div>
+            </template>
+            <div class="control-btn websearch-btn" :class="{
+              'active': isWebSearchEnabled && isWebSearchConfigured,
+              'disabled': !isWebSearchConfigured
+            }" @click.stop="toggleWebSearch">
+              <svg width="18" height="18" viewBox="0 0 18 18" fill="none" xmlns="http://www.w3.org/2000/svg"
+                class="control-icon websearch-icon" :class="{ 'active': isWebSearchEnabled && isWebSearchConfigured }">
+                <circle cx="9" cy="9" r="7" stroke="currentColor" stroke-width="1.2" fill="none" />
+                <path d="M 9 2 A 3.5 7 0 0 0 9 16" stroke="currentColor" stroke-width="1.2" fill="none" />
+                <path d="M 9 2 A 3.5 7 0 0 1 9 16" stroke="currentColor" stroke-width="1.2" fill="none" />
+                <line x1="2.94" y1="5.5" x2="15.06" y2="5.5" stroke="currentColor" stroke-width="1.2"
+                  stroke-linecap="round" />
+                <line x1="2.94" y1="12.5" x2="15.06" y2="12.5" stroke="currentColor" stroke-width="1.2"
+                  stroke-linecap="round" />
               </svg>
             </div>
-          </div>
-        </t-tooltip>
-      </div>
+          </t-tooltip>
 
-      <Teleport to="body">
-        <div v-if="showModelSelector" class="model-selector-overlay" @click="closeModelSelector">
-            <div class="model-selector-dropdown" :style="modelDropdownStyle" @click.stop>
-            <div class="model-selector-header">
-              <span>{{ $t('conversationSettings.models.chatGroupLabel') }}</span>
-              <button class="model-selector-add" type="button" @click="handleModelChange('__add_model__')">
-                <span class="add-icon">+</span>
-                  <span class="add-text">{{ $t('input.addModel') }}</span>
-              </button>
+          <!-- 图片上传按钮（智能体未启用时不显示） -->
+          <t-tooltip v-if="showImageUploadButton" placement="top" theme="light"
+            :popupProps="{ overlayClassName: 'input-field-tooltip' }">
+            <template #content>
+              <span>{{ $t('chat.imageUploadTooltip') }}</span>
+            </template>
+            <div class="control-btn image-upload-btn" :class="{
+              'active': uploadedImages.length > 0
+            }" @click.stop="triggerImageUpload()">
+              <svg width="18" height="18" viewBox="0 0 1024 1024" fill="currentColor" class="control-icon">
+                <path
+                  d="M896 128H128c-35.3 0-64 28.7-64 64v640c0 35.3 28.7 64 64 64h768c35.3 0 64-28.7 64-64V192c0-35.3-28.7-64-64-64zM128 832V192h768l0.1 640H128z" />
+                <path d="M352 448a96 96 0 1 0 0-192 96 96 0 0 0 0 192z" />
+                <path d="M128 768l224-288 160 160 192-256L896 640v128H128z" />
+              </svg>
+              <span v-if="uploadedImages.length > 0" class="image-count">{{ uploadedImages.length }}</span>
             </div>
-            <div class="model-selector-content">
-              <div
-                v-for="model in availableModels"
-                :key="model.id"
-                class="model-option"
-                :class="{ selected: model.id === selectedModelId }"
-                @click="handleModelChange(model.id || '')"
-              >
-                <div class="model-option-main">
-                  <span class="model-option-name">{{ model.name }}</span>
-                  <span v-if="model.source === 'remote'" class="model-badge-remote">{{ $t('input.remote') }}</span>
-                  <span v-else-if="model.parameters?.parameter_size" class="model-badge-local">
-                    {{ model.parameters.parameter_size }}
-                  </span>
-                </div>
-                <div v-if="model.description" class="model-option-desc">
-                  {{ model.description }}
-                </div>
+          </t-tooltip>
+
+          <!-- 附件上传按钮 -->
+          <t-tooltip placement="top" theme="light" :popupProps="{ overlayClassName: 'input-field-tooltip' }">
+            <template #content>
+              <span>{{ uploadedAttachments.length > 0 ? $t('chat.attachmentWithCount', {
+                count: uploadedAttachments.length
+              }) : $t('chat.attachmentUploadTooltip') }}</span>
+            </template>
+            <div class="control-btn attachment-upload-btn" :class="{ 'active': uploadedAttachments.length > 0 }"
+              @click.stop="attachmentUploadRef?.triggerFileSelect()">
+              <!-- 回形针图标 -->
+              <svg width="18" height="18" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.8"
+                stroke-linecap="round" stroke-linejoin="round" class="control-icon">
+                <path
+                  d="M21.44 11.05l-9.19 9.19a6 6 0 0 1-8.49-8.49l9.19-9.19a4 4 0 0 1 5.66 5.66l-9.2 9.19a2 2 0 0 1-2.83-2.83l8.49-8.48" />
+              </svg>
+              <span v-if="uploadedAttachments.length > 0" class="attachment-count">{{ uploadedAttachments.length
+              }}</span>
+            </div>
+          </t-tooltip>
+
+          <!-- @ 知识库/文件选择按钮 -->
+          <t-tooltip placement="top" theme="light" :popupProps="{ overlayClassName: 'input-field-tooltip' }">
+            <template #content>
+              <div v-if="isMentionDisabled && isKnowledgeBaseDisabledByAgent" class="tooltip-with-link">
+                <span>{{ $t('input.kbDisabledByAgent') }}</span>
+                <a href="#" @click.prevent="handleGoToAgentSettings('knowledge')">{{ $t('input.goToAgentSettings')
+                }}</a>
               </div>
-              <div v-if="availableModels.length === 0" class="model-option empty">
-                {{ $t('input.noModel') }}
+              <span v-else>{{ allSelectedItems.length > 0 ? $t('input.knowledgeBaseWithCount', {
+                count:
+                  allSelectedItems.length
+              }) : $t('input.knowledgeBase') }}</span>
+            </template>
+            <div ref="atButtonRef" class="control-btn kb-btn" data-guide="chat-kb-mention" :class="{
+              'active': allSelectedItems.length > 0,
+              'disabled': isMentionDisabled
+            }" @click.stop @mousedown.prevent="triggerMention">
+              <svg width="18" height="18" viewBox="0 0 20 20" fill="none" xmlns="http://www.w3.org/2000/svg"
+                class="control-icon at-icon">
+                <circle cx="10" cy="10" r="3.5" stroke="currentColor" stroke-width="1.8" />
+                <path
+                  d="M13.5 10V11.5C13.5 12.163 13.7634 12.7989 14.2322 13.2678C14.7011 13.7366 15.337 14 16 14C16.663 14 17.2989 13.7366 17.7678 13.2678C18.2366 12.7989 18.5 12.163 18.5 11.5V10C18.5 7.74566 17.6045 5.58365 16.0104 3.98959C14.4163 2.39553 12.2543 1.5 10 1.5C7.74566 1.5 5.58365 2.39553 3.98959 3.98959C2.39553 5.58365 1.5 7.74566 1.5 10C1.5 12.2543 2.39553 14.4163 3.98959 16.0104C5.58365 17.6045 7.74566 18.5 10 18.5H12"
+                  stroke="currentColor" stroke-width="1.8" stroke-linecap="round" stroke-linejoin="round" />
+              </svg>
+              <span v-if="allSelectedItems.length > 0" class="kb-count">{{ allSelectedItems.length }}</span>
+            </div>
+          </t-tooltip>
+
+          <!-- 模型显示 -->
+          <t-tooltip :content="isModelLockedByAgent ? $t('input.modelLockedByAgent') : ''"
+            :disabled="!isModelLockedByAgent">
+            <div class="model-display" :class="{ 'agent-controlled': isModelLockedByAgent }">
+              <div ref="modelButtonRef" class="model-selector-trigger" @click.stop="toggleModelSelector">
+                <span class="model-selector-name">
+                  {{ selectedModelDisplayName }}
+                </span>
+                <span
+                  v-if="selectedModelContextLabel"
+                  class="model-selector-ctx"
+                  :class="{ 'is-default': selectedModelContextIsDefault }"
+                  :title="selectedModelContextTitle"
+                >{{ selectedModelContextLabel }}</span>
+                <svg width="12" height="12" viewBox="0 0 12 12" fill="currentColor" class="model-dropdown-arrow"
+                  :class="{ 'rotate': showModelSelector }">
+                  <path d="M2.5 4.5L6 8L9.5 4.5H2.5Z" />
+                </svg>
               </div>
             </div>
-          </div>
+          </t-tooltip>
         </div>
-      </Teleport>
 
-      <!-- 右侧控制按钮组 -->
-      <div class="control-right">
-        <!-- 停止按钮（仅在回复中时显示） -->
-        <t-tooltip 
-          v-if="isReplying"
-          :content="$t('input.stopGeneration')"
-          placement="top"
-        >
-          <div 
-            @click="handleStop" 
-            class="control-btn stop-btn"
-          >
-            <svg width="16" height="16" viewBox="0 0 16 16" fill="currentColor">
-              <rect x="5" y="5" width="6" height="6" rx="1" />
-            </svg>
+        <Teleport to="body">
+          <div v-if="showModelSelector" class="model-selector-overlay" @click="closeModelSelector">
+            <div class="model-selector-dropdown" :style="modelDropdownStyle" @click.stop>
+              <div class="model-selector-header">
+                <span>{{ $t('conversationSettings.models.chatGroupLabel') }}</span>
+                <button class="model-selector-add" type="button" @click="handleModelChange('__add_model__')">
+                  <span class="add-icon">+</span>
+                  <span class="add-text">{{ $t('input.addModel') }}</span>
+                </button>
+              </div>
+              <div class="model-selector-content">
+                <div v-for="model in availableModels" :key="model.id" class="model-option"
+                  :class="{ selected: model.id === selectedModelId }" @click="handleModelChange(model.id || '')">
+                  <div class="model-option-left">
+                    <div class="model-option-icon">
+                      <t-icon name="chat" size="14px" />
+                    </div>
+                    <div class="model-option-name-wrap">
+                      <span class="model-option-name">{{ modelDisplayName(model) }}</span>
+                      <span v-if="model.display_name" class="model-option-raw-name">{{ model.name }}</span>
+                    </div>
+                  </div>
+                  <span
+                    class="model-option-ctx"
+                    :class="{ 'is-default': isDefaultContextWindow(model.parameters?.context_window) }"
+                    :title="contextWindowTitle(model.parameters?.context_window)"
+                  >{{ formatContextWindow(model.parameters?.context_window) }}</span>
+                </div>
+                <div v-if="availableModels.length === 0" class="model-option empty">
+                  {{ $t('input.noModel') }}
+                </div>
+              </div>
+            </div>
           </div>
-        </t-tooltip>
+        </Teleport>
 
-        <!-- 发送按钮 -->
-      <div 
-          v-if="!isReplying"
-        @click="createSession(query)" 
-        class="control-btn send-btn"
-        :class="{ 'disabled': !query.length }"
-      >
-        <img src="../assets/img/sending-aircraft.svg" :alt="$t('input.send')" />
+        <!-- 右侧控制按钮组 -->
+        <div class="control-right">
+          <!-- 停止按钮（仅在回复中时显示） -->
+          <t-tooltip v-if="isReplying" :content="$t('input.stopGeneration')" placement="top">
+            <div @click="handleStop" class="control-btn stop-btn">
+              <svg width="16" height="16" viewBox="0 0 16 16" fill="currentColor">
+                <rect x="5" y="5" width="6" height="6" rx="1" />
+              </svg>
+            </div>
+          </t-tooltip>
+
+          <!-- 发送按钮 -->
+          <div v-if="!isReplying" @click="createSession(query)" class="control-btn send-btn" data-guide="chat-send"
+            :class="{ 'disabled': !query.length }">
+            <img src="../assets/img/sending-aircraft.svg" :alt="$t('input.send')" />
+          </div>
         </div>
       </div>
     </div>
 
+    <!-- Mention Selector -->
+    <Teleport to="body">
+      <MentionSelector ref="mentionSelectorRef" :visible="showMention" :style="mentionStyle" :items="mentionItems" :hasMore="mentionHasMore"
+        :loading="mentionLoading" :emptyHint="mentionEmptyHint" :query="mentionQuery" :group-counts="mentionGroupCounts" v-model:activeIndex="mentionActiveIndex"
+        @select="onMentionSelect" @loadMore="loadMoreMentionItems" />
+    </Teleport>
+
     <!-- 知识库选择下拉（使用 Teleport 传送到 body，避免父容器定位影响） -->
     <Teleport to="body">
-    <KnowledgeBaseSelector
-      v-model:visible="showKbSelector"
-        :anchorEl="atButtonRef"
-      @close="showKbSelector = false"
-    />
+      <KnowledgeBaseSelector v-model:visible="showKbSelector" :anchorEl="atButtonRef" @close="showKbSelector = false" />
     </Teleport>
   </div>
 </template>
@@ -2307,6 +2780,8 @@ const getImgSrc = (url: string) => {
 }
 </script>
 <style scoped lang="less">
+@import './css/chat-resource-chips.less';
+
 .answers-input {
   position: absolute;
   z-index: 99;
@@ -2316,18 +2791,30 @@ const getImgSrc = (url: string) => {
   width: 100%;
   display: flex;
   justify-content: center;
+
+  &.is-embedded {
+    position: relative;
+    bottom: auto;
+    left: auto;
+    transform: none;
+    z-index: auto;
+
+    .rich-input-container {
+      max-width: 100%;
+    }
+  }
 }
 
 /* 富文本输入框容器 */
 .rich-input-container {
   position: relative;
   width: 100%;
-  max-width: 800px;
+  max-width: 960px;
   background: var(--td-bg-color-container, #FFF);
   border-radius: 12px;
-  border: .5px solid var(--td-component-border, #E7E7E7);
-  box-shadow: 0 6px 6px 0 rgba(0, 0, 0, 0.04), 0 12px 12px -1px rgba(0, 0, 0, 0.08);
-  
+  border: 1px solid var(--td-component-stroke, #dcdcdc);
+  box-shadow: 0 2px 8px rgba(0, 0, 0, 0.04), 0 8px 16px -4px rgba(0, 0, 0, 0.06);
+
   &:focus-within {
     border-color: var(--td-brand-color, #07C05F);
   }
@@ -2340,24 +2827,31 @@ const getImgSrc = (url: string) => {
   align-items: center;
   gap: 5px;
   padding: 6px 12px 6px;
-  border-bottom: .5px solid var(--td-component-stroke, #e7e7e7);
+  border-bottom: 1px solid var(--td-component-stroke, #dcdcdc);
   background: var(--td-bg-color-container, #fff);
-  border-radius: 11px 11px 0 0; /* 与 .rich-input-container 内缘上边圆角一致（12px - 1px 边框） */
+  border-radius: 11px 11px 0 0;
+  /* 与 .rich-input-container 内缘上边圆角一致（12px - 1px 边框） */
 }
 
 .mention-chip {
+  .chat-resource-chip-surface();
+
   display: inline-flex;
   align-items: center;
-  gap: 4px;
-  padding: 3px 6px 3px 5px;
-  border-radius: 6px;
+  gap: 5px;
+  min-height: 26px;
+  padding: 3px 7px 3px 6px;
+  border-radius: var(--td-radius-medium, 6px);
+  box-sizing: border-box;
   font-size: 12px;
   font-weight: 500;
   cursor: default;
-  transition: background 0.2s, border-color 0.2s, box-shadow 0.2s;
-  border: .5px solid transparent;
-  color: var(--td-text-color-primary, #1f2937);
-  line-height: 1.3;
+  transition: background 0.15s, border-color 0.15s;
+  line-height: 18px;
+
+  &:hover {
+    .chat-resource-chip-hover();
+  }
 }
 
 .mention-chip__icon-wrap {
@@ -2365,10 +2859,10 @@ const getImgSrc = (url: string) => {
   display: inline-flex;
   width: 16px;
   height: 16px;
-  flex-shrink: 0;
+  flex: 0 1 auto;
+  min-width: 0;
   align-items: center;
   justify-content: center;
-  border-radius: 3px;
 }
 
 .mention-chip__icon {
@@ -2420,7 +2914,7 @@ const getImgSrc = (url: string) => {
   line-height: 1;
   font-weight: 400;
   cursor: pointer;
-  opacity: 0.45;
+  opacity: 0.5;
   transition: opacity 0.15s, background 0.15s, color 0.15s;
   color: currentColor;
   flex-shrink: 0;
@@ -2432,72 +2926,57 @@ const getImgSrc = (url: string) => {
 
 .mention-chip__remove:hover {
   opacity: 1;
-  background: rgba(0, 0, 0, 0.08);
+  background: var(--td-bg-color-component);
   color: var(--td-text-color-primary, #1f2937);
 }
 
-/* 知识库：浅绿/青色调 */
+/* 标签表面保持中性，仅用图标颜色表达资源类型。 */
 .mention-chip--kb {
-  background: rgba(5, 192, 95, 0.08);
-  border-color: rgba(5, 192, 95, 0.25);
-  color: var(--td-text-color-primary, #1f2937);
+  color: var(--td-text-color-primary);
 }
 
 .mention-chip--kb .mention-chip__icon-wrap {
-  background: rgba(5, 192, 95, 0.12);
   color: var(--td-brand-color, #07c05f);
 }
 
-.mention-chip--kb:hover {
-  background: rgba(5, 192, 95, 0.12);
-  border-color: rgba(5, 192, 95, 0.35);
-}
-
-/* FAQ：浅紫/靛色调 */
 .mention-chip--faq {
-  background: rgba(107, 114, 228, 0.08);
-  border-color: rgba(107, 114, 228, 0.25);
-  color: var(--td-text-color-primary, #1f2937);
+  color: var(--td-text-color-primary);
 }
 
 .mention-chip--faq .mention-chip__icon-wrap {
-  background: rgba(107, 114, 228, 0.12);
-  color: var(--td-brand-color);
+  color: var(--weknora-faq-color, #0052d9);
 }
 
-.mention-chip--faq:hover {
-  background: rgba(107, 114, 228, 0.12);
-  border-color: rgba(107, 114, 228, 0.35);
-}
-
-/* 文件：浅灰/中性色 */
 .mention-chip--file {
-  background: var(--td-bg-color-secondarycontainer, #f3f4f6);
-  border-color: var(--td-component-stroke, #e5e7eb);
-  color: var(--td-text-color-primary, #1f2937);
+  color: var(--td-text-color-primary);
 }
 
 .mention-chip--file .mention-chip__icon-wrap {
-  background: rgba(107, 114, 128, 0.12);
   color: var(--td-text-color-secondary, #6b7280);
 }
 
-.mention-chip--file:hover {
-  background: var(--td-bg-color-component, #e5e7eb);
-  border-color: var(--td-component-stroke, #d1d5db);
+.mention-chip--tag,
+.mention-chip--mcp,
+.mention-chip--tool {
+  color: var(--td-text-color-primary);
+}
+
+.mention-chip--tag .mention-chip__icon-wrap {
+  color: #9f7aea;
+}
+
+.mention-chip--mcp .mention-chip__icon-wrap {
+  color: #0f766e;
+}
+
+.mention-chip--tool .mention-chip__icon-wrap {
+  color: #b7791f;
 }
 
 /* 智能体预配置：虚线边框区分 */
 .mention-chip--agent {
   border-style: dashed;
-}
-
-.mention-chip--agent.mention-chip--kb {
-  border-color: rgba(5, 192, 95, 0.4);
-}
-
-.mention-chip--agent.mention-chip--faq {
-  border-color: rgba(107, 114, 228, 0.4);
+  border-color: var(--td-component-border);
 }
 
 :deep(.t-textarea__inner) {
@@ -2509,7 +2988,7 @@ const getImgSrc = (url: string) => {
   font-size: 16px;
   font-weight: 400;
   line-height: 24px;
-  font-family: var(--td-font-family, "PingFang SC");
+  font-family: var(--app-font-family);
   padding: 12px 16px 56px 16px;
   border-radius: 0 0 12px 12px;
   border: none;
@@ -2524,7 +3003,7 @@ const getImgSrc = (url: string) => {
 
   &::placeholder {
     color: var(--td-text-color-placeholder, #00000066);
-    font-family: var(--td-font-family, "PingFang SC");
+    font-family: var(--app-font-family);
     font-size: 16px;
     font-weight: 400;
     line-height: 24px;
@@ -2553,6 +3032,10 @@ const getImgSrc = (url: string) => {
   background: linear-gradient(to bottom, rgba(255, 255, 255, 0) 0%, var(--td-bg-color-container, #fff) 40%, var(--td-bg-color-container, #fff) 100%);
   pointer-events: auto;
   padding-top: 8px;
+
+  &.is-embedded {
+    justify-content: flex-end;
+  }
 }
 
 .control-left {
@@ -2584,7 +3067,7 @@ const getImgSrc = (url: string) => {
   &.disabled {
     opacity: 0.5;
     cursor: not-allowed;
-    
+
     &:hover {
       background: var(--td-bg-color-secondarycontainer, #f5f5f5);
     }
@@ -2632,45 +3115,50 @@ const getImgSrc = (url: string) => {
 
 .kb-btn {
   height: 28px;
-  padding: 0 10px;
-  min-width: auto;
+  width: 30px;
+  padding: 0;
+  min-width: 30px;
   position: relative;
-  
+
   &.active {
-    background: rgba(16, 185, 129, 0.1);
+    background: var(--td-bg-color-secondarycontainer);
     color: var(--td-brand-color);
-    
+    box-shadow: inset 0 0 0 1px var(--td-component-stroke);
+
     &:hover {
-      background: rgba(16, 185, 129, 0.15);
+      background: var(--td-bg-color-secondarycontainer-hover);
     }
   }
-  
+
   &.agent-controlled {
     cursor: not-allowed;
     opacity: 0.85;
-    
+
     &:hover {
       background: var(--td-bg-color-secondarycontainer, #f5f5f5);
     }
-    
+
     &.active:hover {
-      background: rgba(16, 185, 129, 0.1);
+      background: var(--td-bg-color-secondarycontainer);
     }
   }
 }
 
 .kb-count {
   position: absolute;
-  top: -4px;
-  right: -4px;
-  min-width: 16px;
-  height: 16px;
-  padding: 0 4px;
+  top: -5px;
+  right: -5px;
+  min-width: 15px;
+  height: 15px;
+  padding: 0 3px;
   background: var(--td-brand-color);
-  color: white;
-  font-size: 10px;
+  color: var(--td-text-color-anti, #fff);
+  font-size: 9px;
   font-weight: 600;
-  border-radius: 8px;
+  line-height: 15px;
+  border: 2px solid var(--td-bg-color-container);
+  border-radius: var(--td-radius-round, 999px);
+  box-sizing: content-box;
   display: flex;
   align-items: center;
   justify-content: center;
@@ -2817,41 +3305,41 @@ const getImgSrc = (url: string) => {
   align-items: center;
   justify-content: center;
   position: relative;
-  
+
   &.active {
     background: rgba(16, 185, 129, 0.1);
-    
+
     .websearch-icon {
       color: var(--td-brand-color);
     }
-    
+
     &:hover {
       background: rgba(16, 185, 129, 0.15);
     }
   }
-  
+
   &:not(.active) {
     .websearch-icon {
       color: var(--td-text-color-secondary, #666);
     }
-    
+
     &:hover {
       background: var(--td-bg-color-secondarycontainer-hover, #f0f0f0);
-      
+
       .websearch-icon {
         color: var(--td-text-color-primary, #333);
       }
     }
   }
-  
+
   &.agent-controlled {
     cursor: not-allowed;
     opacity: 0.85;
-    
+
     &:hover {
       background: var(--td-bg-color-secondarycontainer, #f5f5f5);
     }
-    
+
     &.active:hover {
       background: rgba(16, 185, 129, 0.1);
     }
@@ -2894,7 +3382,7 @@ const getImgSrc = (url: string) => {
   height: 10px;
   margin-left: 2px;
   transition: transform 0.12s;
-  
+
   &.rotate {
     transform: rotate(180deg);
   }
@@ -2917,20 +3405,20 @@ const getImgSrc = (url: string) => {
   display: flex;
   align-items: center;
   justify-content: center;
-  
+
   &:hover {
     background: rgba(16, 185, 129, 0.12);
     border-color: var(--td-brand-color);
   }
-  
+
   &:active {
     background: rgba(16, 185, 129, 0.15);
   }
-  
+
   svg {
     display: none;
   }
-  
+
   &::before {
     content: '';
     width: 12px;
@@ -2943,10 +3431,13 @@ const getImgSrc = (url: string) => {
 }
 
 @keyframes stopBtnPulse {
-  0%, 100% {
+
+  0%,
+  100% {
     transform: scale(1);
     opacity: 1;
   }
+
   50% {
     transform: scale(0.75);
     opacity: 0.6;
@@ -2958,15 +3449,15 @@ const getImgSrc = (url: string) => {
   height: 28px;
   padding: 0;
   background-color: var(--td-brand-color);
-  
+
   &:hover:not(.disabled) {
     background-color: var(--td-brand-color-active);
   }
-  
+
   &.disabled {
     background-color: var(--td-success-color-light);
   }
-  
+
   img {
     width: 16px;
     height: 16px;
@@ -3024,13 +3515,25 @@ const getImgSrc = (url: string) => {
   white-space: nowrap;
 }
 
+.model-selector-ctx {
+  flex-shrink: 0;
+  font-size: 11px;
+  font-variant-numeric: tabular-nums;
+  color: var(--td-text-color-placeholder, #999);
+  font-weight: 400;
+
+  &.is-default {
+    opacity: 0.85;
+  }
+}
+
 .model-dropdown-arrow {
   width: 10px;
   height: 10px;
   color: var(--td-text-color-placeholder, #999);
   flex-shrink: 0;
   transition: transform 0.12s;
-  
+
   &.rotate {
     transform: rotate(180deg);
   }
@@ -3043,41 +3546,56 @@ const getImgSrc = (url: string) => {
 .model-selector-overlay {
   position: fixed;
   inset: 0;
-  z-index: 9998;
+  z-index: 9999;
   background: transparent;
   touch-action: none;
 }
 
 .model-selector-dropdown {
   position: fixed !important;
-  z-index: 9999;
-  background: var(--td-bg-color-container, #fff);
+  z-index: 10000;
+  background: var(--td-bg-color-container);
+  border: .5px solid var(--td-component-border);
   border-radius: 10px;
-  box-shadow: var(--td-shadow-2, 0 6px 28px rgba(15, 23, 42, 0.08));
-  border: .5px solid var(--td-component-border, #e7e9eb);
+  box-shadow: var(--td-shadow-2);
   overflow: hidden;
   display: flex;
   flex-direction: column;
   margin: 0 !important;
   padding: 0 !important;
   transform: none !important;
+  transform-origin: top left;
+  animation: modelSelectorFadeIn 0.15s ease-out;
+}
+
+@keyframes modelSelectorFadeIn {
+  from {
+    opacity: 0;
+    transform: scale(0.98);
+  }
+
+  to {
+    opacity: 1;
+    transform: scale(1);
+  }
 }
 
 .model-selector-header {
   display: flex;
   align-items: center;
   justify-content: space-between;
-  padding: 8px 12px;
-  border-bottom: .5px solid var(--td-component-stroke, #f0f0f0);
-  background: var(--td-bg-color-container, #fff);
+  padding: 8px 10px;
+  border-bottom: .5px solid var(--td-component-stroke);
+  background: var(--td-bg-color-container);
   font-size: 12px;
   font-weight: 500;
-  color: var(--td-text-color-secondary, #666);
+  color: var(--td-text-color-secondary);
 }
 
 .model-selector-content {
   flex: 1;
   min-height: 0;
+  max-height: 260px;
   overflow-y: auto;
   overscroll-behavior: contain;
   -webkit-overflow-scrolling: touch;
@@ -3089,107 +3607,113 @@ const getImgSrc = (url: string) => {
   align-items: center;
   gap: 4px;
   padding: 2px 8px;
-  border-radius: 4px;
+  border-radius: 6px;
   border: .5px solid transparent;
   background: transparent;
-  color: var(--td-brand-color, #07c05f);
+  color: var(--td-brand-color);
   font-size: 12px;
   font-weight: 500;
   cursor: pointer;
-  transition: all 0.2s;
-  
+  transition: all 0.12s;
+
   .add-icon {
     font-size: 14px;
     line-height: 1;
     font-weight: 400;
   }
-  
+
   &:hover {
-    color: var(--td-brand-color-hover, #05a04f);
-    background: var(--td-bg-color-secondarycontainer, #f3f3f3);
+    color: var(--td-brand-color-hover);
+    background: var(--td-bg-color-secondarycontainer);
   }
 }
 
 .model-option {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: 8px;
   padding: 6px 8px;
   cursor: pointer;
   transition: background 0.12s;
   border-radius: 6px;
   margin-bottom: 4px;
-  
+
   &:last-child {
     margin-bottom: 0;
   }
-  
-  &:hover {
-    background: var(--td-bg-color-container-hover, #f6f8f7);
-  }
-  
+
+  &:hover,
   &.selected {
-    background: var(--td-brand-color-light, #eefdf5);
-    
-    .model-option-name {
-      color: var(--td-success-color);
-      font-weight: 600;
-    }
+    background: var(--td-bg-color-secondarycontainer);
   }
-  
+
   &.empty {
-    color: var(--td-text-color-disabled, #9aa0a6);
+    color: var(--td-text-color-placeholder);
     cursor: default;
     text-align: center;
     padding: 20px 8px;
-    
+
     &:hover {
       background: transparent;
     }
   }
 }
 
-.model-option-main {
+.model-option-left {
   display: flex;
   align-items: center;
-  gap: 6px;
-  margin-bottom: 1px;
+  gap: 8px;
+  min-width: 0;
+  flex: 1;
+}
+
+.model-option-icon {
+  width: 16px;
+  height: 16px;
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  flex-shrink: 0;
+  color: var(--td-text-color-secondary);
+}
+
+.model-option-name-wrap {
+  display: flex;
+  align-items: center;
+  gap: 4px;
+  min-width: 0;
+  flex: 1;
 }
 
 .model-option-name {
   font-size: 12px;
-  color: var(--td-text-color-primary, #222);
-  flex: 1;
+  color: var(--td-text-color-primary);
+  white-space: nowrap;
   overflow: hidden;
   text-overflow: ellipsis;
-  white-space: nowrap;
   line-height: 1.4;
 }
 
-.model-option-desc {
+.model-option-raw-name {
   font-size: 11px;
-  color: var(--td-text-color-secondary, #8b9196);
-  overflow: hidden;
-  text-overflow: ellipsis;
-  white-space: nowrap;
-  margin-top: 1px;
-}
-
-.model-badge-remote,
-.model-badge-local {
-  display: inline-block;
-  padding: 1px 5px;
-  font-size: 10px;
-  border-radius: 3px;
-  font-weight: 500;
+  color: var(--td-text-color-placeholder);
   flex-shrink: 0;
 }
 
-.model-badge-remote {
-  background: rgba(16, 185, 129, 0.1);
-  color: var(--td-success-color);
-}
-
-.model-badge-local {
-  background: rgba(139, 145, 150, 0.1);
+.model-option-ctx {
+  flex-shrink: 0;
+  font-size: 11px;
+  font-variant-numeric: tabular-nums;
   color: var(--td-text-color-secondary);
+  background: var(--td-bg-color-secondarycontainer);
+  padding: 0 6px;
+  border-radius: 4px;
+  line-height: 18px;
+
+  &.is-default {
+    color: var(--td-text-color-placeholder);
+  }
 }
 
 /* Agent 模式选择下拉菜单 */
@@ -3228,23 +3752,23 @@ const getImgSrc = (url: string) => {
   border-radius: 6px;
   position: relative;
   margin: 4px 6px;
-  
+
   &:hover:not(.disabled) {
     background: var(--td-bg-color-container-hover, #f6f8f7);
   }
-  
+
   &.disabled {
     opacity: 0.6;
     cursor: not-allowed;
-    
+
     &:hover {
       background: transparent;
     }
   }
-  
+
   &.selected {
     background: var(--td-brand-color-light, #eefdf5);
-    
+
     .agent-mode-option-name {
       color: var(--td-success-color);
       font-weight: 700;
@@ -3286,7 +3810,7 @@ const getImgSrc = (url: string) => {
   display: flex;
   align-items: center;
   margin-left: 6px;
-  
+
   .warning-icon {
     color: var(--td-warning-color);
     font-size: 14px;
@@ -3309,12 +3833,10 @@ const getImgSrc = (url: string) => {
   align-items: center;
   gap: 3px;
   transition: all 0.12s;
-  
+
   &:hover {
     color: var(--td-brand-color-active);
     text-decoration: underline;
   }
 }
 </style>
-
-

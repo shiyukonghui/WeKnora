@@ -38,6 +38,25 @@ func (r OrgMemberRole) HasPermission(required OrgMemberRole) bool {
 	return roleLevel[r] >= roleLevel[required]
 }
 
+// MinOrgRole returns whichever of a / b is the lower role on the
+// admin > editor > viewer ladder. Used to apply caps when combining
+// (a) the share's grant, (b) the tenant's role inside the org, and
+// (c) the caller's tenant-RBAC ceiling. A zero/empty role is treated
+// as "less than viewer" so it short-circuits to whatever the other
+// argument is.
+func MinOrgRole(a, b OrgMemberRole) OrgMemberRole {
+	if a == "" {
+		return b
+	}
+	if b == "" {
+		return a
+	}
+	if a.HasPermission(b) {
+		return b
+	}
+	return a
+}
+
 // Organization represents a collaboration organization for cross-tenant sharing
 type Organization struct {
 	// Unique identifier of the organization
@@ -50,6 +69,13 @@ type Organization struct {
 	Avatar string `json:"avatar" gorm:"type:varchar(512)"`
 	// User ID of the organization owner
 	OwnerID string `json:"owner_id" gorm:"type:varchar(36);not null;index"`
+	// OwnerTenantID is the tenant the owner belonged to when the
+	// organization was created. Plan 3 (#1303) treats this tenant as
+	// the org's "owning tenant": its membership row in
+	// organization_tenant_members is undeletable / unchangeable so
+	// the org can never be orphaned even if the owner user later
+	// switches tenants or is soft-deleted. See migration 000046.
+	OwnerTenantID uint64 `json:"owner_tenant_id" gorm:"not null;index"`
 	// Unique invitation code for joining the organization
 	InviteCode string `json:"invite_code" gorm:"type:varchar(32);uniqueIndex"`
 	// When the current invite code expires; nil means no expiry
@@ -70,9 +96,9 @@ type Organization struct {
 	DeletedAt gorm.DeletedAt `json:"deleted_at" gorm:"index"`
 
 	// Associations (not stored in database)
-	Owner   *User                `json:"owner,omitempty" gorm:"foreignKey:OwnerID"`
-	Members []OrganizationMember `json:"members,omitempty" gorm:"foreignKey:OrganizationID"`
-	Shares  []KnowledgeBaseShare `json:"shares,omitempty" gorm:"foreignKey:OrganizationID"`
+	Owner   *User                      `json:"owner,omitempty" gorm:"foreignKey:OwnerID"`
+	Members []OrganizationTenantMember `json:"members,omitempty" gorm:"foreignKey:OrganizationID"`
+	Shares  []KnowledgeBaseShare       `json:"shares,omitempty" gorm:"foreignKey:OrganizationID"`
 }
 
 // TableName returns the table name for GORM
@@ -80,31 +106,29 @@ func (Organization) TableName() string {
 	return "organizations"
 }
 
-// OrganizationMember represents a member of an organization
-type OrganizationMember struct {
-	// Unique identifier
-	ID string `json:"id" gorm:"type:varchar(36);primaryKey"`
-	// Organization ID
-	OrganizationID string `json:"organization_id" gorm:"type:varchar(36);not null;index"`
-	// User ID of the member
-	UserID string `json:"user_id" gorm:"type:varchar(36);not null;index"`
-	// Tenant ID that the member belongs to
-	TenantID uint64 `json:"tenant_id" gorm:"not null;index"`
-	// Role in the organization (admin/editor/viewer)
-	Role OrgMemberRole `json:"role" gorm:"type:varchar(32);not null;default:'viewer'"`
-	// Creation time
-	CreatedAt time.Time `json:"created_at"`
-	// Last updated time
-	UpdatedAt time.Time `json:"updated_at"`
+// OrganizationTenantMember represents a tenant participating in an
+// organization. Plan 3 of #1303 lifts the "Org member" abstraction from
+// per-user (`organization_members`) to per-tenant (this table). The
+// representative_user_id is informational only — the user who first
+// brought this tenant into the org — and is used purely for UI/audit
+// labels. Permission checks are driven exclusively by (org, tenant, role).
+type OrganizationTenantMember struct {
+	ID                   string        `json:"id" gorm:"type:varchar(36);primaryKey"`
+	OrganizationID       string        `json:"organization_id" gorm:"type:varchar(36);not null;index"`
+	TenantID             uint64        `json:"tenant_id" gorm:"not null;index"`
+	Role                 OrgMemberRole `json:"role" gorm:"type:varchar(32);not null;default:'viewer'"`
+	RepresentativeUserID string        `json:"representative_user_id" gorm:"type:varchar(36);default:''"`
+	JoinedAt             *time.Time    `json:"joined_at"`
+	CreatedAt            time.Time     `json:"created_at"`
+	UpdatedAt            time.Time     `json:"updated_at"`
 
-	// Associations (not stored in database)
-	Organization *Organization `json:"organization,omitempty" gorm:"foreignKey:OrganizationID"`
-	User         *User         `json:"user,omitempty" gorm:"foreignKey:UserID"`
+	Organization       *Organization `json:"organization,omitempty" gorm:"foreignKey:OrganizationID"`
+	RepresentativeUser *User         `json:"representative_user,omitempty" gorm:"foreignKey:RepresentativeUserID"`
 }
 
 // TableName returns the table name for GORM
-func (OrganizationMember) TableName() string {
-	return "organization_members"
+func (OrganizationTenantMember) TableName() string {
+	return "organization_tenant_members"
 }
 
 // JoinRequestStatus represents the status of a join request
@@ -232,15 +256,19 @@ func (AgentShare) TableName() string {
 
 // SharedAgentInfo represents a shared agent with additional sharing info
 type SharedAgentInfo struct {
-	Agent             *CustomAgent  `json:"agent"`
-	ShareID           string        `json:"share_id"`
-	OrganizationID    string        `json:"organization_id"`
-	OrgName           string        `json:"org_name"`
-	Permission        OrgMemberRole `json:"permission"`
-	SourceTenantID    uint64        `json:"source_tenant_id"`
-	SharedAt          time.Time     `json:"shared_at"`
-	SharedByUserID    string        `json:"shared_by_user_id,omitempty"`
-	SharedByUsername  string        `json:"shared_by_username,omitempty"`
+	Agent            *CustomAgent  `json:"agent"`
+	ShareID          string        `json:"share_id"`
+	OrganizationID   string        `json:"organization_id"`
+	OrgName          string        `json:"org_name"`
+	Permission       OrgMemberRole `json:"permission"`
+	SourceTenantID   uint64        `json:"source_tenant_id"`
+	SharedAt         time.Time     `json:"shared_at"`
+	SharedByUserID   string        `json:"shared_by_user_id,omitempty"`
+	SharedByUsername string        `json:"shared_by_username,omitempty"`
+	// WebSearchReady is resolved against the source workspace without exposing
+	// its provider list or credentials. Receivers must not compare the agent's
+	// provider ID with their own workspace resources.
+	WebSearchReady bool `json:"web_search_ready"`
 	// DisabledByMe: current tenant has hidden this shared agent from their conversation dropdown (per-user preference)
 	DisabledByMe bool `json:"disabled_by_me"`
 }
@@ -256,7 +284,7 @@ type SourceFromAgentInfo struct {
 // When SourceFromAgent is set, the KB is from a shared agent's config (no direct KB share); show as read-only and "来自智能体 XXX".
 type OrganizationSharedKnowledgeBaseItem struct {
 	SharedKnowledgeBaseInfo
-	IsMine          bool                `json:"is_mine"`
+	IsMine          bool                 `json:"is_mine"`
 	SourceFromAgent *SourceFromAgentInfo `json:"source_from_agent,omitempty"`
 }
 
@@ -339,10 +367,26 @@ type RequestRoleUpgradeRequest struct {
 	Message       string        `json:"message" binding:"max=500"`         // Optional message explaining the reason
 }
 
-// InviteMemberRequest represents a request to directly invite a user to organization
+// InviteMemberRequest represents a request to directly invite a workspace to an organization.
+//
+// Plan 3 (#1303) moved membership to the workspace level: an invitation enrols a whole
+// workspace into the organization, with one user attached purely as the representative
+// (display/audit). Callers SHOULD set TenantID and optionally
+// RepresentativeUserID. For backward compatibility with older SDK callers that
+// still send UserID alone, the handler resolves that user's TenantID and uses
+// the user as the representative.
 type InviteMemberRequest struct {
-	UserID string        `json:"user_id" binding:"required"` // User ID to invite
-	Role   OrgMemberRole `json:"role" binding:"required"`    // Role to assign: admin/editor/viewer
+	// TenantID is the workspace to enrol as an org member. Preferred field.
+	TenantID uint64 `json:"tenant_id"`
+	// RepresentativeUserID identifies the user attached to the OTM row for
+	// display/audit. Optional: when unset, the handler picks a stable default
+	// (the user from the legacy UserID field, or the workspace's owner).
+	RepresentativeUserID string `json:"representative_user_id"`
+	// UserID is retained for backward compatibility. When set without
+	// TenantID, the handler resolves the user's TenantID and uses this
+	// user as the representative.
+	UserID string        `json:"user_id"`
+	Role   OrgMemberRole `json:"role" binding:"required"` // Role to assign: admin/editor/viewer
 }
 
 // ShareKnowledgeBaseRequest represents a request to share a knowledge base
@@ -358,11 +402,17 @@ type UpdateSharePermissionRequest struct {
 
 // OrganizationResponse represents an organization in API responses
 type OrganizationResponse struct {
-	ID                      string     `json:"id"`
-	Name                    string     `json:"name"`
-	Description             string     `json:"description"`
-	Avatar                  string     `json:"avatar,omitempty"`
-	OwnerID                 string     `json:"owner_id"`
+	ID          string `json:"id"`
+	Name        string `json:"name"`
+	Description string `json:"description"`
+	Avatar      string `json:"avatar,omitempty"`
+	OwnerID     string `json:"owner_id"`
+	// OwnerTenantID is the persisted owner workspace of the organization
+	// (Plan 3, migration 000046). Frontend uses this to identify the
+	// "owner row" in the workspace-keyed members list — comparing
+	// member.tenant_id against owner_tenant_id is the post-Plan-3
+	// equivalent of the old member.user_id == owner_id check.
+	OwnerTenantID           uint64     `json:"owner_tenant_id"`
 	InviteCode              string     `json:"invite_code,omitempty"`
 	InviteCodeExpiresAt     *time.Time `json:"invite_code_expires_at,omitempty"`
 	InviteCodeValidityDays  int        `json:"invite_code_validity_days"`
@@ -371,7 +421,7 @@ type OrganizationResponse struct {
 	MemberLimit             int        `json:"member_limit"` // 0 = unlimited
 	MemberCount             int        `json:"member_count"`
 	ShareCount              int        `json:"share_count"`                // 共享到该组织的知识库数量
-	AgentShareCount         int        `json:"agent_share_count"`        // 共享到该组织的智能体数量
+	AgentShareCount         int        `json:"agent_share_count"`          // 共享到该组织的智能体数量
 	PendingJoinRequestCount int        `json:"pending_join_request_count"` // 待审批加入申请数（仅管理员可见）
 	IsOwner                 bool       `json:"is_owner"`
 	MyRole                  string     `json:"my_role,omitempty"`
@@ -380,16 +430,39 @@ type OrganizationResponse struct {
 	UpdatedAt               time.Time  `json:"updated_at"`
 }
 
-// OrganizationMemberResponse represents a member in API responses
+// OrganizationMemberResponse represents a member in API responses.
+//
+// Post-Plan-3: every row is a (org, tenant) tuple. TenantID + TenantName
+// are the primary identity; UserID / Username / Email / Avatar describe
+// the representative user (informational, may be empty if the rep user
+// was soft-deleted). RepresentativeUserID is the same value as UserID,
+// kept as an explicit alias so frontends can stop relying on the
+// misleading user_id field name.
 type OrganizationMemberResponse struct {
-	ID       string    `json:"id"`
-	UserID   string    `json:"user_id"`
-	Username string    `json:"username"`
-	Email    string    `json:"email"`
-	Avatar   string    `json:"avatar"`
-	Role     string    `json:"role"`
-	TenantID uint64    `json:"tenant_id"`
-	JoinedAt time.Time `json:"joined_at"`
+	ID                   string    `json:"id"`
+	UserID               string    `json:"user_id"`
+	RepresentativeUserID string    `json:"representative_user_id"`
+	Username             string    `json:"username"`
+	Email                string    `json:"email"`
+	Avatar               string    `json:"avatar"`
+	Role                 string    `json:"role"`
+	TenantID             uint64    `json:"tenant_id"`
+	TenantName           string    `json:"tenant_name,omitempty"`
+	JoinedAt             time.Time `json:"joined_at"`
+}
+
+// TenantInviteCandidate is one row in the search-tenants-for-invite picker.
+// Plan 3 invites a tenant; users serve as labels. We surface the tenant
+// identity together with a "representative" user (the matching user that
+// caused this tenant to show up in the search). Multiple users may belong
+// to the same tenant; deduplication is by TenantID.
+type TenantInviteCandidate struct {
+	TenantID               uint64 `json:"tenant_id"`
+	TenantName             string `json:"tenant_name"`
+	RepresentativeUserID   string `json:"representative_user_id"`
+	RepresentativeUsername string `json:"representative_username"`
+	RepresentativeEmail    string `json:"representative_email"`
+	RepresentativeAvatar   string `json:"representative_avatar,omitempty"`
 }
 
 // KnowledgeBaseShareResponse represents a share record in API responses
@@ -427,10 +500,10 @@ type AgentShareResponse struct {
 	MyPermission     string    `json:"my_permission,omitempty"`
 	CreatedAt        time.Time `json:"created_at"`
 	// Agent scope summary for list display (from agent config when available)
-	ScopeKB        string `json:"scope_kb,omitempty"`        // "all" | "selected" | "none"
+	ScopeKB        string `json:"scope_kb,omitempty"`       // "all" | "selected" | "none"
 	ScopeKBCount   int    `json:"scope_kb_count,omitempty"` // when selected
 	ScopeWebSearch bool   `json:"scope_web_search,omitempty"`
-	ScopeMCP       string `json:"scope_mcp,omitempty"`        // "all" | "selected" | "none"
+	ScopeMCP       string `json:"scope_mcp,omitempty"`       // "all" | "selected" | "none"
 	ScopeMCPCount  int    `json:"scope_mcp_count,omitempty"` // when selected
 	// Agent avatar (emoji or icon name) for list display
 	AgentAvatar string `json:"agent_avatar,omitempty"`
@@ -438,8 +511,8 @@ type AgentShareResponse struct {
 
 // ListOrganizationsResponse represents the response for listing organizations
 type ListOrganizationsResponse struct {
-	Organizations  []OrganizationResponse     `json:"organizations"`
-	Total          int64                      `json:"total"`
+	Organizations  []OrganizationResponse       `json:"organizations"`
+	Total          int64                        `json:"total"`
 	ResourceCounts *ResourceCountsByOrgResponse `json:"resource_counts,omitempty"` // 各空间内知识库/智能体数量，供列表侧栏展示
 }
 

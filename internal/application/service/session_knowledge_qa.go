@@ -11,7 +11,9 @@ import (
 	"github.com/Tencent/WeKnora/internal/common"
 	"github.com/Tencent/WeKnora/internal/event"
 	"github.com/Tencent/WeKnora/internal/logger"
+	"github.com/Tencent/WeKnora/internal/modelcontext"
 	"github.com/Tencent/WeKnora/internal/models/chat"
+	"github.com/Tencent/WeKnora/internal/tracing/langfuse"
 	"github.com/Tencent/WeKnora/internal/types"
 )
 
@@ -25,15 +27,28 @@ func (s *sessionService) KnowledgeQA(
 ) error {
 	logger.Infof(
 		ctx,
-		"Knowledge base question answering parameters, session ID: %s, query: %s, webSearchEnabled: %v, enableMemory: %v",
+		"Knowledge base question answering parameters, session ID: %s, query: %s, webSearchEnabled: %v",
 		req.Session.ID,
 		req.Query,
 		req.WebSearchEnabled,
-		req.EnableMemory,
 	)
 
+	// Span the request setup (KB / model resolution, search target building,
+	// agent override application). This covers the visible gap between trace
+	// start and the first stage observation in the Langfuse timeline.
+	setupCtx, setupSpan := langfuse.GetManager().StartSpan(ctx, langfuse.SpanOptions{
+		Name: "qa.setup",
+		Metadata: map[string]interface{}{
+			"session_id": req.Session.ID,
+		},
+	})
+	ctx = setupCtx
+
 	// Resolve knowledge bases using shared helper
-	knowledgeBaseIDs, knowledgeIDs := s.resolveKnowledgeBases(ctx, req)
+	knowledgeBaseIDs, knowledgeIDs, err := s.resolveKnowledgeBases(ctx, req)
+	if err != nil {
+		return err
+	}
 
 	// Resolve chat model ID using shared helper
 	chatModelID, err := s.resolveChatModelID(ctx, req, knowledgeBaseIDs, knowledgeIDs)
@@ -72,9 +87,9 @@ func (s *sessionService) KnowledgeQA(
 	retrievalTenantID := s.resolveRetrievalTenantID(ctx, req)
 
 	// Build unified search targets (computed once, used throughout pipeline)
-	searchTargets, err := s.buildSearchTargets(ctx, retrievalTenantID, knowledgeBaseIDs, knowledgeIDs)
+	searchTargets, err := s.buildSearchTargets(ctx, retrievalTenantID, knowledgeBaseIDs, knowledgeIDs, req.TagScopes)
 	if err != nil {
-		logger.Warnf(ctx, "Failed to build search targets: %v", err)
+		return fmt.Errorf("build search targets: %w", err)
 	}
 
 	// Create chat management object with session settings
@@ -87,15 +102,11 @@ func (s *sessionService) KnowledgeQA(
 		len(searchTargets),
 	)
 
-	// Get UserID from context
-	userID, _ := types.UserIDFromContext(ctx)
-
 	chatManage := &types.ChatManage{
 		PipelineRequest: types.PipelineRequest{
 			Query:                   req.Query,
 			SessionID:               req.Session.ID,
-			UserID:                  userID,
-			EnableMemory:            req.EnableMemory,
+			UserID:                  types.SessionOwnerIDFromContext(ctx),
 			MaxRounds:               s.cfg.Conversation.MaxRounds,
 			KnowledgeBaseIDs:        knowledgeBaseIDs,
 			KnowledgeIDs:            knowledgeIDs,
@@ -142,8 +153,18 @@ func (s *sessionService) KnowledgeQA(
 	// rewrite, fallback, FAQ strategy, history turns)
 	s.applyAgentOverridesToChatManage(ctx, req.CustomAgent, chatManage)
 
-	// Determine pipeline based on knowledge bases availability and web search setting
-	hasKB := len(knowledgeBaseIDs) > 0 || len(knowledgeIDs) > 0
+	// An agent may opt out of long-term memory. The preference is per-request
+	// rather than per-user, so it travels in the context that the recall
+	// plugin reads.
+	if req.CustomAgent != nil {
+		ctx = types.ApplyAgentMemoryPreference(ctx, req.CustomAgent.Config.MemoryEnabled)
+	}
+
+	// Determine pipeline based on the effective knowledge retrieval scope and
+	// web search setting. Tag-only mentions leave the raw KB/knowledge ID slices
+	// empty but produce SearchTargets, so the unified targets must participate in
+	// this decision or the request is incorrectly downgraded to pure chat.
+	hasKB := types.HasKnowledgeRetrievalScope(searchTargets, knowledgeBaseIDs, knowledgeIDs)
 	needsRAG := hasKB || req.WebSearchEnabled
 	hasHistory := chatManage.MaxRounds > 0
 
@@ -165,21 +186,21 @@ func (s *sessionService) KnowledgeQA(
 
 		pipeline = types.NewPipelineBuilder().
 			AddIf(hasHistory, types.LOAD_HISTORY).
-			AddIf(chatManage.EnableMemory, types.MEMORY_RETRIEVAL).
+			Add(types.MEMORY_RECALL).
 			Add(types.CHAT_COMPLETION_STREAM).
-			AddIf(chatManage.EnableMemory, types.MEMORY_STORAGE).
 			Build()
 	} else {
 		// RAG — dynamically assemble based on feature flags.
 		pipeline = types.NewPipelineBuilder().
-			Add(types.LOAD_HISTORY).
+			AddIf(hasHistory, types.LOAD_HISTORY).
+			Add(types.MEMORY_RECALL).
 			Add(types.QUERY_UNDERSTAND).
 			Add(types.CHUNK_SEARCH_PARALLEL).
 			Add(types.CHUNK_RERANK).
 			AddIf(req.WebSearchEnabled, types.WEB_FETCH).
 			Add(types.CHUNK_MERGE).
 			Add(types.FILTER_TOP_K).
-			Add(types.DATA_ANALYSIS).
+			AddIf(chatManage.DataAnalysisEnabled, types.DATA_ANALYSIS).
 			Add(types.INTO_CHAT_MESSAGE).
 			Add(types.CHAT_COMPLETION_STREAM).
 			Build()
@@ -190,28 +211,21 @@ func (s *sessionService) KnowledgeQA(
 
 	// Start knowledge QA event processing (set session tenant so pipeline session/message lookups use session owner)
 	ctx = context.WithValue(ctx, types.SessionTenantIDContextKey, req.Session.TenantID)
+	// Propagate the session ID so stateful sandbox backends (CubeSandbox) can
+	// bind script execution to a per-session MicroVM instance.
+	ctx = types.WithSessionID(ctx, req.Session.ID)
 	logger.Info(ctx, "Triggering question answering event")
+	setupSpan.Finish(map[string]interface{}{
+		"stages":             len(pipeline),
+		"knowledge_base_ids": knowledgeBaseIDs,
+		"search_targets":     len(searchTargets),
+	}, nil, nil)
 	err = s.KnowledgeQAByEvent(ctx, chatManage, pipeline)
 	if err != nil {
 		logger.ErrorWithFields(ctx, err, map[string]interface{}{
 			"session_id": req.Session.ID,
 		})
 		return err
-	}
-
-	// Emit references event if we have search results
-	if len(chatManage.MergeResult) > 0 {
-		logger.Infof(ctx, "Emitting references event with %d results", len(chatManage.MergeResult))
-		if err := eventBus.Emit(ctx, event.Event{
-			ID:        generateEventID("references"),
-			Type:      event.EventAgentReferences,
-			SessionID: req.Session.ID,
-			Data: event.AgentReferencesData{
-				References: chatManage.MergeResult,
-			},
-		}); err != nil {
-			logger.Errorf(ctx, "Failed to emit references event: %v", err)
-		}
 	}
 
 	// Note: Answer events are now emitted directly by chat_completion_stream plugin
@@ -334,7 +348,7 @@ func (s *sessionService) resolveKnowledgeBasesFromAgent(
 		// trust the client here: a stale session payload or API caller could
 		// still ask us to retrieve against an incompatible KB and we'd rather
 		// just drop it (and log) than feed it to tools that would no-op.
-		capFilter := tools.DeriveKBFilterFromTools(customAgent.Config.AllowedTools)
+		capFilter := tools.DeriveKBFilterForAgent(customAgent.Config.AgentMode, customAgent.Config.AllowedTools)
 		accept := func(kb *types.KnowledgeBase) bool {
 			if kb == nil {
 				return false
@@ -342,7 +356,7 @@ func (s *sessionService) resolveKnowledgeBasesFromAgent(
 			if capFilter.IsEmpty() {
 				return true
 			}
-			return tools.KBSatisfiesToolRequirements(kb.Capabilities(), customAgent.Config.AllowedTools)
+			return tools.KBSatisfiesAgentRequirements(kb.Capabilities(), customAgent.Config.AgentMode, customAgent.Config.AllowedTools)
 		}
 
 		// Get own knowledge bases (uses ctx TenantID = agent's tenant)
@@ -372,7 +386,8 @@ func (s *sessionService) resolveKnowledgeBasesFromAgent(
 			userIDVal := ctx.Value(types.UserIDContextKey)
 			if userIDVal != nil {
 				if userID, ok := userIDVal.(string); ok && userID != "" && s.kbShareService != nil {
-					sharedList, err := s.kbShareService.ListSharedKnowledgeBases(ctx, userID, tenantID)
+					callerTenantRole := types.TenantRoleFromContext(ctx)
+					sharedList, err := s.kbShareService.ListSharedKnowledgeBases(ctx, tenantID, callerTenantRole)
 					if err != nil {
 						logger.Warnf(ctx, "Failed to list shared knowledge bases: %v", err)
 					} else {
@@ -428,8 +443,11 @@ func (s *sessionService) buildSearchTargets(
 	tenantID uint64,
 	knowledgeBaseIDs []string,
 	knowledgeIDs []string,
+	tagScopes []types.TagScope,
 ) (types.SearchTargets, error) {
+	caller := types.CallerFromContext(ctx)
 	var targets types.SearchTargets
+	tagIDsByKB := mergeTagScopesByKB(tagScopes)
 
 	// Build a map from KB ID to TenantID for all KBs we need to process
 	kbTenantMap := make(map[string]uint64)
@@ -438,39 +456,59 @@ func (s *sessionService) buildSearchTargets(
 	fullKBSet := make(map[string]bool)
 
 	// First pass: batch-fetch KBs, then resolve tenant per ID (tenant scope already set by caller)
-	if len(knowledgeBaseIDs) > 0 {
-		kbs, _ := s.knowledgeBaseService.GetKnowledgeBasesByIDsOnly(ctx, knowledgeBaseIDs)
-		kbByID := make(map[string]*types.KnowledgeBase, len(kbs))
+	permissions := kbReadPermissions(ctx, s.kbShareService)
+	kbIDsToFetch := append([]string(nil), knowledgeBaseIDs...)
+	for kbID := range tagIDsByKB {
+		kbIDsToFetch = append(kbIDsToFetch, kbID)
+	}
+	kbIDsToFetch = uniqueNonEmptyStrings(kbIDsToFetch)
+
+	kbByID := make(map[string]*types.KnowledgeBase)
+	if len(kbIDsToFetch) > 0 {
+		kbs, kbFetchErr := s.knowledgeBaseService.GetKnowledgeBasesByIDsOnly(ctx, kbIDsToFetch)
+		if kbFetchErr != nil {
+			logger.Warnf(ctx, "Failed to fetch knowledge bases for search targets: %v", kbFetchErr)
+		}
 		for _, kb := range kbs {
 			if kb != nil {
 				kbByID[kb.ID] = kb
 			}
 		}
-		userID, _ := types.UserIDFromContext(ctx)
+	}
+	resolveKBTenant := func(kbID string) uint64 {
+		if kbTenantMap[kbID] != 0 {
+			return kbTenantMap[kbID]
+		}
+		kb := kbByID[kbID]
+		kbTenantMap[kbID] = caller.TenantID
+		if kb != nil {
+			kbTenantMap[kbID] = 0
+			if allowed, err := permissions.Check(kbID, kb.TenantID, types.OrgRoleViewer); err == nil && allowed {
+				kbTenantMap[kbID] = kb.TenantID
+			}
+		}
+		return kbTenantMap[kbID]
+	}
+
+	if len(knowledgeBaseIDs) > 0 {
 		for _, kbID := range knowledgeBaseIDs {
 			fullKBSet[kbID] = true
-			kb := kbByID[kbID]
-			if kb == nil {
-				kbTenantMap[kbID] = tenantID
-			} else if kb.TenantID == tenantID {
-				kbTenantMap[kbID] = tenantID
-			} else if s.kbShareService != nil && userID != "" {
-				hasAccess, _ := s.kbShareService.HasKBPermission(ctx, kbID, userID, types.OrgRoleViewer)
-				if hasAccess {
-					kbTenantMap[kbID] = kb.TenantID
-				} else {
-					kbTenantMap[kbID] = tenantID
-				}
-			} else {
-				kbTenantMap[kbID] = tenantID
+			kbTenant := resolveKBTenant(kbID)
+			if kbTenant == 0 {
+				continue
+			}
+			if len(tagIDsByKB[kbID]) > 0 {
+				continue
 			}
 			targets = append(targets, &types.SearchTarget{
 				Type:            types.SearchTargetTypeKnowledgeBase,
 				KnowledgeBaseID: kbID,
-				TenantID:        kbTenantMap[kbID],
+				TenantID:        kbTenant,
 			})
 		}
 	}
+
+	kbToKnowledgeIDs := make(map[string][]string)
 
 	// Process individual knowledge IDs (include shared KB files the user has access to)
 	if len(knowledgeIDs) > 0 {
@@ -482,7 +520,6 @@ func (s *sessionService) buildSearchTargets(
 
 		// Group knowledge IDs by their KB, excluding those already covered by full KB search
 		// Also track KB tenant IDs from knowledge items
-		kbToKnowledgeIDs := make(map[string][]string)
 		for _, k := range knowledgeList {
 			if k == nil || k.KnowledgeBaseID == "" {
 				continue
@@ -491,8 +528,8 @@ func (s *sessionService) buildSearchTargets(
 			if kbTenantMap[k.KnowledgeBaseID] == 0 {
 				kbTenantMap[k.KnowledgeBaseID] = k.TenantID
 			}
-			// Skip if this KB is already fully searched
-			if fullKBSet[k.KnowledgeBaseID] {
+			// Skip if this KB is already fully searched without a tag scope.
+			if fullKBSet[k.KnowledgeBaseID] && len(tagIDsByKB[k.KnowledgeBaseID]) == 0 {
 				continue
 			}
 			kbToKnowledgeIDs[k.KnowledgeBaseID] = append(kbToKnowledgeIDs[k.KnowledgeBaseID], k.ID)
@@ -500,23 +537,132 @@ func (s *sessionService) buildSearchTargets(
 
 		// Create SearchTargetTypeKnowledge targets for each KB with specific files
 		for kbID, kidList := range kbToKnowledgeIDs {
+			if len(tagIDsByKB[kbID]) > 0 {
+				continue
+			}
 			kbTenant := kbTenantMap[kbID]
 			if kbTenant == 0 {
 				kbTenant = tenantID // fallback
 			}
 			targets = append(targets, &types.SearchTarget{
-				Type:            types.SearchTargetTypeKnowledge,
-				KnowledgeBaseID: kbID,
-				TenantID:        kbTenant,
-				KnowledgeIDs:    kidList,
+				Type:                    types.SearchTargetTypeKnowledge,
+				KnowledgeBaseID:         kbID,
+				TenantID:                kbTenant,
+				KnowledgeIDs:            kidList,
+				DisableRecallThresholds: true,
 			})
 		}
 	}
 
-	logger.Infof(ctx, "Built %d search targets: %d full KB, %d partial KB, kbTenantMap=%v",
+	for kbID, tagIDs := range tagIDsByKB {
+		if kbID == "" || len(tagIDs) == 0 {
+			continue
+		}
+		kbTenant := resolveKBTenant(kbID)
+		if kbTenant == 0 {
+			continue
+		}
+		kb := kbByID[kbID]
+		explicitKnowledgeIDs := uniqueNonEmptyStrings(kbToKnowledgeIDs[kbID])
+
+		useDocumentTagResolution := kb == nil || kb.Type != types.KnowledgeBaseTypeFAQ
+		if kb == nil {
+			logger.Warnf(ctx, "Knowledge base metadata missing for tag scope, kb_id=%s, using document tag resolution", kbID)
+		}
+		if useDocumentTagResolution {
+			tagKnowledgeIDs, err := s.knowledgeService.ListKnowledgeIDsByTagIDs(ctx, kbTenant, kbID, tagIDs)
+			if err != nil {
+				return nil, fmt.Errorf("resolve knowledge IDs for tag scope kb_id=%s: %w", kbID, err)
+			}
+			if len(explicitKnowledgeIDs) > 0 {
+				tagKnowledgeIDs = intersectStrings(tagKnowledgeIDs, explicitKnowledgeIDs)
+			}
+			tagKnowledgeIDs = uniqueNonEmptyStrings(tagKnowledgeIDs)
+			if len(tagKnowledgeIDs) == 0 {
+				continue
+			}
+			targets = append(targets, &types.SearchTarget{
+				Type:                    types.SearchTargetTypeKnowledge,
+				KnowledgeBaseID:         kbID,
+				TenantID:                kbTenant,
+				KnowledgeIDs:            tagKnowledgeIDs,
+				ScopeTagIDs:             append([]string(nil), tagIDs...),
+				DisableRecallThresholds: true,
+			})
+			continue
+		}
+
+		target := &types.SearchTarget{
+			Type:                    types.SearchTargetTypeKnowledgeBase,
+			KnowledgeBaseID:         kbID,
+			TenantID:                kbTenant,
+			TagIDs:                  append([]string(nil), tagIDs...),
+			ScopeTagIDs:             append([]string(nil), tagIDs...),
+			DisableRecallThresholds: true,
+		}
+		if len(explicitKnowledgeIDs) > 0 {
+			target.Type = types.SearchTargetTypeKnowledge
+			target.KnowledgeIDs = explicitKnowledgeIDs
+			target.DisableRecallThresholds = true
+		}
+		targets = append(targets, target)
+	}
+
+	logger.Infof(ctx, "Built %d search targets: %d full KB, %d partial/tag KB, kbTenantMap=%v",
 		len(targets), len(knowledgeBaseIDs), len(targets)-len(knowledgeBaseIDs), kbTenantMap)
 
 	return targets, nil
+}
+
+func mergeTagScopesByKB(scopes []types.TagScope) map[string][]string {
+	byKB := make(map[string][]string)
+	seen := make(map[string]map[string]bool)
+	for _, scope := range scopes {
+		if scope.KnowledgeBaseID == "" {
+			continue
+		}
+		if seen[scope.KnowledgeBaseID] == nil {
+			seen[scope.KnowledgeBaseID] = make(map[string]bool)
+		}
+		for _, tagID := range scope.TagIDs {
+			if tagID == "" || seen[scope.KnowledgeBaseID][tagID] {
+				continue
+			}
+			seen[scope.KnowledgeBaseID][tagID] = true
+			byKB[scope.KnowledgeBaseID] = append(byKB[scope.KnowledgeBaseID], tagID)
+		}
+	}
+	return byKB
+}
+
+func uniqueNonEmptyStrings(values []string) []string {
+	seen := make(map[string]bool, len(values))
+	out := make([]string, 0, len(values))
+	for _, value := range values {
+		if value == "" || seen[value] {
+			continue
+		}
+		seen[value] = true
+		out = append(out, value)
+	}
+	return out
+}
+
+func intersectStrings(left []string, right []string) []string {
+	if len(left) == 0 || len(right) == 0 {
+		return nil
+	}
+	rightSet := make(map[string]bool, len(right))
+	for _, value := range right {
+		rightSet[value] = true
+	}
+	out := make([]string, 0)
+	for _, value := range left {
+		if rightSet[value] {
+			out = append(out, value)
+		}
+	}
+	return out
 }
 
 // KnowledgeQAByEvent processes knowledge QA through a series of events in the pipeline
@@ -534,10 +680,95 @@ func (s *sessionService) KnowledgeQAByEvent(ctx context.Context,
 	logger.Infof(ctx, "Trigger event list: %v", methods)
 
 	pipelineStart := time.Now()
+	lastRetrievalStage := chatpipeline.LastConsolidatedRetrievalStage(eventList, chatManage)
+	var retrievalProgress *chatpipeline.StageProgress
+	var retrievalStart time.Time
+	var understandProgress *chatpipeline.StageProgress
+	var understandStart time.Time
 	for _, eventType := range eventList {
 		stageStart := time.Now()
-		err := s.eventManager.Trigger(ctx, eventType, chatManage)
+		// Wrap each pipeline stage in a Langfuse span so the trace timeline
+		// shows the gaps between LLM/embedding/rerank generations (the work
+		// that happens between them — vector DB search, merge, filter, prompt
+		// assembly — was previously invisible). Generations created inside
+		// the stage automatically nest under this span.
+		//
+		// CHAT_COMPLETION_STREAM is intentionally skipped: its OnEvent kicks
+		// off a streaming goroutine and returns immediately, so a span would
+		// finish well before the chat.completion.stream generation does. The
+		// generation already captures the full stream duration; adding a
+		// stage span here would just produce a child observation that
+		// visually exceeds its parent.
+		stageCtx := ctx
+		var stageSpan *langfuse.Span
+		if eventType != types.CHAT_COMPLETION_STREAM {
+			stageCtx, stageSpan = langfuse.GetManager().StartSpan(ctx, langfuse.SpanOptions{
+				Name: "pipeline." + string(eventType),
+				Metadata: map[string]interface{}{
+					"event_type": string(eventType),
+					"session_id": chatManage.SessionID,
+				},
+			})
+		}
+		if eventType == types.QUERY_UNDERSTAND && chatpipeline.ShouldEmitQueryUnderstandProgress(chatManage) {
+			understandStart = stageStart
+			understandProgress = chatpipeline.BeginQueryUnderstandProgress(stageCtx, chatManage)
+		}
+		if chatpipeline.IsConsolidatedRetrievalStage(eventType, chatManage) && retrievalProgress == nil {
+			retrievalStart = stageStart
+			retrievalProgress = chatpipeline.BeginRetrievalProgress(stageCtx, chatManage)
+		}
+		// Emit references before answer streaming so the SSE client receives
+		// them while the connection is still open. Previously references were
+		// emitted after the pipeline returned — by then the `complete` event had
+		// already closed the stream, so the frontend only saw citations on refresh.
+		if eventType == types.CHAT_COMPLETION_STREAM {
+			emitKnowledgeReferencesEvent(ctx, chatManage)
+		}
+		err := s.eventManager.Trigger(stageCtx, eventType, chatManage)
+		if understandProgress != nil && eventType == types.QUERY_UNDERSTAND {
+			chatpipeline.EndQueryUnderstandProgress(stageCtx, chatManage, understandProgress, understandStart, err)
+			understandProgress = nil
+		}
+		// Close the consolidated retrieval progress window as soon as retrieval
+		// is done: either the planned last retrieval stage completed, or a
+		// retrieval stage short-circuited the pipeline (ErrSearchNothing or a
+		// hard error). The early returns below (fallback / stage_failed) would
+		// otherwise skip EndRetrievalProgress, leaving the "knowledge_search"
+		// tool_call pending — so the frontend keeps spinning on "正在检索知识库"
+		// forever even though the fallback answer has already streamed.
+		if retrievalProgress != nil && chatpipeline.ShouldCloseRetrievalProgress(eventType, lastRetrievalStage, err) {
+			chatpipeline.EndRetrievalProgress(stageCtx, chatManage, retrievalProgress, retrievalStart, err)
+			retrievalProgress = nil
+		}
 		stageDuration := time.Since(stageStart)
+		var spanErr error
+		if err != nil && err != chatpipeline.ErrSearchNothing {
+			spanErr = err.Err
+		}
+		if stageSpan != nil {
+			stageSpan.Finish(map[string]interface{}{
+				"duration_ms": stageDuration.Milliseconds(),
+			}, nil, spanErr)
+		}
+
+		// If the user stopped generation, the context is cancelled. A cancelled
+		// retrieval stage surfaces as ErrSearchNothing (the search goroutines
+		// return no results when their embedding/vector calls are aborted), so
+		// this check MUST come before the ErrSearchNothing handling below.
+		// Otherwise we would persist the fixed fallback response ("Sorry, I am
+		// unable to answer this question.") over the intentionally-empty stopped
+		// message, and the user would see the fallback text after refreshing.
+		// This is not single-machine specific: the stop arrives via the shared
+		// StreamManager and cancels asyncCtx on whichever node is generating.
+		if ctxErr := ctx.Err(); ctxErr != nil {
+			common.PipelineWarn(ctx, "Pipeline", "stage_cancelled", map[string]interface{}{
+				"event":       string(eventType),
+				"duration_ms": stageDuration.Milliseconds(),
+				"reason":      ctxErr.Error(),
+			})
+			return ctxErr
+		}
 
 		if err == chatpipeline.ErrSearchNothing {
 			common.PipelineWarn(ctx, "Pipeline", "stage_fallback", map[string]interface{}{
@@ -578,23 +809,23 @@ func (s *sessionService) KnowledgeQAByEvent(ctx context.Context,
 // knowledgeBaseIDs: list of knowledge base IDs to search (supports multi-KB)
 // knowledgeIDs: list of specific knowledge (file) IDs to search
 func (s *sessionService) SearchKnowledge(ctx context.Context,
-	knowledgeBaseIDs []string, knowledgeIDs []string, query string,
+	knowledgeBaseIDs []string, knowledgeIDs []string, tagScopes []types.TagScope, query string,
 ) ([]*types.SearchResult, error) {
 	logger.Info(ctx, "Start knowledge base search without LLM summary")
-	logger.Infof(ctx, "Knowledge base search parameters, knowledge base IDs: %v, knowledge IDs: %v, query: %s",
-		knowledgeBaseIDs, knowledgeIDs, query)
+	logger.Infof(ctx, "Knowledge base search parameters, knowledge base IDs: %v, knowledge IDs: %v, tag scopes: %d, query: %s",
+		knowledgeBaseIDs, knowledgeIDs, len(tagScopes), query)
 
 	// Get tenant ID from context
 	tenantID, ok := types.TenantIDFromContext(ctx)
 	if !ok {
 		logger.Error(ctx, "Failed to get tenant ID from context")
-		return nil, fmt.Errorf("tenant ID not found in context")
+		return nil, fmt.Errorf("workspace ID not found in context")
 	}
 
 	// Build unified search targets (computed once, used throughout pipeline)
-	searchTargets, err := s.buildSearchTargets(ctx, tenantID, knowledgeBaseIDs, knowledgeIDs)
+	searchTargets, err := s.buildSearchTargets(ctx, tenantID, knowledgeBaseIDs, knowledgeIDs, tagScopes)
 	if err != nil {
-		logger.Warnf(ctx, "Failed to build search targets: %v", err)
+		return nil, fmt.Errorf("build search targets: %w", err)
 	}
 
 	if len(searchTargets) == 0 {
@@ -603,7 +834,7 @@ func (s *sessionService) SearchKnowledge(ctx context.Context,
 	}
 
 	// Create default retrieval parameters — prefer tenant RetrievalConfig, fallback to built-in defaults
-	userID, _ := types.UserIDFromContext(ctx)
+	userID := types.SessionOwnerIDFromContext(ctx)
 
 	// Load tenant-level retrieval config (nil is safe — GetEffective* methods handle nil receiver)
 	var rc *types.RetrievalConfig
@@ -664,7 +895,19 @@ func (s *sessionService) SearchKnowledge(ctx context.Context,
 
 	for _, event := range searchEvents {
 		logger.Infof(ctx, "Starting to trigger search event: %v", event)
-		err := s.eventManager.Trigger(ctx, event, chatManage)
+		stageCtx, stageSpan := langfuse.GetManager().StartSpan(ctx, langfuse.SpanOptions{
+			Name: "pipeline." + string(event),
+			Metadata: map[string]interface{}{
+				"event_type": string(event),
+				"flow":       "search_knowledge",
+			},
+		})
+		err := s.eventManager.Trigger(stageCtx, event, chatManage)
+		var spanErr error
+		if err != nil && err != chatpipeline.ErrSearchNothing {
+			spanErr = err.Err
+		}
+		stageSpan.Finish(nil, nil, spanErr)
 
 		if err == chatpipeline.ErrSearchNothing {
 			logger.Warnf(ctx, "Event %v triggered, search result is empty", event)
@@ -740,11 +983,8 @@ func (s *sessionService) handleModelFallback(ctx context.Context, chatManage *ty
 	}
 
 	// Start streaming response
-	userMsg := chat.Message{Role: "user", Content: promptContent}
-	if chatManage.ChatModelSupportsVision && len(chatManage.Images) > 0 {
-		userMsg.Images = chatManage.Images
-	}
-	responseChan, err := chatModel.ChatStream(ctx, []chat.Message{userMsg}, opt)
+	fallbackMessages, modelContext := prepareFallbackMessages(chatManage, promptContent)
+	responseChan, err := chatModel.ChatStream(ctx, fallbackMessages, opt)
 	if err != nil {
 		logger.Errorf(ctx, "Failed to start streaming fallback response: %v, falling back to fixed response", err)
 		s.handleFixedFallback(ctx, chatManage)
@@ -758,7 +998,53 @@ func (s *sessionService) handleModelFallback(ctx context.Context, chatManage *ty
 	}
 
 	// Start goroutine to consume stream and emit events
-	go s.consumeFallbackStream(ctx, chatManage, responseChan)
+	go s.consumeFallbackStream(ctx, chatManage, responseChan, modelContext)
+}
+
+func prepareFallbackMessages(
+	chatManage *types.ChatManage,
+	promptContent string,
+) ([]chat.Message, *modelcontext.Registry) {
+	messages := buildFallbackMessages(chatManage, promptContent)
+	citationsEnabled := chatManage == nil || chatManage.CitationsEnabled()
+	registry := modelcontext.NewRegistry(citationsEnabled)
+	if len(messages) > 0 && messages[0].Role == "system" {
+		messages[0].Content = strings.TrimRight(messages[0].Content, " \t\r\n") + registry.ProtocolPrompt()
+	} else {
+		messages = append([]chat.Message{{Role: "system", Content: strings.TrimSpace(registry.ProtocolPrompt())}}, messages...)
+	}
+	return registry.EncodeMessages(messages), registry
+}
+
+func buildFallbackMessages(chatManage *types.ChatManage, promptContent string) []chat.Message {
+	messages := make([]chat.Message, 0, len(chatManage.History)*2+2)
+
+	// The model-fallback prompt is a system-style instruction (KB document
+	// listing + "use general knowledge when nothing matched" guidance). Carry
+	// it in the system role so the LLM input keeps a proper system message
+	// instead of starting with a bare user turn. We deliberately do NOT reuse
+	// the RAG summary system prompt (SummaryConfig.Prompt) here: that template
+	// forbids prior knowledge ("reply ONLY based on retrieved information"),
+	// which directly contradicts the fallback's purpose.
+	if strings.TrimSpace(promptContent) != "" {
+		messages = append(messages, chat.Message{Role: "system", Content: promptContent})
+	}
+
+	messages = chatpipeline.AppendHistoryMessages(messages, chatManage.History)
+
+	// End on the user's actual question so generation is prompted by a user
+	// turn (the query is also embedded in the system instruction above, but a
+	// trailing user message keeps the chat shape valid for all providers).
+	query := chatManage.Query
+	if rq := strings.TrimSpace(chatManage.RewriteQuery); rq != "" {
+		query = rq
+	}
+	userMsg := chat.Message{Role: "user", Content: query}
+	if chatManage.ChatModelSupportsVision && len(chatManage.Images) > 0 {
+		userMsg.Images = chatManage.Images
+	}
+
+	return append(messages, userMsg)
 }
 
 // renderFallbackPrompt renders the fallback prompt template with query and image context.
@@ -767,9 +1053,13 @@ func (s *sessionService) renderFallbackPrompt(ctx context.Context, chatManage *t
 	if rq := strings.TrimSpace(chatManage.RewriteQuery); rq != "" {
 		query = rq
 	}
+
+	kbDocuments := s.buildKBDocumentListing(ctx, chatManage)
+
 	result := types.RenderPromptPlaceholders(chatManage.FallbackPrompt, types.PlaceholderValues{
-		"query":    query,
-		"language": chatManage.Language,
+		"query":        query,
+		"language":     chatManage.Language,
+		"kb_documents": kbDocuments,
 	})
 
 	if chatManage.ImageDescription != "" && !chatManage.ChatModelSupportsVision {
@@ -781,20 +1071,96 @@ func (s *sessionService) renderFallbackPrompt(ctx context.Context, chatManage *t
 	return result, nil
 }
 
+// buildKBDocumentListing returns a concise listing of documents in the knowledge bases
+// associated with the current pipeline. This gives the LLM visibility into KB contents
+// when vector/keyword search returns empty (e.g., broad browse queries).
+func (s *sessionService) buildKBDocumentListing(ctx context.Context, chatManage *types.ChatManage) string {
+	// Collect unique KB IDs from search targets
+	kbIDs := make(map[string]struct{})
+	for _, t := range chatManage.SearchTargets {
+		kbIDs[t.KnowledgeBaseID] = struct{}{}
+	}
+	for _, id := range chatManage.KnowledgeBaseIDs {
+		kbIDs[id] = struct{}{}
+	}
+	if len(kbIDs) == 0 {
+		return ""
+	}
+
+	const maxDocuments = 50
+	var b strings.Builder
+	total := 0
+
+	for kbID := range kbIDs {
+		if total >= maxDocuments {
+			break
+		}
+		knowledges, err := s.knowledgeService.ListKnowledgeByKnowledgeBaseID(ctx, kbID)
+		if err != nil {
+			logger.Warnf(ctx, "buildKBDocumentListing: failed to list knowledge for KB %s: %v", kbID, err)
+			continue
+		}
+		for _, k := range knowledges {
+			if total >= maxDocuments {
+				break
+			}
+			if k.EnableStatus != "enabled" {
+				continue
+			}
+			title := k.Title
+			if title == "" {
+				title = k.FileName
+			}
+			if title == "" {
+				continue
+			}
+			fmt.Fprintf(&b, "- %s", title)
+			if k.FileType != "" {
+				fmt.Fprintf(&b, " (%s)", k.FileType)
+			}
+			if k.Description != "" {
+				desc := k.Description
+				if len([]rune(desc)) > 100 {
+					desc = string([]rune(desc)[:100]) + "..."
+				}
+				fmt.Fprintf(&b, ": %s", desc)
+			}
+			b.WriteString("\n")
+			total++
+		}
+	}
+
+	if b.Len() == 0 {
+		return ""
+	}
+
+	if total >= maxDocuments {
+		fmt.Fprintf(&b, "... (showing first %d documents)\n", maxDocuments)
+	}
+
+	return b.String()
+}
+
 // consumeFallbackStream consumes the streaming response and emits events
 func (s *sessionService) consumeFallbackStream(
 	ctx context.Context,
 	chatManage *types.ChatManage,
 	responseChan <-chan types.StreamResponse,
+	modelContext *modelcontext.Registry,
 ) {
 	fallbackID := generateEventID("fallback")
 	eventBus := chatManage.EventBus
 	var finalContent string
 	streamCompleted := false
+	decoder := modelContext.StreamDecoder()
 
 	for response := range responseChan {
 		// Emit event for each answer chunk
 		if response.ResponseType == types.ResponseTypeAnswer {
+			response.Content = decoder.Feed(response.Content)
+			if response.Done {
+				response.Content += decoder.Flush()
+			}
 			finalContent += response.Content
 			if err := eventBus.Emit(ctx, types.Event{
 				ID:        fallbackID,
@@ -826,10 +1192,35 @@ func (s *sessionService) consumeFallbackStream(
 	}
 }
 
+// emitKnowledgeReferencesEvent streams retrieved chunks to the client as a
+// `references` SSE event. These references drive the retrieval-results UI and
+// remain available even when inline citations in the model answer are disabled.
+// Must run before CHAT_COMPLETION_STREAM so the event arrives while the
+// connection is still open (complete closes the stream).
+func emitKnowledgeReferencesEvent(ctx context.Context, chatManage *types.ChatManage) {
+	if chatManage == nil || chatManage.EventBus == nil || len(chatManage.MergeResult) == 0 {
+		return
+	}
+	logger.Infof(ctx, "Emitting references event with %d results (pre-answer)", len(chatManage.MergeResult))
+	if err := chatManage.EventBus.Emit(ctx, types.Event{
+		ID:        generateEventID("references"),
+		Type:      types.EventType(event.EventAgentReferences),
+		SessionID: chatManage.SessionID,
+		Data: event.AgentReferencesData{
+			References: chatManage.MergeResult,
+		},
+	}); err != nil {
+		logger.Errorf(ctx, "Failed to emit references event: %v", err)
+	}
+}
+
 // emitFallbackAnswer emits fallback answer event
 func (s *sessionService) emitFallbackAnswer(ctx context.Context, chatManage *types.ChatManage, content string) {
 	if chatManage.EventBus == nil {
 		return
+	}
+	if !chatManage.CitationsEnabled() {
+		content = modelcontext.NewRegistry(false).DecodeOutputText(content)
 	}
 
 	fallbackID := generateEventID("fallback")
@@ -888,8 +1279,8 @@ func (s *sessionService) resolveWebSearchMaxResults(ctx context.Context, req *ty
 		return req.CustomAgent.Config.WebSearchMaxResults
 	}
 	tenantInfo, _ := types.TenantInfoFromContext(ctx)
-	if tenantInfo != nil && tenantInfo.WebSearchConfig != nil && tenantInfo.WebSearchConfig.MaxResults > 0 {
-		return tenantInfo.WebSearchConfig.MaxResults
+	if tenantInfo != nil {
+		return types.EffectiveWebSearchConfig(tenantInfo.WebSearchConfig).MaxResults
 	}
-	return 10
+	return types.DefaultWebSearchMaxResults
 }

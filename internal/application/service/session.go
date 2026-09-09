@@ -2,28 +2,113 @@ package service
 
 import (
 	"context"
-	"errors"
+	stderrors "errors"
 	"fmt"
 	"strings"
 
+	"github.com/Tencent/WeKnora/internal/application/repository"
+	chatpipeline "github.com/Tencent/WeKnora/internal/application/service/chat_pipeline"
 	"github.com/Tencent/WeKnora/internal/config"
+	apperrors "github.com/Tencent/WeKnora/internal/errors"
 	"github.com/Tencent/WeKnora/internal/event"
 	"github.com/Tencent/WeKnora/internal/logger"
 	"github.com/Tencent/WeKnora/internal/models/chat"
+	"github.com/Tencent/WeKnora/internal/sandbox"
 	"github.com/Tencent/WeKnora/internal/types"
 	"github.com/Tencent/WeKnora/internal/types/interfaces"
 	"github.com/google/uuid"
-
-	chatpipeline "github.com/Tencent/WeKnora/internal/application/service/chat_pipeline"
-	llmcontext "github.com/Tencent/WeKnora/internal/application/service/llmcontext"
 )
+
+func sessionUserIDFromContext(ctx context.Context) string {
+	return types.SessionOwnerIDFromContext(ctx)
+}
+
+// runtimeMayBypassAdminConsoleRead reports whether a non-admin caller on the
+// owner-scoped read path may open a channel-managed session. Admin console reads
+// use the GetByID fallback in loadSessionForRead and never call this helper.
+func runtimeMayBypassAdminConsoleRead(
+	ctx context.Context,
+	session *types.Session,
+	imPlatform string,
+) bool {
+	principal, ok := types.PrincipalFromContext(ctx)
+	if !ok || session == nil {
+		return false
+	}
+
+	switch principal.Type {
+	case types.PrincipalIMUser:
+		return strings.TrimSpace(imPlatform) != ""
+	case types.PrincipalAPITenant, types.PrincipalAPIExternalUser:
+		ownerID := types.SessionOwnerIDFromContext(ctx)
+		return types.IsAPISessionOwnerID(session.UserID) && session.UserID == ownerID
+	case types.PrincipalEmbedSession:
+		// An embed widget runs as a Viewer but is the legitimate owner of its own
+		// channel session (verified upstream by ensureEmbedSession, including the
+		// signed handle). Allow it to read exactly the session it owns; the owner
+		// scope in repo.Get already confines it to that single row.
+		ownerID := types.SessionOwnerIDFromContext(ctx)
+		return session.UserID == ownerID
+	default:
+		return false
+	}
+}
+
+// loadSessionForRead loads a session honoring the caller's per-user scope, with
+// an Admin+ fallback that additionally permits reading tenant channel sessions
+// (API-key, IM, and embed) from the Web console. Non-admin callers must not
+// open channel-managed rows even when legacy empty user_id scope would match.
+// Write paths keep the strict scope and must not use this helper.
+func loadSessionForRead(
+	ctx context.Context,
+	repo interfaces.SessionRepository,
+	tenantID uint64,
+	ownerID, sessionID string,
+) (*types.Session, error) {
+	isAdmin := types.TenantRoleFromContext(ctx).HasPermission(types.TenantRoleAdmin)
+
+	session, err := repo.Get(ctx, tenantID, ownerID, sessionID)
+	if err == nil {
+		imPlatform, _ := repo.GetIMPlatform(ctx, tenantID, sessionID)
+		if types.SessionRequiresAdminConsoleRead(session, imPlatform) &&
+			!isAdmin &&
+			!runtimeMayBypassAdminConsoleRead(ctx, session, imPlatform) {
+			return nil, apperrors.ErrSessionNotFound
+		}
+		if imPlatform != "" {
+			session.IMPlatform = imPlatform
+		}
+		return session, nil
+	}
+	if !stderrors.Is(err, apperrors.ErrSessionNotFound) {
+		return session, err
+	}
+	if !isAdmin {
+		return nil, err
+	}
+	s, e := repo.GetByID(ctx, tenantID, sessionID)
+	if e != nil {
+		return nil, err
+	}
+	imPlatform, _ := repo.GetIMPlatform(ctx, tenantID, sessionID)
+	if !types.SessionRequiresAdminConsoleRead(s, imPlatform) {
+		return nil, err
+	}
+	if imPlatform != "" {
+		s.IMPlatform = imPlatform
+	}
+	return s, nil
+}
 
 // generateEventID generates a unique event ID with type suffix for better traceability
 func generateEventID(suffix string) string {
 	return fmt.Sprintf("%s-%s", uuid.New().String()[:8], suffix)
 }
 
-// sessionService implements the SessionService interface for managing conversation sessions
+// sessionService implements the SessionService interface for managing conversation sessions.
+// History for multi-turn conversations is rebuilt from the messages table on demand
+// (see service.LoadAgentHistory and chat_pipeline history loading) — there is no
+// separate cross-turn cache layer.
 type sessionService struct {
 	cfg                   *config.Config                         // Application configuration
 	sessionRepo           interfaces.SessionRepository           // Repository for session data
@@ -33,13 +118,22 @@ type sessionService struct {
 	tenantService         interfaces.TenantService               // Service for tenant operations
 	eventManager          *chatpipeline.EventManager             // Event manager for chat pipeline
 	agentService          interfaces.AgentService                // Service for agent operations
-	sessionStorage        llmcontext.ContextStorage              // Session storage
 	knowledgeService      interfaces.KnowledgeService            // Service for knowledge operations
 	chunkService          interfaces.ChunkService                // Service for chunk operations
 	webSearchStateRepo    interfaces.WebSearchStateService       // Service for web search state
 	webSearchProviderRepo interfaces.WebSearchProviderRepository // Repository for web search provider entities
 	kbShareService        interfaces.KBShareService              // Service for KB sharing operations
-	memoryService         interfaces.MemoryService               // Service for memory operations
+	suggestionRepo        interfaces.MessageSuggestionRepository
+	sandboxMgr            sandbox.Manager // Default sandbox backend; used to reclaim per-session MicroVMs on delete
+	sandboxResolver       sandbox.TenantSandboxResolver
+	sandboxPinner         *SessionSandboxPinner
+	sandboxPolicy         WorkspaceSandboxPolicy
+	memoryService         interfaces.MemoryService // Service for cross-session long-term memory
+	// sandboxConfigRepo and tenantSkillRepo answer "which installed skills can
+	// this turn actually invoke". They are repositories rather than
+	// TenantSkillService because that service depends on this one.
+	sandboxConfigRepo repository.TenantSandboxConfigRepository
+	tenantSkillRepo   repository.TenantSkillRepository
 }
 
 // NewSessionService creates a new session service instance with all required dependencies
@@ -53,11 +147,17 @@ func NewSessionService(cfg *config.Config,
 	tenantService interfaces.TenantService,
 	eventManager *chatpipeline.EventManager,
 	agentService interfaces.AgentService,
-	sessionStorage llmcontext.ContextStorage,
 	webSearchStateRepo interfaces.WebSearchStateService,
 	webSearchProviderRepo interfaces.WebSearchProviderRepository,
 	kbShareService interfaces.KBShareService,
+	suggestionRepo interfaces.MessageSuggestionRepository,
+	sandboxMgr sandbox.Manager,
+	sandboxResolver sandbox.TenantSandboxResolver,
+	sandboxPinner *SessionSandboxPinner,
+	sandboxPolicy WorkspaceSandboxPolicy,
 	memoryService interfaces.MemoryService,
+	sandboxConfigRepo repository.TenantSandboxConfigRepository,
+	tenantSkillRepo repository.TenantSkillRepository,
 ) interfaces.SessionService {
 	return &sessionService{
 		cfg:                   cfg,
@@ -70,11 +170,17 @@ func NewSessionService(cfg *config.Config,
 		tenantService:         tenantService,
 		eventManager:          eventManager,
 		agentService:          agentService,
-		sessionStorage:        sessionStorage,
 		webSearchStateRepo:    webSearchStateRepo,
 		webSearchProviderRepo: webSearchProviderRepo,
 		kbShareService:        kbShareService,
+		suggestionRepo:        suggestionRepo,
+		sandboxMgr:            sandboxMgr,
+		sandboxResolver:       sandboxResolver,
+		sandboxPinner:         sandboxPinner,
+		sandboxPolicy:         sandboxPolicy,
 		memoryService:         memoryService,
+		sandboxConfigRepo:     sandboxConfigRepo,
+		tenantSkillRepo:       tenantSkillRepo,
 	}
 }
 
@@ -85,7 +191,7 @@ func (s *sessionService) CreateSession(ctx context.Context, session *types.Sessi
 	// Validate tenant ID
 	if session.TenantID == 0 {
 		logger.Error(ctx, "Failed to create session: tenant ID cannot be empty")
-		return nil, errors.New("tenant ID is required")
+		return nil, stderrors.New("tenant ID is required")
 	}
 
 	logger.Infof(ctx, "Creating session, tenant ID: %d", session.TenantID)
@@ -107,15 +213,16 @@ func (s *sessionService) GetSession(ctx context.Context, id string) (*types.Sess
 	// Validate session ID
 	if id == "" {
 		logger.Error(ctx, "Failed to get session: session ID cannot be empty")
-		return nil, errors.New("session id is required")
+		return nil, stderrors.New("session id is required")
 	}
 
 	// Get tenant ID from context
 	tenantID := types.MustTenantIDFromContext(ctx)
+	userID := sessionUserIDFromContext(ctx)
 	logger.Infof(ctx, "Retrieving session, ID: %s, tenant ID: %d", id, tenantID)
 
 	// Get session from repository
-	session, err := s.sessionRepo.Get(ctx, tenantID, id)
+	session, err := loadSessionForRead(ctx, s.sessionRepo, tenantID, userID, id)
 	if err != nil {
 		logger.ErrorWithFields(ctx, err, map[string]interface{}{
 			"session_id": id,
@@ -124,18 +231,69 @@ func (s *sessionService) GetSession(ctx context.Context, id string) (*types.Sess
 		return nil, err
 	}
 
+	// Best-effort IM origin so the Web console can classify the session's
+	// folder on read; a lookup failure must not fail the detail request.
+	if session.IMPlatform == "" {
+		if platform, pErr := s.sessionRepo.GetIMPlatform(ctx, tenantID, session.ID); pErr == nil {
+			session.IMPlatform = platform
+		} else {
+			logger.Warnf(ctx, "Failed to resolve IM platform for session %s: %v", session.ID, pErr)
+		}
+	}
+
 	logger.Infof(ctx, "Session retrieved successfully, ID: %s, tenant ID: %d", session.ID, session.TenantID)
 	return session, nil
+}
+
+// GetOwnedSession loads a session strictly within the caller's owner scope.
+// Unlike GetSession it does NOT apply the Admin+ API-key read fallback
+// (loadSessionForRead), so it is the correct check for write/mutation
+// endpoints: a tenant admin may open and read an API-key session, but must not
+// be able to modify it (title, attachments, streaming state, messages).
+func (s *sessionService) GetOwnedSession(ctx context.Context, id string) (*types.Session, error) {
+	if id == "" {
+		return nil, stderrors.New("session id is required")
+	}
+	tenantID := types.MustTenantIDFromContext(ctx)
+	userID := sessionUserIDFromContext(ctx)
+	return s.sessionRepo.Get(ctx, tenantID, userID, id)
+}
+
+// GetSessionByID loads a session by tenant and id without user scoping.
+func (s *sessionService) GetSessionByID(ctx context.Context, tenantID uint64, id string) (*types.Session, error) {
+	if id == "" {
+		return nil, stderrors.New("session id is required")
+	}
+	if tenantID == 0 {
+		return nil, stderrors.New("workspace id is required")
+	}
+	return s.sessionRepo.GetByID(ctx, tenantID, id)
+}
+
+// SetSessionOwnerID assigns sessions.user_id for the given session row.
+func (s *sessionService) SetSessionOwnerID(ctx context.Context, tenantID uint64, sessionID, ownerID string) error {
+	if sessionID == "" || ownerID == "" || tenantID == 0 {
+		return stderrors.New("tenant id, session id and owner id are required")
+	}
+	affected, err := s.sessionRepo.SetOwnerID(ctx, tenantID, sessionID, ownerID)
+	if err != nil {
+		return err
+	}
+	if affected == 0 {
+		return apperrors.ErrSessionNotFound
+	}
+	return nil
 }
 
 // GetSessionsByTenant retrieves all sessions for the current tenant
 func (s *sessionService) GetSessionsByTenant(ctx context.Context) ([]*types.Session, error) {
 	// Get tenant ID from context
 	tenantID := types.MustTenantIDFromContext(ctx)
+	userID := sessionUserIDFromContext(ctx)
 	logger.Infof(ctx, "Retrieving all sessions for tenant, tenant ID: %d", tenantID)
 
 	// Get sessions from repository
-	sessions, err := s.sessionRepo.GetByTenantID(ctx, tenantID)
+	sessions, err := s.sessionRepo.GetByTenantID(ctx, tenantID, userID)
 	if err != nil {
 		logger.ErrorWithFields(ctx, err, map[string]interface{}{
 			"tenant_id": tenantID,
@@ -155,8 +313,9 @@ func (s *sessionService) GetPagedSessionsByTenant(ctx context.Context,
 ) (*types.PageResult, error) {
 	// Get tenant ID from context
 	tenantID := types.MustTenantIDFromContext(ctx)
+	userID := sessionUserIDFromContext(ctx)
 	// Get paged sessions from repository
-	sessions, total, err := s.sessionRepo.GetPagedByTenantID(ctx, tenantID, pagination)
+	sessions, total, err := s.sessionRepo.GetPagedByTenantID(ctx, tenantID, userID, pagination)
 	if err != nil {
 		logger.ErrorWithFields(ctx, err, map[string]interface{}{
 			"tenant_id": tenantID,
@@ -169,16 +328,107 @@ func (s *sessionService) GetPagedSessionsByTenant(ctx context.Context,
 	return types.NewPageResult(total, pagination, sessions), nil
 }
 
+// ListSessions returns a page of sessions with search/source filters, scoped to
+// the current tenant (and user when the caller is an authenticated user).
+func (s *sessionService) ListSessions(
+	ctx context.Context, query *types.SessionListQuery,
+) (*types.PageResult, error) {
+	if query == nil {
+		query = &types.SessionListQuery{}
+	}
+	query.TenantID = types.MustTenantIDFromContext(ctx)
+	// API / IM / embed source filters are tenant-wide admin views over channel
+	// traffic. Gate them behind Admin+ and drop the per-user owner scope so an
+	// Owner/admin can observe sessions that are otherwise isolated per key,
+	// visitor, or IM identity; everyone else stays scoped to their own principal.
+	if types.SessionListSourceRequiresAdmin(query.Source) {
+		if !types.TenantRoleFromContext(ctx).HasPermission(types.TenantRoleAdmin) {
+			return nil, apperrors.NewForbiddenError(
+				"listing channel sessions requires tenant admin or owner role",
+			)
+		}
+		query.UserID = ""
+	} else if uid := types.SessionOwnerIDFromContext(ctx); uid != "" {
+		query.UserID = uid
+	}
+
+	items, total, err := s.sessionRepo.QueryPaged(ctx, query)
+	if err != nil {
+		logger.ErrorWithFields(ctx, err, map[string]interface{}{
+			"tenant_id": query.TenantID,
+			"user_id":   query.UserID,
+			"keyword":   query.Keyword,
+			"source":    query.Source,
+			"agent_id":  query.AgentID,
+		})
+		return nil, err
+	}
+
+	pagination := &types.Pagination{Page: query.Page, PageSize: query.PageSize}
+	return types.NewPageResult(total, pagination, items), nil
+}
+
+// CountSessionsBySource returns the total session count for a source filter
+// without the Admin+ gate used by ListSessions. Aggregate stats endpoints may
+// expose counts to Viewer+ while keeping session rows admin-only.
+func (s *sessionService) CountSessionsBySource(
+	ctx context.Context, query *types.SessionListQuery,
+) (int64, error) {
+	if query == nil {
+		query = &types.SessionListQuery{}
+	}
+	query.TenantID = types.MustTenantIDFromContext(ctx)
+	if types.SessionListSourceRequiresAdmin(query.Source) {
+		query.UserID = ""
+	} else if uid := types.SessionOwnerIDFromContext(ctx); uid != "" {
+		query.UserID = uid
+	}
+	_, total, err := s.sessionRepo.QueryPaged(ctx, query)
+	if err != nil {
+		logger.ErrorWithFields(ctx, err, map[string]interface{}{
+			"tenant_id": query.TenantID,
+			"user_id":   query.UserID,
+			"source":    query.Source,
+		})
+		return 0, err
+	}
+	return total, nil
+}
+
+// SetSessionPinned pins or unpins a session for the current user scope.
+// Returns the number of rows affected; 0 means the session doesn't exist
+// or is not owned by the caller so the handler can respond 404.
+func (s *sessionService) SetSessionPinned(
+	ctx context.Context, sessionID string, pinned bool,
+) (int64, error) {
+	if sessionID == "" {
+		return 0, stderrors.New("session id is required")
+	}
+	tenantID := types.MustTenantIDFromContext(ctx)
+	userID := sessionUserIDFromContext(ctx)
+	return s.sessionRepo.SetPinned(ctx, tenantID, userID, sessionID, pinned)
+}
+
 // UpdateSession updates an existing session's properties
 func (s *sessionService) UpdateSession(ctx context.Context, session *types.Session) error {
 	// Validate session ID
 	if session.ID == "" {
 		logger.Error(ctx, "Failed to update session: session ID cannot be empty")
-		return errors.New("session id is required")
+		return stderrors.New("session id is required")
 	}
 
 	// Update session in repository
-	err := s.sessionRepo.Update(ctx, session)
+	userID := sessionUserIDFromContext(ctx)
+	existing, err := s.sessionRepo.Get(ctx, session.TenantID, userID, session.ID)
+	if err != nil {
+		return err
+	}
+	if existing != nil {
+		session.Description = types.SanitizeClientSessionDescription(
+			session.Description, existing.Description)
+	}
+
+	_, err = s.sessionRepo.Update(ctx, session, userID)
 	if err != nil {
 		logger.ErrorWithFields(ctx, err, map[string]interface{}{
 			"session_id": session.ID,
@@ -191,16 +441,48 @@ func (s *sessionService) UpdateSession(ctx context.Context, session *types.Sessi
 	return nil
 }
 
+// UpdateSessionLastRequestState persists the input-bar state used by the most
+// recent QA request on this session. Called from the QA handler after a
+// request is accepted so the UI can rehydrate the same settings on reopen.
+// Best-effort: scope mismatches are logged and swallowed — failing to record
+// the UI memo should never fail the user's chat request.
+func (s *sessionService) UpdateSessionLastRequestState(
+	ctx context.Context, sessionID string, state *types.SessionLastRequestState,
+) error {
+	if sessionID == "" {
+		return stderrors.New("session id is required")
+	}
+	tenantID := types.MustTenantIDFromContext(ctx)
+	userID := sessionUserIDFromContext(ctx)
+	affected, err := s.sessionRepo.UpdateLastRequestState(ctx, tenantID, userID, sessionID, state)
+	if err != nil {
+		logger.ErrorWithFields(ctx, err, map[string]interface{}{
+			"session_id": sessionID,
+			"tenant_id":  tenantID,
+		})
+		return err
+	}
+	if affected == 0 {
+		logger.Warnf(ctx, "UpdateSessionLastRequestState: no rows affected for session %s", sessionID)
+	}
+	return nil
+}
+
 // DeleteSession removes a session by its ID
 func (s *sessionService) DeleteSession(ctx context.Context, id string) error {
 	// Validate session ID
 	if id == "" {
 		logger.Error(ctx, "Failed to delete session: session ID cannot be empty")
-		return errors.New("session id is required")
+		return stderrors.New("session id is required")
 	}
 
 	// Get tenant ID from context
 	tenantID := types.MustTenantIDFromContext(ctx)
+	userID := sessionUserIDFromContext(ctx)
+
+	if _, err := s.sessionRepo.Get(ctx, tenantID, userID, id); err != nil {
+		return err
+	}
 
 	// Cleanup chat history knowledge entries for this session (async, best-effort).
 	// Use WithoutCancel so the goroutine survives after the HTTP request context is done.
@@ -212,30 +494,44 @@ func (s *sessionService) DeleteSession(ctx context.Context, id string) error {
 			return
 		}
 		if len(knowledgeIDs) > 0 {
-			if err := s.knowledgeService.DeleteKnowledgeList(bgCtx, knowledgeIDs); err != nil {
+			if err := deleteReferencedKnowledge(bgCtx, s.knowledgeService, "", knowledgeIDs); err != nil {
 				logger.Warnf(bgCtx, "Failed to delete chat history knowledge for session %s: %v", id, err)
 			}
 		}
 	}()
+
+	// NOTE: Skill-generated artifact blobs are intentionally NOT purged here.
+	// Their lifecycle mirrors messages, which are soft-deleted (deleted_at
+	// timestamp) rather than physically removed. Hard-deleting the blobs on a
+	// soft session delete would (a) diverge from message semantics, (b) make
+	// any future "restore soft-deleted session" flow silently broken, and (c)
+	// leave 404s in the download endpoint if the message row is ever surfaced
+	// again. A dedicated GC job or explicit hard-delete API is the right
+	// place to reclaim storage — not this soft-delete path.
 
 	// Cleanup temporary KB stored in Redis for this session
 	if err := s.webSearchStateRepo.DeleteWebSearchTempKBState(ctx, id); err != nil {
 		logger.Warnf(ctx, "Failed to cleanup temporary KB for session %s: %v", id, err)
 	}
 
-	// Cleanup conversation context stored in Redis for this session
-	if err := s.sessionStorage.Delete(ctx, id); err != nil {
-		logger.Warnf(ctx, "Failed to cleanup conversation context for session %s: %v", id, err)
+	if s.suggestionRepo != nil {
+		if err := s.suggestionRepo.DeleteBySessionID(ctx, tenantID, id); err != nil {
+			logger.Warnf(ctx, "Failed to delete suggestions for session %s: %v", id, err)
+		}
 	}
 
+	s.destroyBoundSandbox(ctx, id)
 	// Delete session from repository
-	err := s.sessionRepo.Delete(ctx, tenantID, id)
+	rows, err := s.sessionRepo.Delete(ctx, tenantID, userID, id)
 	if err != nil {
 		logger.ErrorWithFields(ctx, err, map[string]interface{}{
 			"session_id": id,
 			"tenant_id":  tenantID,
 		})
 		return err
+	}
+	if rows == 0 {
+		return apperrors.ErrSessionNotFound
 	}
 
 	return nil
@@ -245,15 +541,28 @@ func (s *sessionService) DeleteSession(ctx context.Context, id string) error {
 func (s *sessionService) BatchDeleteSessions(ctx context.Context, ids []string) error {
 	if len(ids) == 0 {
 		logger.Error(ctx, "Failed to batch delete sessions: IDs list is empty")
-		return errors.New("session ids are required")
+		return stderrors.New("session ids are required")
 	}
 
 	// Get tenant ID from context
 	tenantID := types.MustTenantIDFromContext(ctx)
+	userID := sessionUserIDFromContext(ctx)
+
+	visibleIDs := make([]string, 0, len(ids))
+	for _, id := range ids {
+		if _, err := s.sessionRepo.Get(ctx, tenantID, userID, id); err == nil {
+			visibleIDs = append(visibleIDs, id)
+		} else if !stderrors.Is(err, apperrors.ErrSessionNotFound) {
+			return err
+		}
+	}
+	if len(visibleIDs) == 0 {
+		return apperrors.ErrSessionNotFound
+	}
 
 	// Cleanup associated resources for each session
 	bgCtx := context.WithoutCancel(ctx)
-	for _, id := range ids {
+	for _, id := range visibleIDs {
 		// Cleanup chat history knowledge entries (async, best-effort)
 		go func(sessionID string) {
 			knowledgeIDs, err := s.messageRepo.GetKnowledgeIDsBySessionID(bgCtx, sessionID)
@@ -262,7 +571,7 @@ func (s *sessionService) BatchDeleteSessions(ctx context.Context, ids []string) 
 				return
 			}
 			if len(knowledgeIDs) > 0 {
-				if err := s.knowledgeService.DeleteKnowledgeList(bgCtx, knowledgeIDs); err != nil {
+				if err := deleteReferencedKnowledge(bgCtx, s.knowledgeService, "", knowledgeIDs); err != nil {
 					logger.Warnf(bgCtx, "Failed to delete chat history knowledge for session %s: %v", sessionID, err)
 				}
 			}
@@ -271,18 +580,29 @@ func (s *sessionService) BatchDeleteSessions(ctx context.Context, ids []string) 
 		if err := s.webSearchStateRepo.DeleteWebSearchTempKBState(ctx, id); err != nil {
 			logger.Warnf(ctx, "Failed to cleanup temporary KB for session %s: %v", id, err)
 		}
-		if err := s.sessionStorage.Delete(ctx, id); err != nil {
-			logger.Warnf(ctx, "Failed to cleanup conversation context for session %s: %v", id, err)
-		}
+		// Artifact blobs are kept alongside soft-deleted messages — see
+		// DeleteSession for the rationale.
+	}
+
+	// Tear down sandboxes while session rows (and pins) are still readable.
+	for _, id := range visibleIDs {
+		s.destroyBoundSandbox(ctx, id)
 	}
 
 	// Batch delete sessions from repository
-	if err := s.sessionRepo.BatchDelete(ctx, tenantID, ids); err != nil {
+	if _, err := s.sessionRepo.BatchDelete(ctx, tenantID, userID, visibleIDs); err != nil {
 		logger.ErrorWithFields(ctx, err, map[string]interface{}{
-			"session_ids": ids,
+			"session_ids": visibleIDs,
 			"tenant_id":   tenantID,
 		})
 		return err
+	}
+	if s.suggestionRepo != nil {
+		for _, id := range visibleIDs {
+			if err := s.suggestionRepo.DeleteBySessionID(ctx, tenantID, id); err != nil {
+				logger.Warnf(ctx, "Failed to delete suggestions for session %s: %v", id, err)
+			}
+		}
 	}
 
 	return nil
@@ -291,9 +611,10 @@ func (s *sessionService) BatchDeleteSessions(ctx context.Context, ids []string) 
 // DeleteAllSessions deletes all sessions for the current tenant
 func (s *sessionService) DeleteAllSessions(ctx context.Context) error {
 	tenantID := types.MustTenantIDFromContext(ctx)
+	userID := sessionUserIDFromContext(ctx)
 	logger.Infof(ctx, "Deleting all sessions for tenant %d", tenantID)
 
-	sessions, err := s.sessionRepo.GetByTenantID(ctx, tenantID)
+	sessions, err := s.sessionRepo.GetByTenantID(ctx, tenantID, userID)
 	if err != nil {
 		logger.Warnf(ctx, "Failed to list sessions for cleanup: %v", err)
 	} else {
@@ -307,7 +628,7 @@ func (s *sessionService) DeleteAllSessions(ctx context.Context) error {
 					return
 				}
 				if len(knowledgeIDs) > 0 {
-					if err := s.knowledgeService.DeleteKnowledgeList(bgCtx, knowledgeIDs); err != nil {
+					if err := deleteReferencedKnowledge(bgCtx, s.knowledgeService, "", knowledgeIDs); err != nil {
 						logger.Warnf(bgCtx, "Failed to delete chat history knowledge for session %s: %v", sessionID, err)
 					}
 				}
@@ -316,21 +637,111 @@ func (s *sessionService) DeleteAllSessions(ctx context.Context) error {
 			if err := s.webSearchStateRepo.DeleteWebSearchTempKBState(ctx, session.ID); err != nil {
 				logger.Warnf(ctx, "Failed to cleanup temporary KB for session %s: %v", session.ID, err)
 			}
-			if err := s.sessionStorage.Delete(ctx, session.ID); err != nil {
-				logger.Warnf(ctx, "Failed to cleanup conversation context for session %s: %v", session.ID, err)
-			}
+			// Artifact blobs are kept alongside soft-deleted messages — see
+			// DeleteSession for the rationale.
 		}
 	}
 
-	if err := s.sessionRepo.DeleteAllByTenantID(ctx, tenantID); err != nil {
+	// Tear down sandboxes while session rows (and pins) are still readable.
+	if sessions != nil {
+		for _, session := range sessions {
+			s.destroyBoundSandbox(ctx, session.ID)
+		}
+	}
+
+	if _, err := s.sessionRepo.DeleteAllByTenantID(ctx, tenantID, userID); err != nil {
 		logger.ErrorWithFields(ctx, err, map[string]interface{}{
 			"tenant_id": tenantID,
 		})
 		return err
 	}
+	if s.suggestionRepo != nil && sessions != nil {
+		for _, session := range sessions {
+			if err := s.suggestionRepo.DeleteBySessionID(ctx, tenantID, session.ID); err != nil {
+				logger.Warnf(ctx, "Failed to delete suggestions for session %s: %v", session.ID, err)
+			}
+		}
+	}
 
 	logger.Infof(ctx, "All sessions deleted for tenant %d", tenantID)
 	return nil
+}
+
+// destroyBoundSandbox tears down the sandbox MicroVM bound to sessionID, if
+// the configured sandbox backend supports session-scoped instances.
+//
+// Only SessionBoundManager implements the DestroySession method, which every
+// session-scoped backend resolves to (Cube, E2B, Docker). For Disabled
+// the type assertion fails and the call is a no-op — that backend holds no
+// resources keyed on session ID.
+//
+// Errors are logged but never propagated: sandbox teardown must not block
+// session deletion. Call this while the session row is still live so the
+// sandbox_config_id pin resolves to the correct named backend.
+func (s *sessionService) destroyBoundSandbox(ctx context.Context, sessionID string) {
+	if sessionID == "" {
+		return
+	}
+	// Resolve the workspace's own manager: the sandbox to release lives on
+	// whichever backend that workspace is configured for, not necessarily the
+	// process-wide default.
+	tenantID, _ := types.TenantIDFromContext(ctx)
+	configID, err := sandboxConfigForExistingSandbox(ctx, s.sandboxPinner, sessionID)
+	if err != nil {
+		logger.Warnf(ctx, "Failed to read sandbox pin for session %s cleanup: %v", sessionID, err)
+		return
+	}
+	// An empty pin normally means there is nothing to destroy, but sessions
+	// whose sandbox predates the pin column also read as empty. Falling through
+	// to the default manager keeps those reachable: DestroySession is a cheap
+	// binding lookup that no-ops when the session truly has no sandbox, whereas
+	// skipping would abandon a paused instance that keeps billing.
+	//
+	// Pass nil policy so the workspace kill switch cannot strand an already
+	// created sandbox: disabling script execution must still allow teardown.
+	mgr, err := resolveTenantSandboxForConfig(ctx, s.sandboxResolver, s.sandboxMgr, tenantID, configID, nil)
+	if err != nil {
+		logger.Warnf(ctx, "Failed to resolve sandbox for session %s cleanup: %v", sessionID, err)
+		return
+	}
+	if mgr == nil {
+		return
+	}
+	destroyer, ok := mgr.(interface {
+		DestroySession(context.Context, string) error
+	})
+	if !ok {
+		return
+	}
+	if err := destroyer.DestroySession(ctx, sessionID); err != nil {
+		logger.Warnf(ctx, "Failed to destroy sandbox for session %s: %v", sessionID, err)
+		return
+	}
+	if s.sandboxPinner != nil {
+		if err := s.sandboxPinner.Clear(ctx, sessionID); err != nil {
+			logger.Warnf(ctx, "Failed to clear sandbox pin for session %s: %v", sessionID, err)
+		}
+	}
+}
+
+// maxSessionTitleRunes bounds the auto-generated session title. sessions.title
+// is VARCHAR(255) in every shipped migration, so an over-long model response
+// would be rejected by the database; 100 runes stays well clear of that limit
+// while still being a reasonable title length in the UI.
+const maxSessionTitleRunes = 100
+
+// sanitizeGeneratedTitle turns a raw title completion into something safe to
+// persist: the reasoning prefix some models emit is dropped, surrounding
+// whitespace is trimmed, and the result is truncated by rune (not byte) so a
+// multi-byte character is never cut in half. It reports whether truncation
+// happened so the caller can log it.
+func sanitizeGeneratedTitle(raw string) (string, bool) {
+	title := strings.TrimSpace(strings.TrimPrefix(raw, "<think>\n\n</think>"))
+	runes := []rune(title)
+	if len(runes) <= maxSessionTitleRunes {
+		return title, false
+	}
+	return strings.TrimSpace(string(runes[:maxSessionTitleRunes])), true
 }
 
 // GenerateTitle generates a title for the current conversation content
@@ -340,7 +751,7 @@ func (s *sessionService) GenerateTitle(ctx context.Context,
 ) (string, error) {
 	if session == nil {
 		logger.Error(ctx, "Failed to generate title: session cannot be empty")
-		return "", errors.New("session cannot be empty")
+		return "", stderrors.New("session cannot be empty")
 	}
 
 	// Skip if title already exists
@@ -370,7 +781,7 @@ func (s *sessionService) GenerateTitle(ctx context.Context,
 	// Ensure a user message was found
 	if message == nil {
 		logger.Error(ctx, "No user message found, cannot generate title")
-		return "", errors.New("no user message found")
+		return "", stderrors.New("no user message found")
 	}
 
 	// Use provided modelID, or fallback to first available KnowledgeQA model
@@ -392,7 +803,7 @@ func (s *sessionService) GenerateTitle(ctx context.Context,
 		}
 		if modelID == "" {
 			logger.Error(ctx, "No KnowledgeQA model found")
-			return "", errors.New("no KnowledgeQA model available for title generation")
+			return "", stderrors.New("no KnowledgeQA model available for title generation")
 		}
 	} else {
 		logger.Infof(ctx, "Using specified model for title generation: %s", modelID)
@@ -430,10 +841,17 @@ func (s *sessionService) GenerateTitle(ctx context.Context,
 	}
 
 	// Process and store the generated title
-	session.Title = strings.TrimPrefix(response.Content, "<think>\n\n</think>")
+	title, truncated := sanitizeGeneratedTitle(response.Content)
+	if truncated {
+		logger.Warnf(ctx,
+			"Generated session title exceeded %d runes and was truncated, session=%s, model=%s",
+			maxSessionTitleRunes, session.ID, modelID,
+		)
+	}
+	session.Title = title
 
 	// Update session with new title
-	err = s.sessionRepo.Update(ctx, session)
+	_, err = s.sessionRepo.Update(ctx, session, session.UserID)
 	if err != nil {
 		logger.ErrorWithFields(ctx, err, nil)
 		return "", err
@@ -454,7 +872,7 @@ func (s *sessionService) GenerateTitleAsync(
 	eventBus *event.EventBus,
 ) {
 	// Use context tenant (effective tenant when using shared agent) so ListModels/GetChatModel find the agent's model.
-	// sessionRepo.Update uses session.TenantID in WHERE, so the session row is updated correctly regardless of ctx.
+	// The session row itself is still updated by its persisted tenant/user owner scope.
 	tenantID := ctx.Value(types.TenantIDContextKey)
 	requestID := ctx.Value(types.RequestIDContextKey)
 	language := ctx.Value(types.LanguageContextKey)
@@ -518,9 +936,58 @@ func (s *sessionService) GenerateTitleAsync(
 	}()
 }
 
-// ClearContext clears the LLM context for a session
-// This is useful when switching knowledge bases or agent modes to prevent context contamination
-func (s *sessionService) ClearContext(ctx context.Context, sessionID string) error {
-	logger.Infof(ctx, "Clearing context for session: %s", sessionID)
-	return s.sessionStorage.Delete(ctx, sessionID)
+// holdSandboxTurn opens a chat-turn lease on the session's remote sandbox so
+// a skill-image change mid-turn cannot rebuild the VM between tool calls.
+// The first resolve of this turn may still pick up a stale mark from the
+// previous turn. The returned closer must be called.
+func (s *sessionService) holdSandboxTurn(
+	ctx context.Context, sessionID, configID string,
+) func() {
+	if strings.TrimSpace(sessionID) == "" {
+		return func() {}
+	}
+	begin := func(mgr sandbox.Manager) sandbox.SessionTurnHolder {
+		if mgr == nil {
+			return nil
+		}
+		holder, ok := mgr.(sandbox.SessionTurnHolder)
+		if !ok {
+			return nil
+		}
+		if err := holder.BeginSessionTurn(ctx, sessionID); err != nil {
+			logger.Warnf(ctx, "[sandbox] begin turn for session %s failed: %v", sessionID, err)
+			return nil
+		}
+		return holder
+	}
+
+	if holder := begin(s.sandboxMgr); holder != nil {
+		return func() {
+			if err := holder.EndSessionTurn(ctx, sessionID); err != nil {
+				logger.Warnf(ctx, "[sandbox] end turn for session %s failed: %v", sessionID, err)
+			}
+		}
+	}
+
+	tenantID, _ := types.TenantIDFromContext(ctx)
+	if s.sandboxResolver == nil || tenantID == 0 {
+		return func() {}
+	}
+	mgr, err := resolveTenantSandboxForConfig(
+		ctx, s.sandboxResolver, s.sandboxMgr, tenantID, configID, s.sandboxPolicy,
+	)
+	if err != nil {
+		logger.Warnf(ctx, "[sandbox] resolve config %s to begin turn of session %s failed: %v",
+			configID, sessionID, err)
+		return func() {}
+	}
+	holder := begin(mgr)
+	if holder == nil {
+		return func() {}
+	}
+	return func() {
+		if err := holder.EndSessionTurn(ctx, sessionID); err != nil {
+			logger.Warnf(ctx, "[sandbox] end turn for session %s failed: %v", sessionID, err)
+		}
+	}
 }

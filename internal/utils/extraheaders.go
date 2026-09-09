@@ -11,6 +11,7 @@ var reservedHeaderKeys = map[string]struct{}{
 	"authorization":     {},
 	"api-key":           {},
 	"x-api-key":         {},
+	"x-goog-api-key":    {},
 	"content-type":      {},
 	"content-length":    {},
 	"accept-encoding":   {},
@@ -74,7 +75,7 @@ func WrapHTTPClientWithHeaders(client *http.Client, headers map[string]string) *
 		return client
 	}
 	if client == nil {
-		client = &http.Client{}
+		client = NewSSRFSafeHTTPClient(DefaultSSRFSafeHTTPClientConfig())
 	}
 	base := client.Transport
 	if base == nil {

@@ -3,7 +3,6 @@ package file
 import (
 	"fmt"
 	"os"
-	"path/filepath"
 	"strings"
 
 	"github.com/Tencent/WeKnora/internal/types"
@@ -38,16 +37,12 @@ func NewFileServiceFromStorageConfig(
 	case "local":
 		baseDir := localBaseDir
 		if sec != nil && sec.Local != nil {
-			rawPrefix := strings.TrimSpace(sec.Local.PathPrefix)
-			prefix := strings.Trim(rawPrefix, "/\\")
-			if prefix != "" {
-				candidate := filepath.Join(baseDir, prefix)
-				if safeBaseDir, err := secutils.SafePathUnderBase(baseDir, candidate); err == nil {
-					baseDir = safeBaseDir
-				}
+			if safeBaseDir, err := secutils.SafeJoinUnderBase(baseDir, sec.Local.PathPrefix); err == nil {
+				baseDir = safeBaseDir
 			}
 		}
-		return NewLocalFileService(baseDir), p, nil
+		externalURL := strings.TrimSpace(os.Getenv("APP_EXTERNAL_URL"))
+		return NewLocalFileService(baseDir, externalURL), p, nil
 
 	case "minio":
 		if sec == nil || sec.MinIO == nil {
@@ -81,24 +76,65 @@ func NewFileServiceFromStorageConfig(
 		if pathPrefix == "" {
 			pathPrefix = "weknora"
 		}
-		svc, err := NewCosFileService(sec.COS.BucketName, sec.COS.Region, sec.COS.SecretID, sec.COS.SecretKey, pathPrefix)
+		svc, err := NewCosFileServiceWithTempBucket(sec.COS.BucketName, sec.COS.Region, sec.COS.SecretID, sec.COS.SecretKey, pathPrefix, sec.COS.TempBucketName, sec.COS.TempRegion)
 		return svc, p, err
 
 	case "tos":
 		if sec == nil || sec.TOS == nil || sec.TOS.Endpoint == "" || sec.TOS.Region == "" || sec.TOS.AccessKey == "" || sec.TOS.SecretKey == "" || sec.TOS.BucketName == "" {
 			return nil, p, fmt.Errorf("incomplete tos config")
 		}
-		svc, err := NewTosFileService(sec.TOS.Endpoint, sec.TOS.Region, sec.TOS.AccessKey, sec.TOS.SecretKey, sec.TOS.BucketName, sec.TOS.PathPrefix)
+		svc, err := NewTosFileServiceWithTempBucket(sec.TOS.Endpoint, sec.TOS.Region, sec.TOS.AccessKey, sec.TOS.SecretKey, sec.TOS.BucketName, sec.TOS.PathPrefix, sec.TOS.TempBucketName, sec.TOS.TempRegion)
 		return svc, p, err
 	case "s3":
-		if sec == nil || sec.S3 == nil || sec.S3.Endpoint == "" || sec.S3.Region == "" || sec.S3.AccessKey == "" || sec.S3.SecretKey == "" || sec.S3.BucketName == "" {
+		if sec == nil || sec.S3 == nil || sec.S3.Region == "" || sec.S3.BucketName == "" || (sec.S3.AccessKey == "") != (sec.S3.SecretKey == "") {
 			return nil, p, fmt.Errorf("incomplete s3 config")
 		}
 		pathPrefix := strings.TrimSpace(sec.S3.PathPrefix)
 		if pathPrefix == "" {
 			pathPrefix = "weknora/"
 		}
-		svc, err := NewS3FileService(sec.S3.Endpoint, sec.S3.AccessKey, sec.S3.SecretKey, sec.S3.BucketName, sec.S3.Region, pathPrefix)
+		svc, err := NewS3FileServiceWithOptions(sec.S3.Endpoint, sec.S3.AccessKey, sec.S3.SecretKey, sec.S3.BucketName, sec.S3.Region, pathPrefix, sec.S3.ForcePathStyle)
+		return svc, p, err
+
+	case "obs":
+		obsEndpoint, obsRegion, obsAccessKey := "", "", ""
+		obsSecretKey, obsBucketName, obsPathPrefix := "", "", ""
+		if sec != nil && sec.OBS != nil {
+			obsEndpoint = strings.TrimSpace(sec.OBS.Endpoint)
+			obsRegion = strings.TrimSpace(sec.OBS.Region)
+			obsAccessKey = strings.TrimSpace(sec.OBS.AccessKey)
+			obsSecretKey = strings.TrimSpace(sec.OBS.SecretKey)
+			obsBucketName = strings.TrimSpace(sec.OBS.BucketName)
+			obsPathPrefix = strings.TrimSpace(sec.OBS.PathPrefix)
+		}
+		if obsEndpoint == "" {
+			obsEndpoint = strings.TrimSpace(os.Getenv("OBS_ENDPOINT"))
+		}
+		if obsRegion == "" {
+			obsRegion = strings.TrimSpace(os.Getenv("OBS_REGION"))
+		}
+		if obsAccessKey == "" {
+			obsAccessKey = strings.TrimSpace(os.Getenv("OBS_ACCESS_KEY"))
+		}
+		if obsSecretKey == "" {
+			obsSecretKey = strings.TrimSpace(os.Getenv("OBS_SECRET_KEY"))
+		}
+		if obsBucketName == "" {
+			obsBucketName = strings.TrimSpace(os.Getenv("OBS_BUCKET_NAME"))
+		}
+		if obsPathPrefix == "" {
+			obsPathPrefix = strings.TrimSpace(os.Getenv("OBS_PATH_PREFIX"))
+		}
+		if obsPathPrefix == "" {
+			obsPathPrefix = "weknora/"
+		}
+		if obsEndpoint == "" || obsAccessKey == "" || obsSecretKey == "" || obsBucketName == "" {
+			return nil, p, fmt.Errorf("incomplete obs config")
+		}
+		if obsRegion == "" {
+			obsRegion = "cn-north-4"
+		}
+		svc, err := NewObsFileService(obsEndpoint, obsRegion, obsAccessKey, obsSecretKey, obsBucketName, obsPathPrefix)
 		return svc, p, err
 
 	case "oss":
@@ -123,6 +159,17 @@ func NewFileServiceFromStorageConfig(
 				sec.OSS.BucketName, pathPrefix,
 			)
 		}
+		return svc, p, err
+
+	case "ks3":
+		if sec == nil || sec.KS3 == nil || sec.KS3.Endpoint == "" || sec.KS3.Region == "" || sec.KS3.AccessKey == "" || sec.KS3.SecretKey == "" || sec.KS3.BucketName == "" {
+			return nil, p, fmt.Errorf("incomplete ks3 config")
+		}
+		pathPrefix := strings.TrimSpace(sec.KS3.PathPrefix)
+		if pathPrefix == "" {
+			pathPrefix = "weknora/"
+		}
+		svc, err := NewKS3FileService(sec.KS3.Endpoint, sec.KS3.Region, sec.KS3.AccessKey, sec.KS3.SecretKey, sec.KS3.BucketName, pathPrefix)
 		return svc, p, err
 
 	default:

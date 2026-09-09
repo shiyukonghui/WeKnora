@@ -11,6 +11,7 @@ import (
 	"strings"
 	"time"
 
+	"github.com/Tencent/WeKnora/internal/logger"
 	"github.com/Tencent/WeKnora/internal/types/interfaces"
 	"github.com/Tencent/WeKnora/internal/utils"
 	"github.com/google/uuid"
@@ -35,10 +36,17 @@ func NewTosFileService(endpoint, region, accessKey, secretKey, bucketName, pathP
 
 // NewTosFileServiceWithTempBucket creates a TOS file service with optional temp bucket.
 func NewTosFileServiceWithTempBucket(endpoint, region, accessKey, secretKey, bucketName, pathPrefix, tempBucketName, tempRegion string) (interfaces.FileService, error) {
+	if err := utils.ValidateURLForSSRF(endpoint); err != nil {
+		return nil, fmt.Errorf("unsafe TOS endpoint: %w", err)
+	}
+	httpConfig := utils.DefaultSSRFSafeHTTPClientConfig()
 	client, err := tos.NewClientV2(
 		endpoint,
 		tos.WithRegion(region),
 		tos.WithCredentials(tos.NewStaticCredentials(accessKey, secretKey)),
+		tos.WithHTTPTransport(&utils.SSRFValidatingRoundTripper{
+			Base: utils.NewSSRFSafeTransport(httpConfig),
+		}),
 	)
 	if err != nil {
 		return nil, fmt.Errorf("failed to initialize TOS client: %w", err)
@@ -57,6 +65,9 @@ func NewTosFileServiceWithTempBucket(endpoint, region, accessKey, secretKey, buc
 			endpoint,
 			tos.WithRegion(tempRegion),
 			tos.WithCredentials(tos.NewStaticCredentials(accessKey, secretKey)),
+			tos.WithHTTPTransport(&utils.SSRFValidatingRoundTripper{
+				Base: utils.NewSSRFSafeTransport(httpConfig),
+			}),
 		)
 		if err != nil {
 			return nil, fmt.Errorf("failed to initialize TOS temp client: %w", err)
@@ -86,10 +97,16 @@ func (s *tosFileService) CheckConnectivity(ctx context.Context) error {
 
 // CheckTosConnectivity tests TOS connectivity using the provided credentials.
 func CheckTosConnectivity(ctx context.Context, endpoint, region, accessKey, secretKey, bucketName string) error {
+	if err := utils.ValidateURLForSSRF(endpoint); err != nil {
+		return fmt.Errorf("unsafe TOS endpoint: %w", err)
+	}
 	client, err := tos.NewClientV2(
 		endpoint,
 		tos.WithRegion(region),
 		tos.WithCredentials(tos.NewStaticCredentials(accessKey, secretKey)),
+		tos.WithHTTPTransport(&utils.SSRFValidatingRoundTripper{
+			Base: utils.NewSSRFSafeTransport(utils.DefaultSSRFSafeHTTPClientConfig()),
+		}),
 	)
 	if err != nil {
 		return fmt.Errorf("failed to initialize TOS client: %w", err)
@@ -223,6 +240,43 @@ func (s *tosFileService) SaveBytes(ctx context.Context, data []byte, tenantID ui
 	}
 
 	return fmt.Sprintf("tos://%s/%s", targetBucket, objectName), nil
+}
+
+// CopyFile copies an existing TOS object to a new knowledge-owned object using a
+// server-side CopyObject (no data leaves TOS). The destination uses the same
+// layout as SaveFile. Returns ErrCrossBackendCopy when srcPath is not a tos:// path.
+func (s *tosFileService) CopyFile(ctx context.Context,
+	srcPath string, tenantID uint64, knowledgeID string,
+) (string, error) {
+	srcBucket, srcKey, err := parseTOSFilePath(srcPath)
+	if err != nil {
+		return "", fmt.Errorf("tos copy rejected source %q: %w", srcPath, ErrCrossBackendCopy)
+	}
+	if err := utils.SafeObjectKey(srcKey); err != nil {
+		return "", fmt.Errorf("invalid source path: %w", err)
+	}
+
+	ext := filepath.Ext(srcPath)
+	destKey := joinTOSObjectKey(
+		s.pathPrefix,
+		fmt.Sprintf("%d", tenantID),
+		knowledgeID,
+		uuid.New().String()+ext,
+	)
+
+	_, err = s.client.CopyObject(ctx, &tos.CopyObjectInput{
+		Bucket:    s.bucketName,
+		Key:       destKey,
+		SrcBucket: srcBucket,
+		SrcKey:    srcKey,
+	})
+	if err != nil {
+		return "", fmt.Errorf("failed to copy file in TOS: %w", err)
+	}
+
+	newPath := fmt.Sprintf("tos://%s/%s", s.bucketName, destKey)
+	logger.Infof(ctx, "Copied TOS object %s to %s", srcPath, newPath)
+	return newPath, nil
 }
 
 func (s *tosFileService) GetFile(ctx context.Context, filePath string) (io.ReadCloser, error) {

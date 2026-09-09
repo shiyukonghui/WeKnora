@@ -43,6 +43,9 @@ type qaRequest struct {
 	channel   *IMChannel
 	channelID string
 
+	// tenant is used to resolve provider:// URLs in outbound replies (scheme-aware).
+	tenant *types.Tenant
+
 	// userKey is "channelID:userID:chatID", used for per-user limits and /stop.
 	userKey    string
 	enqueuedAt time.Time

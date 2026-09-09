@@ -10,7 +10,6 @@ CREATE TABLE IF NOT EXISTS tenants (
     id SERIAL PRIMARY KEY,
     name VARCHAR(255) NOT NULL,
     description TEXT,
-    api_key VARCHAR(256) NOT NULL,
     retriever_engines JSONB NOT NULL DEFAULT '[]',
     status VARCHAR(50) DEFAULT 'active',
     business VARCHAR(255) NOT NULL,
@@ -28,7 +27,6 @@ COMMENT ON COLUMN tenants.agent_config IS 'Tenant-level agent configuration in J
 ALTER SEQUENCE tenants_id_seq RESTART WITH 10000;
 
 -- Add indexes
-CREATE INDEX IF NOT EXISTS idx_tenants_api_key ON tenants(api_key);
 CREATE INDEX IF NOT EXISTS idx_tenants_status ON tenants(status);
 
 -- Create model table
@@ -36,6 +34,7 @@ CREATE TABLE IF NOT EXISTS models (
     id VARCHAR(64) PRIMARY KEY DEFAULT uuid_generate_v4(),
     tenant_id INTEGER NOT NULL,
     name VARCHAR(255) NOT NULL,
+    display_name VARCHAR(255) NOT NULL DEFAULT '',
     type VARCHAR(50) NOT NULL,
     source VARCHAR(50) NOT NULL,
     description TEXT,
@@ -65,6 +64,7 @@ CREATE TABLE IF NOT EXISTS knowledge_bases (
     cos_config JSONB NOT NULL DEFAULT '{}',
     vlm_config JSONB NOT NULL DEFAULT '{}',
     extract_config JSONB NULL DEFAULT NULL,
+    auto_tag_config JSONB NULL,
     created_at TIMESTAMP WITH TIME ZONE DEFAULT CURRENT_TIMESTAMP,
     updated_at TIMESTAMP WITH TIME ZONE DEFAULT CURRENT_TIMESTAMP,
     deleted_at TIMESTAMP WITH TIME ZONE
@@ -81,7 +81,7 @@ CREATE TABLE IF NOT EXISTS knowledges (
     type VARCHAR(50) NOT NULL,
     title VARCHAR(255) NOT NULL,
     description TEXT,
-    source VARCHAR(128) NOT NULL,
+    source VARCHAR(2048) NOT NULL,
     parse_status VARCHAR(50) NOT NULL DEFAULT 'unprocessed',
     enable_status VARCHAR(50) NOT NULL DEFAULT 'enabled',
     embedding_model_id VARCHAR(64),

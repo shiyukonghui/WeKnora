@@ -3,12 +3,10 @@ package repository
 import (
 	"context"
 	"errors"
-	"strings"
 
 	"github.com/Tencent/WeKnora/internal/logger"
 	"github.com/Tencent/WeKnora/internal/types"
 	"github.com/Tencent/WeKnora/internal/types/interfaces"
-	"github.com/Tencent/WeKnora/internal/utils"
 	"gorm.io/gorm"
 	"gorm.io/gorm/clause"
 )
@@ -43,6 +41,27 @@ func (r *tenantRepository) GetTenantByID(ctx context.Context, id uint64) (*types
 		return nil, err
 	}
 	return &tenant, nil
+}
+
+// GetTenantsByIDs batches GetTenantByID with a single IN-list query.
+// Returns a map keyed by tenant ID; missing rows are simply absent from
+// the map (no error). An empty input slice short-circuits to an empty map
+// without hitting the database.
+func (r *tenantRepository) GetTenantsByIDs(ctx context.Context, ids []uint64) (map[uint64]*types.Tenant, error) {
+	if len(ids) == 0 {
+		return map[uint64]*types.Tenant{}, nil
+	}
+	var tenants []*types.Tenant
+	if err := r.db.WithContext(ctx).Where("id IN ?", ids).Find(&tenants).Error; err != nil {
+		return nil, err
+	}
+	out := make(map[uint64]*types.Tenant, len(tenants))
+	for _, t := range tenants {
+		if t != nil {
+			out[t.ID] = t
+		}
+	}
+	return out, nil
 }
 
 // ListTenants lists all tenants
@@ -95,32 +114,21 @@ func (r *tenantRepository) SearchTenants(ctx context.Context, keyword string, te
 }
 
 // UpdateTenant updates tenant.
-// Handles api_key carefully because db.Updates() does not trigger the BeforeSave
-// GORM hook. Without this guard, AfterFind-decrypted plaintext would silently
-// overwrite the encrypted value in the database.
-//
-// Strategy:
-//   - enc:v1:… (pre-encrypted by CreateTenant / UpdateAPIKey): write as-is.
-//   - plaintext (decrypted by AfterFind): blank it so GORM skips the column.
-//   - SYSTEM_AES_KEY not set: write as-is (encryption disabled).
-//
-// The caller's in-memory struct is always restored after the write.
 func (r *tenantRepository) UpdateTenant(ctx context.Context, tenant *types.Tenant) error {
-	origAPIKey := tenant.APIKey
-	if key := utils.GetAESKey(); key != nil && tenant.APIKey != "" &&
-		!strings.HasPrefix(tenant.APIKey, utils.EncPrefix) {
-		// Plaintext from AfterFind — do not write back; let the DB keep its
-		// existing encrypted value untouched.
-		tenant.APIKey = ""
-	}
-	err := r.db.WithContext(ctx).Model(&types.Tenant{}).Where("id = ?", tenant.ID).Updates(tenant).Error
-	tenant.APIKey = origAPIKey
-	return err
+	return r.db.WithContext(ctx).Model(&types.Tenant{}).Where("id = ?", tenant.ID).Updates(tenant).Error
 }
 
-// DeleteTenant deletes tenant
+// DeleteTenant soft-deletes the tenant and every active membership row
+// for that tenant in one transaction. Without the membership purge,
+// /auth/me still lists the defunct tenant (name lookup fails → UI shows
+// "#<id>").
 func (r *tenantRepository) DeleteTenant(ctx context.Context, id uint64) error {
-	return r.db.WithContext(ctx).Where("id = ?", id).Delete(&types.Tenant{}).Error
+	return r.db.WithContext(ctx).Transaction(func(tx *gorm.DB) error {
+		if err := tx.Where("tenant_id = ?", id).Delete(&types.TenantMember{}).Error; err != nil {
+			return err
+		}
+		return tx.Where("id = ?", id).Delete(&types.Tenant{}).Error
+	})
 }
 
 func (r *tenantRepository) AdjustStorageUsed(ctx context.Context, tenantID uint64, delta int64) error {
@@ -140,4 +148,25 @@ func (r *tenantRepository) AdjustStorageUsed(ctx context.Context, tenantID uint6
 
 		return tx.Save(&tenant).Error
 	})
+}
+
+// BulkSetStorageQuota writes quotaBytes to storage_quota for every
+// tenant in one statement. We don't WHERE-filter (the action is
+// "apply globally"), so the affected count equals the row count of
+// the tenants table.
+//
+// No transaction here: the operation is a single statement and we
+// don't want to hold a long lock just to update a single column. If
+// a concurrent CreateTenant lands in the middle, the new row gets
+// the new default via the system-setting resolver in the handler —
+// no risk of the new tenant being skipped.
+func (r *tenantRepository) BulkSetStorageQuota(ctx context.Context, quotaBytes int64) (int64, error) {
+	res := r.db.WithContext(ctx).
+		Model(&types.Tenant{}).
+		Where("1 = 1"). // GORM refuses unconditional UPDATEs without an explicit WHERE
+		Update("storage_quota", quotaBytes)
+	if res.Error != nil {
+		return 0, res.Error
+	}
+	return res.RowsAffected, nil
 }

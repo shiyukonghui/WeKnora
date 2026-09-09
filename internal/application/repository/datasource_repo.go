@@ -25,10 +25,22 @@ func (r *DataSourceRepository) Create(ctx context.Context, ds *types.DataSource)
 	if ds == nil {
 		return errors.New("data source is nil")
 	}
-	if err := r.db.WithContext(ctx).Create(ds).Error; err != nil {
-		return err
-	}
-	return nil
+	// GORM treats false as the zero value of bool. For a field tagged
+	// default:true it replaces both the INSERT value and the in-memory field
+	// with true, so a caller-selected false would be lost. Capture it, force
+	// the column write, then restore the struct so Create's return value (and
+	// the HTTP 201 body) match the database.
+	syncDeletions := ds.SyncDeletions
+	err := r.db.WithContext(ctx).Transaction(func(tx *gorm.DB) error {
+		if err := tx.Create(ds).Error; err != nil {
+			return err
+		}
+		return tx.Model(&types.DataSource{}).
+			Where("id = ?", ds.ID).
+			UpdateColumn("sync_deletions", syncDeletions).Error
+	})
+	ds.SyncDeletions = syncDeletions
+	return err
 }
 
 // FindByID retrieves a data source by ID
@@ -73,9 +85,39 @@ func (r *DataSourceRepository) Update(ctx context.Context, ds *types.DataSource)
 	if ds.ID == "" {
 		return errors.New("data source id is empty")
 	}
+	return r.db.WithContext(ctx).Transaction(func(tx *gorm.DB) error {
+		if err := tx.Model(ds).Updates(ds).Error; err != nil {
+			return err
+		}
+		// GORM Updates(struct) deliberately skips zero values, which would make
+		// a user-selected sync_deletions=false impossible to persist.
+		return tx.Model(&types.DataSource{}).
+			Where("id = ?", ds.ID).
+			UpdateColumn("sync_deletions", ds.SyncDeletions).Error
+	})
+}
+
+// UpdateSyncState updates only fields managed by sync execution. GORM's
+// Updates(struct) skips zero values, so use a map here to persist cleared error
+// messages without broadening the generic Update method.
+func (r *DataSourceRepository) UpdateSyncState(ctx context.Context, ds *types.DataSource) error {
+	if ds == nil {
+		return errors.New("data source is nil")
+	}
+	if ds.ID == "" {
+		return errors.New("data source id is empty")
+	}
 	if err := r.db.WithContext(ctx).
-		Model(ds).
-		Updates(ds).Error; err != nil {
+		Model(&types.DataSource{}).
+		Where("id = ?", ds.ID).
+		Updates(map[string]interface{}{
+			"status":           ds.Status,
+			"last_sync_at":     ds.LastSyncAt,
+			"last_sync_cursor": ds.LastSyncCursor,
+			"last_sync_result": ds.LastSyncResult,
+			"error_message":    ds.ErrorMessage,
+			"updated_at":       time.Now().UTC(),
+		}).Error; err != nil {
 		return err
 	}
 	return nil
@@ -87,9 +129,8 @@ func (r *DataSourceRepository) Delete(ctx context.Context, id string) error {
 		return errors.New("id is empty")
 	}
 	if err := r.db.WithContext(ctx).
-		Model(&types.DataSource{}).
 		Where("id = ?", id).
-		Update("deleted_at", gorm.Expr("NOW()")).Error; err != nil {
+		Delete(&types.DataSource{}).Error; err != nil {
 		return err
 	}
 	return nil
@@ -216,6 +257,36 @@ func (r *SyncLogRepository) Update(ctx context.Context, log *types.SyncLog) erro
 	if err := r.db.WithContext(ctx).
 		Model(log).
 		Updates(log).Error; err != nil {
+		return err
+	}
+	return nil
+}
+
+// UpdateResult updates only fields produced by sync execution. Use an explicit
+// map so empty error messages are written when a later sync succeeds.
+func (r *SyncLogRepository) UpdateResult(ctx context.Context, log *types.SyncLog) error {
+	if log == nil {
+		return errors.New("sync log is nil")
+	}
+	if log.ID == "" {
+		return errors.New("sync log id is empty")
+	}
+	if err := r.db.WithContext(ctx).
+		Model(&types.SyncLog{}).
+		Where("id = ?", log.ID).
+		Updates(map[string]interface{}{
+			"status":        log.Status,
+			"finished_at":   log.FinishedAt,
+			"items_total":   log.ItemsTotal,
+			"items_created": log.ItemsCreated,
+			"items_updated": log.ItemsUpdated,
+			"items_deleted": log.ItemsDeleted,
+			"items_skipped": log.ItemsSkipped,
+			"items_failed":  log.ItemsFailed,
+			"error_message": log.ErrorMessage,
+			"result":        log.Result,
+			"updated_at":    time.Now().UTC(),
+		}).Error; err != nil {
 		return err
 	}
 	return nil

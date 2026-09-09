@@ -9,6 +9,24 @@ import (
 	"gorm.io/gorm"
 )
 
+const storageBackendScheme = "storage://"
+
+func BuildStorageBackendPath(backendID, providerPath string) string {
+	return storageBackendScheme + strings.TrimSpace(backendID) + "/" + providerPath
+}
+
+func ParseStorageBackendPath(path string) (backendID, providerPath string, ok bool) {
+	if !strings.HasPrefix(path, storageBackendScheme) {
+		return "", "", false
+	}
+	rest := strings.TrimPrefix(path, storageBackendScheme)
+	parts := strings.SplitN(rest, "/", 2)
+	if len(parts) != 2 || parts[0] == "" || parts[1] == "" {
+		return "", "", false
+	}
+	return parts[0], parts[1], true
+}
+
 // KnowledgeBaseType represents the type of the knowledge base
 const (
 	// KnowledgeBaseTypeDocument represents the document knowledge base type
@@ -49,8 +67,14 @@ type KnowledgeBase struct {
 	IsTemporary bool `yaml:"is_temporary"            json:"is_temporary"            gorm:"default:false"`
 	// Description of the knowledge base
 	Description string `yaml:"description"             json:"description"`
-	// Tenant ID
+	// Workspace ID
 	TenantID uint64 `yaml:"tenant_id"               json:"tenant_id"`
+	// CreatorID records the user ID of whoever originally created the KB.
+	// Used by the workspace-level RBAC middleware to let Contributors edit
+	// their own KBs without granting them access to everyone else's.
+	// Nullable for backward compatibility with rows created before the
+	// RBAC migration backfilled the column to the workspace Owner.
+	CreatorID string `yaml:"creator_id"              json:"creator_id"              gorm:"type:varchar(36);index"`
 	// Chunking configuration
 	ChunkingConfig ChunkingConfig `yaml:"chunking_config"         json:"chunking_config"         gorm:"type:json"`
 	// Image processing configuration
@@ -63,12 +87,15 @@ type KnowledgeBase struct {
 	VLMConfig VLMConfig `yaml:"vlm_config"              json:"vlm_config"              gorm:"type:json"`
 	// ASR config (Automatic Speech Recognition)
 	ASRConfig ASRConfig `yaml:"asr_config"              json:"asr_config"              gorm:"type:json"`
-	// Storage provider config (new): only stores provider selection; credentials from tenant StorageEngineConfig
+	// Storage provider config (new): only stores provider selection; credentials from workspace StorageEngineConfig
 	StorageProviderConfig *StorageProviderConfig `yaml:"storage_provider_config" json:"storage_provider_config"  gorm:"column:storage_provider_config;type:jsonb"`
+	// StorageBackendID binds this KB to one concrete storage instance. The
+	// legacy provider field remains readable during migration only.
+	StorageBackendID *string `yaml:"storage_backend_id" json:"storage_backend_id,omitempty" gorm:"column:storage_backend_id;type:varchar(36);default:null"`
 	// Deprecated: legacy COS config column. Kept for backward compatibility with old data.
 	StorageConfig StorageConfig `yaml:"-" json:"storage_config" gorm:"column:cos_config;type:json"`
 	// VectorStoreID references the VectorStore this knowledge base is bound to.
-	// When nil, the KB falls back to the tenant's effective engines derived from
+	// When nil, the KB falls back to the workspace's effective engines derived from
 	// the RETRIEVE_DRIVER environment variable (env store flow).
 	// This field is set once at creation time and must not be modified afterwards;
 	// enforcement lives at the GORM layer (`<-:create`) plus the service-layer
@@ -80,15 +107,25 @@ type KnowledgeBase struct {
 	FAQConfig *FAQConfig `yaml:"faq_config"              json:"faq_config"              gorm:"column:faq_config;type:json"`
 	// QuestionGenerationConfig stores question generation configuration for document knowledge bases
 	QuestionGenerationConfig *QuestionGenerationConfig `yaml:"question_generation_config" json:"question_generation_config" gorm:"column:question_generation_config;type:json"`
+	// AutoTagConfig controls asynchronous association of existing tags after parsing.
+	AutoTagConfig *AutoTagConfig `yaml:"auto_tag_config" json:"auto_tag_config" gorm:"type:json"`
 	// WikiConfig stores wiki-specific configuration (only for wiki type knowledge bases)
 	WikiConfig *WikiConfig `yaml:"wiki_config"             json:"wiki_config"             gorm:"column:wiki_config;type:json"`
 	// IndexingStrategy controls which indexing pipelines are active for this knowledge base.
 	// Pipelines: vector search, keyword search, wiki generation, knowledge graph extraction.
 	IndexingStrategy IndexingStrategy `yaml:"indexing_strategy"       json:"indexing_strategy"       gorm:"column:indexing_strategy;type:json"`
-	// Whether this knowledge base is pinned to the top of the list
-	IsPinned bool `yaml:"is_pinned"               json:"is_pinned"               gorm:"default:false"`
-	// Time when the knowledge base was pinned (nil if not pinned)
-	PinnedAt *time.Time `yaml:"pinned_at"               json:"pinned_at"`
+	// IsPinned and PinnedAt are computed per-caller from user_kb_pins
+	// (see migration 000050). They used to be stored on the row itself,
+	// which made pinning a workspace-wide ordering decision gated behind
+	// the kb-edit RBAC guard. The columns are still present in legacy
+	// schemas for rollback safety but are no longer read or written by
+	// the application — both fields are tagged `gorm:"-"` so GORM
+	// ignores them on every CRUD call and the list handler stamps them
+	// after enriching with the caller's pin set.
+	IsPinned bool `yaml:"is_pinned"               json:"is_pinned"               gorm:"-"`
+	// PinnedAt records when the current caller pinned this knowledge
+	// base; nil when they have not.
+	PinnedAt *time.Time `yaml:"pinned_at"               json:"pinned_at"               gorm:"-"`
 	// Creation time of the knowledge base
 	CreatedAt time.Time `yaml:"created_at"              json:"created_at"`
 	// Last updated time of the knowledge base
@@ -105,6 +142,10 @@ type KnowledgeBase struct {
 	ProcessingCount int64 `yaml:"processing_count"        json:"processing_count"        gorm:"-"`
 	// ShareCount indicates the number of organizations this knowledge base is shared with (not stored in database)
 	ShareCount int64 `yaml:"share_count"             json:"share_count"             gorm:"-"`
+	// CreatorName 是 CreatorID 对应用户的展示名（username / email 等），
+	// 仅在列表场景由 handler 批量回填，不落库；为空表示创建者无法解析（用户已删除、
+	// CreatorID 为空的老数据等）。前端用它在卡片来源徽章上做 mine vs workspace 的二分。
+	CreatorName string `yaml:"-"                       json:"creator_name,omitempty"  gorm:"-"`
 }
 
 // KnowledgeBaseConfig represents the knowledge base configuration
@@ -117,15 +158,86 @@ type KnowledgeBaseConfig struct {
 	FAQConfig *FAQConfig `yaml:"faq_config"              json:"faq_config"`
 	// Wiki configuration (only for wiki-enabled knowledge bases)
 	WikiConfig *WikiConfig `yaml:"wiki_config"             json:"wiki_config"`
+	// AutoTagConfig controls optional automatic association of existing KB tags.
+	AutoTagConfig *AutoTagConfig `yaml:"auto_tag_config" json:"auto_tag_config"`
 	// IndexingStrategy controls which indexing pipelines are active.
 	// nil means "no change" when updating (preserves existing strategy).
 	IndexingStrategy *IndexingStrategy `yaml:"indexing_strategy"       json:"indexing_strategy"`
+}
+
+const (
+	// DefaultAutoTagMaxTags is applied when max_tags is unset or non-positive.
+	DefaultAutoTagMaxTags = 3
+	// MaximumAutoTagMaxTags caps how many tags one document may auto-acquire.
+	MaximumAutoTagMaxTags = 10
+)
+
+// AutoTagConfig controls asynchronous document auto-tagging. It is deliberately
+// opt-in so upgrading an existing deployment does not add model calls or alter
+// document tags unexpectedly.
+type AutoTagConfig struct {
+	Enabled bool   `yaml:"enabled" json:"enabled"`
+	ModelID string `yaml:"model_id,omitempty" json:"model_id,omitempty"`
+	MaxTags int    `yaml:"max_tags,omitempty" json:"max_tags,omitempty"`
+	// SkipIfTagged leaves documents that already carry tags untouched, so a
+	// deliberate manual classification is not diluted by model guesses. It is
+	// a pointer because the default is true: rows written before this field
+	// existed decode to nil and must not silently flip to "always append".
+	SkipIfTagged *bool `yaml:"skip_if_tagged,omitempty" json:"skip_if_tagged,omitempty"`
+}
+
+// ShouldSkipIfTagged reports whether documents with existing tags are left
+// alone. Defaults to true for nil receivers and unset values.
+func (c *AutoTagConfig) ShouldSkipIfTagged() bool {
+	if c == nil || c.SkipIfTagged == nil {
+		return true
+	}
+	return *c.SkipIfTagged
+}
+
+// Value serializes the automatic-tagging configuration for database storage.
+func (c AutoTagConfig) Value() (driver.Value, error) { return json.Marshal(c) }
+
+// Scan deserializes the automatic-tagging configuration from a database value.
+func (c *AutoTagConfig) Scan(value interface{}) error {
+	if value == nil {
+		return nil
+	}
+	b, ok := value.([]byte)
+	if !ok {
+		if s, ok := value.(string); ok {
+			b = []byte(s)
+		} else {
+			return nil
+		}
+	}
+	return json.Unmarshal(b, c)
+}
+
+// Normalize applies defaults and bounds to the automatic-tagging configuration.
+func (c *AutoTagConfig) Normalize() {
+	if c == nil {
+		return
+	}
+	if c.MaxTags <= 0 {
+		c.MaxTags = DefaultAutoTagMaxTags
+	}
+	if c.MaxTags > MaximumAutoTagMaxTags {
+		c.MaxTags = MaximumAutoTagMaxTags
+	}
+	if c.SkipIfTagged == nil {
+		skip := true
+		c.SkipIfTagged = &skip
+	}
 }
 
 // ParserEngineRule maps a set of file types to a specific parser engine.
 type ParserEngineRule struct {
 	FileTypes []string `yaml:"file_types" json:"file_types"`
 	Engine    string   `yaml:"engine"     json:"engine"`
+	// XLSXFirstRowAsHeader restores row-1 column context for flat XLSX tables.
+	// nil preserves the parser default; an explicit false disables the mode.
+	XLSXFirstRowAsHeader *bool `yaml:"xlsx_first_row_as_header,omitempty" json:"xlsx_first_row_as_header,omitempty"`
 }
 
 // ChunkingConfig represents the document splitting configuration
@@ -136,10 +248,11 @@ type ChunkingConfig struct {
 	ChunkOverlap int `yaml:"chunk_overlap" json:"chunk_overlap"`
 	// Separators
 	Separators []string `yaml:"separators"    json:"separators"`
-	// EnableMultimodal (deprecated, kept for backward compatibility with old data)
-	EnableMultimodal bool `yaml:"enable_multimodal,omitempty" json:"enable_multimodal,omitempty"`
 	// ParserEngineRules configures which parser engine to use for each file type.
-	// When empty, the builtin engine is used for all types.
+	// When empty, DefaultParserEngine is used (builtin/simple routing, except
+	// types that only a specific engine can parse: ppt/pptx fall back to
+	// markitdown). A linked anydoc binding is preferred for every type it
+	// converts.
 	ParserEngineRules []ParserEngineRule `yaml:"parser_engine_rules,omitempty" json:"parser_engine_rules,omitempty"`
 	// EnableParentChild enables two-level parent-child chunking strategy.
 	// When enabled, large parent chunks provide context while small child chunks
@@ -151,26 +264,92 @@ type ChunkingConfig struct {
 	// ChildChunkSize is the size of child chunks used for embedding (default: 384).
 	// Only used when EnableParentChild is true.
 	ChildChunkSize int `yaml:"child_chunk_size,omitempty" json:"child_chunk_size,omitempty"`
+	// Strategy selects the adaptive chunking tier. Empty / "legacy" preserves
+	// the historical recursive splitter; "auto" lets a profiler pick between
+	// heading-aware, heuristic and recursive tiers; "heading" / "heuristic" /
+	// "recursive" pin the tier explicitly.
+	Strategy string `yaml:"strategy,omitempty" json:"strategy,omitempty"`
+	// TokenLimit caps chunk size in approximate tokens. 0 = use ChunkSize
+	// as a character count.
+	TokenLimit int `yaml:"token_limit,omitempty" json:"token_limit,omitempty"`
+	// Languages hints the heuristic patterns. Empty = auto-detect from content.
+	// Examples: ["de"], ["en", "zh"].
+	Languages []string `yaml:"languages,omitempty" json:"languages,omitempty"`
+	// TableMetadataInstructions contains optional business guidance used when
+	// generating searchable summaries for CSV/Excel tables. The system-owned
+	// output contract remains fixed; these instructions only add domain context.
+	TableMetadataInstructions string `yaml:"table_metadata_instructions,omitempty" json:"table_metadata_instructions,omitempty"`
+}
+
+// defaultParserEngineByType maps file types the builtin/simple engines cannot
+// parse to a docreader engine that can. Types omitted here keep empty-string
+// routing (Go simple formats, otherwise docreader builtin) unless
+// SetPreferParserEngine selects a linked in-process engine such as anydoc.
+var defaultParserEngineByType = map[string]string{
+	"ppt":  "markitdown",
+	"pptx": "markitdown",
+}
+
+// preferParserEngine, if set, may override DefaultParserEngine. The
+// docparser package registers anydoc here so types does not import the
+// engine catalog.
+var preferParserEngine func(fileType string) string
+
+// SetPreferParserEngine registers a build-time preference used by
+// DefaultParserEngine. Pass nil to clear. Intended to be called from init().
+func SetPreferParserEngine(fn func(fileType string) string) {
+	preferParserEngine = fn
+}
+
+// DefaultParserEngine returns the engine used when no parser_engine_rules
+// match. Empty string means builtin (docreader) or Go simple-format routing.
+// When the anydoc binding is linked it is preferred for every type it
+// converts (except Go simple formats). ppt/pptx otherwise fall back to
+// markitdown.
+func DefaultParserEngine(fileType string) string {
+	ft := normalizeParserFileType(fileType)
+	if preferParserEngine != nil {
+		if engine := preferParserEngine(ft); engine != "" {
+			return engine
+		}
+	}
+	return defaultParserEngineByType[ft]
 }
 
 // ResolveParserEngine returns the engine name for the given file type
-// based on the configured rules. Returns empty string (builtin) when
-// no rule matches.
+// based on the configured rules. When no rule matches it returns the
+// type-level default (see DefaultParserEngine).
 func (c ChunkingConfig) ResolveParserEngine(fileType string) string {
-	for _, rule := range c.ParserEngineRules {
-		for _, ft := range rule.FileTypes {
-			if ft == fileType {
-				return rule.Engine
+	if rule := c.ResolveParserEngineRule(fileType); rule != nil {
+		return rule.Engine
+	}
+	return DefaultParserEngine(fileType)
+}
+
+// ResolveParserEngineRule returns the parser rule for a file type.
+func (c ChunkingConfig) ResolveParserEngineRule(fileType string) *ParserEngineRule {
+	fileType = normalizeParserFileType(fileType)
+	if fileType == "" {
+		return nil
+	}
+	for i := range c.ParserEngineRules {
+		for _, ft := range c.ParserEngineRules[i].FileTypes {
+			if normalizeParserFileType(ft) == fileType {
+				return &c.ParserEngineRules[i]
 			}
 		}
 	}
-	return ""
+	return nil
+}
+
+func normalizeParserFileType(fileType string) string {
+	return strings.TrimPrefix(strings.ToLower(strings.TrimSpace(fileType)), ".")
 }
 
 // StorageProviderConfig stores the KB-level storage provider selection.
 // Credentials are managed at the tenant level (StorageEngineConfig).
 type StorageProviderConfig struct {
-	Provider string `yaml:"provider" json:"provider"` // "local", "minio", "cos", "tos", "s3", "oss"
+	Provider string `yaml:"provider" json:"provider"` // "local", "minio", "cos", "tos", "s3", "oss", "ks3", "obs"
 }
 
 func (c StorageProviderConfig) Value() (driver.Value, error) {
@@ -191,13 +370,26 @@ func (c *StorageProviderConfig) Scan(value interface{}) error {
 // Deprecated: StorageConfig is the legacy COS configuration stored in the cos_config column.
 // New code should use StorageProviderConfig. Kept for backward compatibility with old data.
 type StorageConfig struct {
-	SecretID   string `yaml:"secret_id"   json:"secret_id"`
-	SecretKey  string `yaml:"secret_key"  json:"secret_key"`
-	Region     string `yaml:"region"      json:"region"`
+	// Secret ID (COS) / Access Key ID (S3, MinIO)
+	SecretID string `yaml:"secret_id"   json:"secret_id"`
+	// Secret Key (COS) / Secret Access Key (S3, MinIO)
+	SecretKey string `yaml:"secret_key"  json:"secret_key"`
+	// Region
+	Region string `yaml:"region"      json:"region"`
+	// Bucket Name
 	BucketName string `yaml:"bucket_name" json:"bucket_name"`
-	AppID      string `yaml:"app_id"      json:"app_id"`
+	// App ID (COS specific)
+	AppID string `yaml:"app_id"      json:"app_id"`
+	// Path Prefix
 	PathPrefix string `yaml:"path_prefix" json:"path_prefix"`
-	Provider   string `yaml:"provider"    json:"provider"`
+	// Provider: "cos", "minio", "s3"
+	Provider string `yaml:"provider"    json:"provider"`
+	// Endpoint (S3 specific) - e.g., s3.amazonaws.com, oss-cn-hangzhou.aliyuncs.com
+	Endpoint string `yaml:"endpoint"    json:"endpoint,omitempty"`
+	// UseSSL (S3 specific) - whether to use HTTPS
+	UseSSL bool `yaml:"use_ssl"     json:"use_ssl,omitempty"`
+	// ForcePathStyle (S3 specific) - whether to use path-style URLs
+	ForcePathStyle bool `yaml:"force_path_style" json:"force_path_style,omitempty"`
 }
 
 func (c StorageConfig) Value() (driver.Value, error) {
@@ -254,12 +446,44 @@ func (kb *KnowledgeBase) GetStorageProvider() string {
 	return strings.ToLower(strings.TrimSpace(kb.StorageConfig.Provider))
 }
 
+// EffectiveStorageProvider returns the KB's storage provider, falling back to
+// the supplied tenant default when the KB does not pin one. This mirrors the
+// selection logic in resolveFileService and is used by clone preflight checks
+// to detect cross-storage-backend clones (which are not supported).
+func (kb *KnowledgeBase) EffectiveStorageProvider(tenantDefault string) string {
+	if p := kb.GetStorageProvider(); p != "" {
+		return p
+	}
+	return strings.ToLower(strings.TrimSpace(tenantDefault))
+}
+
 // SetStorageProvider writes the provider to the new StorageProviderConfig field.
 func (kb *KnowledgeBase) SetStorageProvider(provider string) {
 	if kb == nil {
 		return
 	}
 	kb.StorageProviderConfig = &StorageProviderConfig{Provider: provider}
+}
+
+// SharesStorageBackendWith compares concrete instance bindings first. Provider
+// comparison is only a compatibility fallback for rows not yet backfilled.
+func (kb *KnowledgeBase) SharesStorageBackendWith(other *KnowledgeBase, defaultBackendID, defaultProvider string) bool {
+	if kb == nil || other == nil {
+		return false
+	}
+	effectiveID := func(candidate *KnowledgeBase) string {
+		if candidate.StorageBackendID != nil {
+			if id := strings.TrimSpace(*candidate.StorageBackendID); id != "" {
+				return id
+			}
+		}
+		return strings.TrimSpace(defaultBackendID)
+	}
+	leftID, rightID := effectiveID(kb), effectiveID(other)
+	if leftID != "" || rightID != "" {
+		return leftID != "" && leftID == rightID
+	}
+	return kb.EffectiveStorageProvider(defaultProvider) == other.EffectiveStorageProvider(defaultProvider)
 }
 
 // InferStorageFromFilePath deduces the storage provider from a file path format.
@@ -284,7 +508,10 @@ func InferStorageFromFilePath(filePath string) string {
 // e.g. "minio://bucket/key" → "minio", "local://tenant/file.pdf" → "local"
 // Returns "" if the path does not use a known provider scheme.
 func ParseProviderScheme(filePath string) string {
-	for _, provider := range []string{"local", "minio", "cos", "tos", "s3", "oss"} {
+	if _, inner, ok := ParseStorageBackendPath(filePath); ok {
+		filePath = inner
+	}
+	for _, provider := range []string{"local", "minio", "cos", "tos", "s3", "oss", "ks3", "obs", "dummy"} {
 		if strings.HasPrefix(filePath, provider+"://") {
 			return provider
 		}
@@ -336,6 +563,12 @@ func (c *ImageProcessingConfig) Scan(value interface{}) error {
 type VLMConfig struct {
 	Enabled bool   `yaml:"enabled"  json:"enabled"`
 	ModelID string `yaml:"model_id" json:"model_id"`
+	// DescriptionLanguage controls the language used for generated image
+	// captions. Empty means follow the document/request language.
+	DescriptionLanguage string `yaml:"description_language,omitempty" json:"description_language,omitempty"`
+	// CustomInstructions adds KB-specific image interpretation guidance without
+	// replacing the system-owned OCR and Markdown output contract.
+	CustomInstructions string `yaml:"custom_instructions,omitempty" json:"custom_instructions,omitempty"`
 
 	// 兼容老版本
 	// Model Name
@@ -370,6 +603,9 @@ type QuestionGenerationConfig struct {
 	Enabled bool `yaml:"enabled"  json:"enabled"`
 	// Number of questions to generate per chunk (default: 3, max: 10)
 	QuestionCount int `yaml:"question_count" json:"question_count"`
+	// CustomInstructions describes the intended audience or question style.
+	// It is appended to the stable system question-generation template.
+	CustomInstructions string `yaml:"custom_instructions,omitempty" json:"custom_instructions,omitempty"`
 }
 
 // Value implements the driver.Valuer interface
@@ -442,6 +678,9 @@ type ExtractConfig struct {
 	Tags      []string         `yaml:"tags"      json:"tags,omitempty"`
 	Nodes     []*GraphNode     `yaml:"nodes"     json:"nodes,omitempty"`
 	Relations []*GraphRelation `yaml:"relations" json:"relations,omitempty"`
+	// CustomInstructions adds domain-specific extraction guidance while the
+	// system keeps ownership of the structured graph output protocol.
+	CustomInstructions string `yaml:"custom_instructions,omitempty" json:"custom_instructions,omitempty"`
 }
 
 // Value implements the driver.Valuer interface, used to convert ExtractConfig to database value
@@ -495,6 +734,11 @@ func (kb *KnowledgeBase) EnsureDefaults() {
 	// Clear type-specific configs that don't belong
 	if kb.Type != KnowledgeBaseTypeFAQ {
 		kb.FAQConfig = nil
+	}
+	if kb.Type != KnowledgeBaseTypeDocument {
+		kb.AutoTagConfig = nil
+	} else if kb.AutoTagConfig != nil {
+		kb.AutoTagConfig.Normalize()
 	}
 	// Set defaults for FAQ
 	if kb.Type == KnowledgeBaseTypeFAQ {
@@ -605,20 +849,71 @@ func (kb *KnowledgeBase) NeedsEmbeddingModel() bool {
 	return kb != nil && kb.IndexingStrategy.NeedsEmbedding()
 }
 
-// IsMultimodalEnabled 判断多模态是否启用（兼容新老版本配置）
-// 新版本：VLMConfig.IsEnabled()
-// 老版本：ChunkingConfig.EnableMultimodal
+// IsMultimodalEnabled 判断多模态是否启用，由 VLMConfig.IsEnabled() 决定。
 func (kb *KnowledgeBase) IsMultimodalEnabled() bool {
 	if kb == nil {
 		return false
 	}
-	// 新版本配置优先
-	if kb.VLMConfig.IsEnabled() {
-		return true
+	return kb.VLMConfig.IsEnabled()
+}
+
+// HasVectorStore reports whether the KB is bound to a DB-managed VectorStore
+// (as opposed to the tenant's env-store fallback).
+//
+// Safe to call on a nil receiver (returns false). Mirrors the convention of
+// other Is*Enabled / Capabilities accessors in this file.
+func (kb *KnowledgeBase) HasVectorStore() bool {
+	return kb != nil && kb.VectorStoreID != nil && *kb.VectorStoreID != ""
+}
+
+// Normalize folds the empty-string vector store id into nil so a single
+// representation reaches both the DB and the retrieve-engine factory, which
+// treats nil and `&""` as the same "no binding" signal. Idempotent and safe
+// to call repeatedly.
+//
+// Callers that accept unvalidated user input (CreateKnowledgeBase, async
+// payload decoders) should invoke this before persistence or validation.
+// Safe to call on a nil receiver (no-op).
+func (kb *KnowledgeBase) Normalize() {
+	if kb == nil {
+		return
 	}
-	// 兼容老版本：chunking_config 中的 enable_multimodal 字段
-	if kb.ChunkingConfig.EnableMultimodal {
-		return true
+	if kb.VectorStoreID != nil && *kb.VectorStoreID == "" {
+		kb.VectorStoreID = nil
 	}
-	return false
+}
+
+// SharesStoreWith reports whether two knowledge bases are bound to the same
+// vector store. Both env-fallback (nil) → true; both same UUID → true;
+// otherwise false. Safe to call when either receiver or argument is nil
+// (returns true iff both are nil).
+//
+// Empty-string VectorStoreID is treated as equivalent to nil so that rows
+// persisted by callers that did not run Normalize first (raw-SQL writes,
+// external migrations, ops scripts) still compare correctly. The alternative
+// — treating `&""` as a distinct binding — would reject otherwise valid
+// CopyKnowledgeBase clones with a confusing "different vector stores" 400.
+// This normalization is read-only; it does not mutate the receivers.
+//
+// Lives on *KnowledgeBase next to HasVectorStore() so the binding semantics
+// stay co-located with the type they describe.
+func (kb *KnowledgeBase) SharesStoreWith(other *KnowledgeBase) bool {
+	if kb == nil || other == nil {
+		return kb == other
+	}
+	a, b := kb.VectorStoreID, other.VectorStoreID
+	if a != nil && *a == "" {
+		a = nil
+	}
+	if b != nil && *b == "" {
+		b = nil
+	}
+	switch {
+	case a == nil && b == nil:
+		return true
+	case a == nil || b == nil:
+		return false
+	default:
+		return *a == *b
+	}
 }

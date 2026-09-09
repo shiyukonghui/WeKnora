@@ -1,8 +1,19 @@
+# Keep build context lean; multi-stage Dockerfile needs sources, not dist.
 node_modules
 dist
-.git
-.gitignore
-README.md
-.vscode
+dist-ssr
+coverage
+logs
 *.log
-.DS_Store 
+.DS_Store
+.vscode
+.idea
+*.local
+*.tsbuildinfo
+package.json.md5
+*.md
+.env
+.env.*
+.gitignore
+.dockerignore
+Dockerfile
